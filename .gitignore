@@ -1,0 +1,6 @@
+# CMake 构建产物
+build/
+
+# Python
+__pycache__/
+*.pyc

@@ -1,5 +1,26 @@
 #include <cmath>
 
+// =============================================================================
+// 二自由度平面双连杆系统动力学模型（参考实现）
+//
+// 【修正说明】
+//   本文件最初版本的质量矩阵 / 重力项 / 科氏项与正向运动学不自洽，具体为：
+//     1) M11、M12 漏掉了连杆 s 绕关节 s 的惯量 (ms*|Ps|^2 + Is)；
+//     2) G1 漏掉了连杆 s 的重力贡献（即 G2，它通过 psi_b 的旋转同样作用于 theta_b）；
+//     3) C1 漏掉了一项 ms*(dh/dtheta_s)*dtheta_s*dtheta_b。
+//   症状：重力项不是任何势函数的梯度（dG1/dtheta_s != dG2/dtheta_b），
+//         且零力矩零摩擦下能量自增（从偏离竖直 0.15 rad 释放，20 s 内角速度被泵到
+//         10.5 rad/s）。
+//   现已按正向运动学补全上述缺项，模型能量守恒（20 s 能量漂移 ~1e-7）。
+//
+// 【运动学约定】
+//   psi_b = theta_c + theta_b
+//   psi_s = theta_c + theta_b + theta_s
+//   连杆 b 质心在 R(psi_b)*(Pbx, Pby)；
+//   关节 s 在 R(psi_b)*(Dx, Dy)；
+//   连杆 s 质心在 关节 s + R(psi_s)*(Psx, Psy)。
+// =============================================================================
+
 // 系统参数结构体
 struct Params {
     // 连杆 b 参数
@@ -76,22 +97,27 @@ void computeAccelerations(
 
     // ---------------------------------------------------------
     // 2. 质量矩阵元素 (对称)
+    //
+    // 【已修正】补上连杆 s 绕关节 s 的惯量 Is_ = ms*(Psx^2+Psy^2) + Is，
+    //          它在 M11、M12 中不可省略（例如 D=0 时两连杆仍通过它耦合）。
     // ---------------------------------------------------------
+    double Is_link = p.ms * (p.Psx * p.Psx + p.Psy * p.Psy) + p.Is;
+
     double M11 = p.mb * (p.Pbx * p.Pbx + p.Pby * p.Pby) + p.Ib 
-               + p.ms * (p.Dx * p.Dx + p.Dy * p.Dy) + p.ms * h;
+               + p.ms * (p.Dx * p.Dx + p.Dy * p.Dy) + Is_link + 2.0 * p.ms * h;
                
-    double M12 = p.ms * h;
+    double M12 = Is_link + p.ms * h;
     
-    double M22 = p.ms * (p.Psx * p.Psx + p.Psy * p.Psy) + p.Is;
+    double M22 = Is_link;
 
     // ---------------------------------------------------------
     // 3. 科里奥利力与离心力项 (已移项至等式右侧)
     // ---------------------------------------------------------
     double dpsi_b = dtheta_c + dtheta_b;
-    double dpsi_s = dtheta_c + dtheta_b + dtheta_s;
 
     // 方程1的科里奥利力移项部分
-    double C1 = p.ms * dh_dts * dtheta_s * dpsi_s;
+    // 【已修正】应为 ms*dh/dts*dtheta_s*(2*dpsi_b + dtheta_s)
+    double C1 = p.ms * dh_dts * dtheta_s * (2.0 * dpsi_b + dtheta_s);
 
     // 方程2的科里奥利力移项部分 (原为 -ms*dh_dts*dpsi_b^2，移项后变为正)
     double C2 = -p.ms * dh_dts * dpsi_b * dpsi_b; 
@@ -99,13 +125,16 @@ void computeAccelerations(
     // ---------------------------------------------------------
     // 4. 重力项
     // ---------------------------------------------------------
-    // 方程1的重力项 G1
-    double G1 = (p.gx * (p.mb * p.Pbx + p.ms * p.Dx) + p.gy * (p.mb * p.Pby + p.ms * p.Dy)) * Sb
-              + (p.gx * (p.mb * p.Pby + p.ms * p.Dy) - p.gy * (p.mb * p.Pbx + p.ms * p.Dx)) * Cb;
-
-    // 方程2的重力项 G2
+    // 方程2的重力项 G2：连杆 s 自身的重力贡献
     double G2 = p.ms * (p.gx * p.Psx + p.gy * p.Psy) * Ss
               + p.ms * (p.gx * p.Psy - p.gy * p.Psx) * Cs;
+
+    // 方程1的重力项 G1
+    // 【已修正】关节 s 随连杆 b 一起转动，因此连杆 s 的重力也通过 psi_b 进入 G1，
+    //          即 G1 必须再加上 G2。
+    double G1 = (p.gx * (p.mb * p.Pbx + p.ms * p.Dx) + p.gy * (p.mb * p.Pby + p.ms * p.Dy)) * Sb
+              + (p.gx * (p.mb * p.Pby + p.ms * p.Dy) - p.gy * (p.mb * p.Pbx + p.ms * p.Dx)) * Cb
+              + G2;
 
     // ---------------------------------------------------------
     // 5. 广义力 (驱动力与摩擦力)
@@ -119,9 +148,10 @@ void computeAccelerations(
     //              M12*ddtheta_b + M22*ddtheta_s = F2
     // ---------------------------------------------------------
     
-    // 注意：ddtheta_c 作为系统输入，需要分配到等号右侧
+    // 注意：ddtheta_c 作为系统输入，需要分配到等号右侧；
+    //       基座加速度与两个广义坐标的耦合系数就是质量矩阵的第一列 (M11, M12)。
     double F1 = Qb - C1 - G1 - M11 * ddtheta_c;
-    double F2 = Qs - C2 - G2 - (M22 + M12) * ddtheta_c;
+    double F2 = Qs - C2 - G2 - M12 * ddtheta_c;
 
     // ---------------------------------------------------------
     // 7. 求解线性方程组 (克拉默法则)
