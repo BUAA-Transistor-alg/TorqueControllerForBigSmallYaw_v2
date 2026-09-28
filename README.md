@@ -47,8 +47,14 @@
 python3 python/pendulum_sim.py
 ```
 
-所有参数（物理参数、`dt`、细化倍数、按键力矩、初值、`theta_c`）都写死在
-[`python/pendulum_sim.py`](python/pendulum_sim.py) 顶部的常量区，**不接受命令行参数**。
+所有参数都写死在 [`python/pendulum_sim.py`](python/pendulum_sim.py) 顶部的常量区
+（物理参数、`dt`、细化倍数、按键力矩、广义坐标初值、基座初始 `THETA_C_0` / `DTHETA_C_0`
+与常值 `DDTHETA_C`），**不接受命令行参数**。
+
+基座状态 `(theta_c, dtheta_c)` 由脚本自己维护：主循环每推进一步，就用与仿真器 RK4
+子步内一致的等角加速度公式把 c 状态推进一个 `SIM_DT`，再作为下一步输入传给
+`sim.step()`；按 `R` 复位时一并回到初始值。因此把 `DDTHETA_C` 设为非零，基座就会
+持续加速旋转，并实时反映在绘制与 HUD 上。
 
 | 按键 | 作用 |
 | --- | --- |

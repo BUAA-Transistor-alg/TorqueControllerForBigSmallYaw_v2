@@ -5,6 +5,10 @@
 
 坐标系约定：向右为 x 正方向，向上为 y 正方向（屏幕 y 轴已翻转）。
 
+基座偏航角 theta_c 由本脚本自己维护：顶部常量给出初始 THETA_C_0 / DTHETA_C_0 与
+常值角加速度 DDTHETA_C，主循环每推进一步就按与仿真器子步内相同的等角加速度公式
+把 (theta_c, dtheta_c) 推进一个 SIM_DT，再作为下一步的输入传给仿真器。
+
 按键：
     A / S   关节 b 力矩 +TORQUE_B / -TORQUE_B
     K / L   关节 s 力矩 +TORQUE_S / -TORQUE_S
@@ -68,10 +72,12 @@ INITIAL_STATE = State(
 TORQUE_B = 5.0         # A / S 键给出的关节 b 力矩幅值 [N*m]
 TORQUE_S = 1.0         # K / L 键给出的关节 s 力矩幅值 [N*m]
 
-# --- 外部输入 theta_c（基座偏航角）：恒定不动 -------------------------------
-THETA_C = 0.0          # [rad]
-DTHETA_C = 0.0         # [rad/s]
-DDTHETA_C = 0.0        # [rad/s^2]
+# --- 外部输入 theta_c（基座偏航角）：初始状态 + 常值角加速度 -----------------
+# 仿真器每步只接收本步起始时刻的 (theta_c, dtheta_c, ddtheta_c)，步内按等角加速度
+# 外推；本步结束后由本脚本按同一公式把 c 状态推进到下一步（见 advance_theta_c）。
+THETA_C_0 = 0.0        # 初始基座角度 [rad]
+DTHETA_C_0 = 0.0       # 初始基座角速度 [rad/s]
+DDTHETA_C = 0.0        # 基座角加速度 [rad/s^2]（常值；非 0 时基座持续加速旋转）
 
 # --- 实时推进 ---------------------------------------------------------------
 FPS = 60
@@ -127,8 +133,8 @@ def world_to_screen(x: float, y: float) -> tuple[int, int]:
     )
 
 
-def compute_geometry(state: State) -> dict:
-    """由两个广义坐标算出各关节点、质心与连杆端点的世界坐标。
+def compute_geometry(state: State, theta_c: float) -> dict:
+    """由基座角度与两个广义坐标算出各关节点、质心与连杆端点的世界坐标。
 
     运动学：
         psi_b = theta_c + theta_b
@@ -138,7 +144,7 @@ def compute_geometry(state: State) -> dict:
         连杆 s 质心 = 关节 s + R(psi_s) * (Psx, Psy)
         连杆 s 末端 = 关节 s + R(psi_s) * (2*Psx, 2*Psy)   （仅用于绘制）
     """
-    psi_b = THETA_C + state.theta_b
+    psi_b = theta_c + state.theta_b
     psi_s = psi_b + state.theta_s
 
     joint = _rot(PARAMS.Dx, PARAMS.Dy, psi_b)
@@ -199,9 +205,9 @@ def draw_base(surface: pygame.Surface) -> None:
         pygame.draw.line(surface, C_BASE, (x, oy + 16), (x - 8, oy + 26), 2)
 
 
-def draw_pendulum(surface: pygame.Surface, state: State) -> dict:
+def draw_pendulum(surface: pygame.Surface, state: State, theta_c: float) -> dict:
     """绘制二阶摆本体，返回几何量供 HUD 使用。"""
-    geo = compute_geometry(state)
+    geo = compute_geometry(state, theta_c)
 
     origin_px = world_to_screen(*geo["origin"])
     joint_px = world_to_screen(*geo["joint"])
@@ -260,6 +266,8 @@ def render(
     font: pygame.font.Font,
     font_big: pygame.font.Font,
     state: State,
+    theta_c: float,
+    dtheta_c: float,
     torque_b: float,
     torque_s: float,
     sim_time: float,
@@ -270,31 +278,35 @@ def render(
     draw_grid(surface)
     draw_axes(surface, font)
     draw_base(surface)
-    geo = draw_pendulum(surface, state)
+    geo = draw_pendulum(surface, state, theta_c)
 
     # --- HUD 面板 ---
-    panel = pygame.Surface((470, 228), pygame.SRCALPHA)
-    panel.fill((12, 14, 18, 190))
-    surface.blit(panel, (16, 16))
-
     x0, y0 = 30, 26
     lines = [
         f"dt = {SIM_DT:g} s    refinement = {REFINEMENT}    substep = {SIM_DT / REFINEMENT:g} s",
         f"sim time = {sim_time:8.3f} s    fps = {fps:5.1f}" + ("    [PAUSED]" if paused else ""),
         f"theta_b = {state.theta_b:+.4f} rad   dtheta_b = {state.dtheta_b:+.4f} rad/s",
         f"theta_s = {state.theta_s:+.4f} rad   dtheta_s = {state.dtheta_s:+.4f} rad/s",
+        f"theta_c = {theta_c:+.4f} rad   dtheta_c = {dtheta_c:+.4f} rad/s",
+        f"ddtheta_c = {DDTHETA_C:+.4f} rad/s^2",
         f"psi_b   = {geo['psi_b']:+.4f} rad   psi_s    = {geo['psi_s']:+.4f} rad",
     ]
+    n_lines = len(lines)
+    panel = pygame.Surface((470, n_lines * 22 + 84), pygame.SRCALPHA)
+    panel.fill((12, 14, 18, 190))
+    surface.blit(panel, (16, 16))
+
     for i, text in enumerate(lines):
         surface.blit(font.render(text, True, C_TEXT), (x0, y0 + i * 22))
 
+    keys_y = y0 + n_lines * 22 + 4
     surface.blit(
         font_big.render("Keys: A/S -> Tb   K/L -> Ts", True, C_TEXT),
-        (x0, y0 + 5 * 22 + 4),
+        (x0, keys_y),
     )
     surface.blit(
         font.render("SPACE pause / resume    R reset    ESC quit", True, C_TEXT_DIM),
-        (x0, y0 + 5 * 22 + 32),
+        (x0, keys_y + 28),
     )
 
     # 力矩条
@@ -306,6 +318,21 @@ def render(
 # ===========================================================================
 # 4. 输入与主循环
 # ===========================================================================
+def advance_theta_c(
+    theta_c: float, dtheta_c: float, ddtheta_c: float, dt: float
+) -> tuple[float, float]:
+    """把基座状态 (theta_c, dtheta_c) 推进一个 dt。
+
+    与仿真器 RK4 子步内的假设保持一致（等角加速度外推）：
+        theta_c(t + dt) = theta_c + dtheta_c*dt + 0.5*ddtheta_c*dt^2
+        dtheta_c(t + dt) = dtheta_c + ddtheta_c*dt
+    """
+    return (
+        theta_c + dtheta_c * dt + 0.5 * ddtheta_c * dt * dt,
+        dtheta_c + ddtheta_c * dt,
+    )
+
+
 def read_torques() -> tuple[float, float]:
     """按当前按键状态给出两个驱动力矩。
 
@@ -346,6 +373,9 @@ def main() -> int:
     sim.set_state(INITIAL_STATE)
 
     state = INITIAL_STATE
+    # 脚本自己维护的基座状态
+    theta_c = THETA_C_0
+    dtheta_c = DTHETA_C_0
     sim_time = 0.0
     accumulator = 0.0
     paused = False
@@ -367,6 +397,8 @@ def main() -> int:
                     elif event.key == pygame.K_r:
                         sim.set_state(INITIAL_STATE)
                         state = INITIAL_STATE
+                        theta_c = THETA_C_0
+                        dtheta_c = DTHETA_C_0
                         sim_time = 0.0
                         accumulator = 0.0
 
@@ -376,15 +408,18 @@ def main() -> int:
                 accumulator += frame_seconds * TIME_SCALE
                 steps = 0
                 while accumulator >= SIM_DT and steps < MAX_STEPS_PER_FRAME:
-                    state = sim.step(torque_b, torque_s, THETA_C, DTHETA_C, DDTHETA_C)
+                    # 传入本步起始时刻的基座状态
+                    state = sim.step(torque_b, torque_s, theta_c, dtheta_c, DDTHETA_C)
+                    # 本步结束后按同一公式把基座状态推进到下一步
+                    theta_c, dtheta_c = advance_theta_c(theta_c, dtheta_c, DDTHETA_C, SIM_DT)
                     sim_time += SIM_DT
                     accumulator -= SIM_DT
                     steps += 1
                 if steps >= MAX_STEPS_PER_FRAME:
                     accumulator = 0.0
 
-            render(screen, font, font_big, state, torque_b, torque_s, sim_time,
-                   paused, clock.get_fps())
+            render(screen, font, font_big, state, theta_c, dtheta_c, torque_b, torque_s,
+                   sim_time, paused, clock.get_fps())
             pygame.display.flip()
     finally:
         sim.close()
