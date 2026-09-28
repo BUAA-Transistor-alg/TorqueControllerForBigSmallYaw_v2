@@ -26,8 +26,11 @@ import ctypes
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
-__all__ = ["Params", "State", "Simulator", "library_path"]
+import numpy as np
+
+__all__ = ["Params", "State", "Simulator", "Trajectory", "TrajectoryLoss", "library_path"]
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +146,45 @@ def _load_library() -> ctypes.CDLL:
         ctypes.c_double,
         ctypes.c_double,
         ctypes.POINTER(_CState),
+    ]
+
+    # ---- 轨迹梯度接口 ----
+    lib.tcbss_trajectory_create.restype = ctypes.c_void_p
+    lib.tcbss_trajectory_create.argtypes = [ctypes.POINTER(_CParams)]
+
+    lib.tcbss_trajectory_destroy.restype = None
+    lib.tcbss_trajectory_destroy.argtypes = [ctypes.c_void_p]
+
+    _dbl_p = ctypes.POINTER(ctypes.c_double)
+
+    lib.tcbss_trajectory_loss.restype = ctypes.c_double
+    lib.tcbss_trajectory_loss.argtypes = [
+        ctypes.c_void_p,                                  # t
+        ctypes.c_double, ctypes.c_double, ctypes.c_double,  # theta_c0, dtheta_c, ddtheta_c
+        ctypes.c_double,                                  # dt
+        ctypes.c_size_t,                                  # num_steps
+        _dbl_p,                                           # tau
+        ctypes.c_double, ctypes.c_double,                 # tau_b_fixed, tau_s_fixed
+        ctypes.POINTER(_CState),                          # x0
+        ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,  # w1..w4
+        ctypes.c_double, ctypes.c_double,                 # w5, w6
+        _dbl_p, _dbl_p, _dbl_p, _dbl_p,                   # targets
+        _dbl_p, _dbl_p, _dbl_p, _dbl_p,                   # outputs
+    ]
+
+    lib.tcbss_trajectory_gradient.restype = ctypes.c_double
+    lib.tcbss_trajectory_gradient.argtypes = [
+        ctypes.c_void_p,                                  # t
+        ctypes.c_double, ctypes.c_double, ctypes.c_double,  # theta_c0, dtheta_c, ddtheta_c
+        ctypes.c_double,                                  # dt
+        ctypes.c_size_t,                                  # num_steps
+        _dbl_p,                                           # tau
+        ctypes.POINTER(_CState),                          # x0
+        ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,  # w1..w4
+        ctypes.c_double, ctypes.c_double,                 # w5, w6
+        _dbl_p, _dbl_p, _dbl_p, _dbl_p,                   # targets
+        _dbl_p,                                           # grad_tau
+        ctypes.POINTER(_CState),                          # out_final_state
     ]
 
     return lib
@@ -356,3 +398,230 @@ class Simulator:
             f"Simulator(dt={self._dt:g}, refinement={self._refinement}, "
             f"substep_dt={self._dt / self._refinement:g})"
         )
+
+
+# ---------------------------------------------------------------------------
+# 有限多步轨迹 + 损失对每一步力矩的解析梯度
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class TrajectoryLoss:
+    """六项加权的损失定义（时间均值形式）。
+
+        L = (1/2K) * sum_k [ w_psi_b  * (psi_b[k]  - target_psi_b[k])^2
+                           + w_psi_s  * (psi_s[k]  - target_psi_s[k])^2
+                           + w_dpsi_b * (dpsi_b[k] - target_dpsi_b[k])^2
+                           + w_dpsi_s * (dpsi_s[k] - target_dpsi_s[k])^2
+                           + w_tau_b  * tau_b[k]^2
+                           + w_tau_s  * tau_s[k]^2 ]
+
+    其中 psi_b = theta_c + theta_b，psi_s = theta_c + theta_b + theta_s，
+    dpsi_b = dtheta_c + dtheta_b，dpsi_s = dtheta_c + dtheta_b + dtheta_s。
+
+    目标序列为 None 时该项退化为惩罚幅值（目标恒为 0）。
+    序列长度必须与 num_steps 一致。
+    """
+
+    w_psi_b: float = 0.0
+    w_psi_s: float = 0.0
+    w_dpsi_b: float = 0.0
+    w_dpsi_s: float = 0.0
+    w_tau_b: float = 0.0
+    w_tau_s: float = 0.0
+
+    target_psi_b: Sequence[float] | None = None
+    target_psi_s: Sequence[float] | None = None
+    target_dpsi_b: Sequence[float] | None = None
+    target_dpsi_s: Sequence[float] | None = None
+
+
+def _dbl_array(seq) -> "np.ndarray":
+    """把序列（或 None）转成连续 double 数组。"""
+    if seq is None:
+        return None
+    arr = np.ascontiguousarray(seq, dtype=np.float64)
+    return arr
+
+
+def _dbl_ptr(arr):
+    """把 numpy double 数组转成 ctypes 指针；None -> NULL。"""
+    if arr is None:
+        return ctypes.cast(None, ctypes.POINTER(ctypes.c_double))
+    return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+
+
+class Trajectory:
+    """有限多步轨迹求解器：一次调用完成正向仿真与反向伴随。
+
+    缓冲在句柄内复用，因此对同一 batch 反复调用（例如优化迭代）不会有额外分配。
+
+    :param params: 全部系统参数
+
+    用法::
+
+        traj = Trajectory(PARAMS)
+        loss = traj.loss(theta_c0=0.0, dtheta_c=0.0, ddtheta_c=0.0,
+                         dt=1e-3, num_steps=200, tau=tau, x0=x0, spec=spec)
+        loss, grad = traj.gradient(...)      # grad 形状 (K, 2)
+    """
+
+    def __init__(self, params: Params):
+        c_params = params._to_c()
+        handle = _lib.tcbss_trajectory_create(ctypes.byref(c_params))
+        if not handle:
+            raise RuntimeError(f"tcbss_trajectory_create 失败: {_last_error()}")
+        self._handle = handle
+        self._params = params
+
+    # -- 生命周期 ---------------------------------------------------------
+    def close(self) -> None:
+        if getattr(self, "_handle", None):
+            _lib.tcbss_trajectory_destroy(self._handle)
+            self._handle = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "Trajectory":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def _require_handle(self) -> ctypes.c_void_p:
+        if not getattr(self, "_handle", None):
+            raise RuntimeError("Trajectory 已关闭")
+        return self._handle
+
+    @property
+    def params(self) -> Params:
+        return self._params
+
+    # -- 接口 -------------------------------------------------------------
+    def loss(
+        self,
+        theta_c0: float,
+        dtheta_c: float,
+        ddtheta_c: float,
+        dt: float,
+        tau: "np.ndarray",
+        x0: State,
+        spec: TrajectoryLoss,
+        return_sequences: bool = False,
+    ):
+        """只做正向仿真并返回损失值。
+
+        :param tau: 形状 (K, 2) 的力矩序列（tau[k] = [Tb, Ts]），或形状 (2,) 的常值力矩
+        :param return_sequences: True 时返回 (loss, psi_b, psi_s, dpsi_b, dpsi_s)
+        """
+        tau_arr, num_steps = self._prepare_tau(tau)
+        x0_c = x0._to_c()
+
+        outs = []
+        for name in ("target_psi_b", "target_psi_s", "target_dpsi_b", "target_dpsi_s"):
+            outs.append(_dbl_array(getattr(spec, name)))
+        self._check_target_lengths(outs, num_steps)
+
+        if return_sequences:
+            buf = [np.zeros(num_steps, dtype=np.float64) for _ in range(4)]
+            buf_ptr = [b.ctypes.data_as(ctypes.POINTER(ctypes.c_double)) for b in buf]
+        else:
+            buf = None
+            buf_ptr = [ctypes.cast(None, ctypes.POINTER(ctypes.c_double))] * 4
+
+        value = _lib.tcbss_trajectory_loss(
+            self._require_handle(),
+            float(theta_c0), float(dtheta_c), float(ddtheta_c), float(dt),
+            ctypes.c_size_t(num_steps),
+            _dbl_ptr(tau_arr),
+            0.0, 0.0,
+            ctypes.byref(x0_c),
+            float(spec.w_psi_b), float(spec.w_psi_s),
+            float(spec.w_dpsi_b), float(spec.w_dpsi_s),
+            float(spec.w_tau_b), float(spec.w_tau_s),
+            _dbl_ptr(outs[0]), _dbl_ptr(outs[1]), _dbl_ptr(outs[2]), _dbl_ptr(outs[3]),
+            buf_ptr[0], buf_ptr[1], buf_ptr[2], buf_ptr[3],
+        )
+        if value < 0.0:
+            raise RuntimeError(f"tcbss_trajectory_loss 失败: {_last_error()}")
+        if return_sequences:
+            return (value, buf[0], buf[1], buf[2], buf[3])
+        return value
+
+    def gradient(
+        self,
+        theta_c0: float,
+        dtheta_c: float,
+        ddtheta_c: float,
+        dt: float,
+        tau: "np.ndarray",
+        x0: State,
+        spec: TrajectoryLoss,
+        return_final_state: bool = False,
+    ):
+        """正向 + 反向伴随，返回 (loss, grad)。
+
+        :param tau: 形状 (K, 2) 的力矩序列
+        :param return_final_state: True 时额外返回最后一步之后的状态
+        :return: (loss, grad)，grad 形状 (K, 2)，grad[k] = [dL/dTb_k, dL/dTs_k]
+        """
+        tau_arr, num_steps = self._prepare_tau(tau)
+        if tau_arr.ndim != 2:
+            raise ValueError("gradient 需要形状 (K, 2) 的力矩序列")
+        x0_c = x0._to_c()
+
+        targets = [_dbl_array(getattr(spec, n)) for n in
+                   ("target_psi_b", "target_psi_s", "target_dpsi_b", "target_dpsi_s")]
+        self._check_target_lengths(targets, num_steps)
+
+        grad = np.zeros((num_steps, 2), dtype=np.float64)
+        final_c = _CState()
+
+        value = _lib.tcbss_trajectory_gradient(
+            self._require_handle(),
+            float(theta_c0), float(dtheta_c), float(ddtheta_c), float(dt),
+            ctypes.c_size_t(num_steps),
+            _dbl_ptr(tau_arr),
+            ctypes.byref(x0_c),
+            float(spec.w_psi_b), float(spec.w_psi_s),
+            float(spec.w_dpsi_b), float(spec.w_dpsi_s),
+            float(spec.w_tau_b), float(spec.w_tau_s),
+            _dbl_ptr(targets[0]), _dbl_ptr(targets[1]),
+            _dbl_ptr(targets[2]), _dbl_ptr(targets[3]),
+            _dbl_ptr(grad),
+            ctypes.byref(final_c),
+        )
+        if value < 0.0:
+            raise RuntimeError(f"tcbss_trajectory_gradient 失败: {_last_error()}")
+        if return_final_state:
+            return value, grad, State._from_c(final_c)
+        return value, grad
+
+    # -- 内部 -------------------------------------------------------------
+    @staticmethod
+    def _prepare_tau(tau):
+        """返回 (连续数组, num_steps)。支持 (K,2) 序列；常值力矩请用 loss() 的 fixed 参数。"""
+        arr = np.ascontiguousarray(tau, dtype=np.float64)
+        if arr.ndim == 1:
+            if arr.shape[0] != 2:
+                raise ValueError("常值力矩必须是长度 2 的序列 [Tb, Ts]")
+            raise ValueError(
+                "loss() 的常值力矩请传 (K,2) 的序列；或用 tau_b_fixed/tau_s_fixed 参数"
+            )
+        if arr.ndim != 2 or arr.shape[1] != 2:
+            raise ValueError("tau 形状必须是 (K, 2)")
+        return arr, arr.shape[0]
+
+    @staticmethod
+    def _check_target_lengths(targets, num_steps):
+        for i, t in enumerate(targets):
+            if t is not None and t.size != num_steps:
+                raise ValueError(
+                    f"目标序列 {i} 长度为 {t.size}，应为 num_steps={num_steps}"
+                )
+
+    def __repr__(self) -> str:
+        return f"Trajectory({self._params!r})"
+

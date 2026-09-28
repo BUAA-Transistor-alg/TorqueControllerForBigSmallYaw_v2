@@ -6,6 +6,8 @@
 
 #include "params.hpp"
 #include "simulator.hpp"
+#include "state.hpp"
+#include "trajectory.hpp"
 
 namespace {
 
@@ -65,6 +67,48 @@ TcbssState toCState(const tcbss::State& s) {
     c.dtheta_s = s.dtheta_s;
     return c;
 }
+
+
+/// 轨迹求解器的 C++ 侧持有点：参数 + 可复用缓冲。
+struct TrajectoryHolder {
+    tcbss::Params params;
+    tcbss::TrajectoryWorkspace workspace;
+
+    explicit TrajectoryHolder(const tcbss::Params& p) : params(p) {}
+};
+
+TrajectoryHolder* asTrajectory(TcbssTrajectory* t) {
+    return reinterpret_cast<TrajectoryHolder*>(t);
+}
+
+const TrajectoryHolder* asTrajectory(const TcbssTrajectory* t) {
+    return reinterpret_cast<const TrajectoryHolder*>(t);
+}
+
+tcbss::LossSpec makeSpec(double w_psi_b,
+                         double w_psi_s,
+                         double w_dpsi_b,
+                         double w_dpsi_s,
+                         double w_tau_b,
+                         double w_tau_s,
+                         const double* target_psi_b,
+                         const double* target_psi_s,
+                         const double* target_dpsi_b,
+                         const double* target_dpsi_s) {
+    tcbss::LossSpec s;
+    s.w_psi_b = w_psi_b;
+    s.w_psi_s = w_psi_s;
+    s.w_dpsi_b = w_dpsi_b;
+    s.w_dpsi_s = w_dpsi_s;
+    s.w_tau_b = w_tau_b;
+    s.w_tau_s = w_tau_s;
+    s.target_psi_b = target_psi_b;
+    s.target_psi_s = target_psi_s;
+    s.target_dpsi_b = target_dpsi_b;
+    s.target_dpsi_s = target_dpsi_s;
+    return s;
+}
+
 
 }  // namespace
 
@@ -182,6 +226,144 @@ void tcbss_step(TcbssSimulator* sim,
 
     if (out != nullptr) {
         *out = toCState(next);
+    }
+}
+
+/* ==================================================================== */
+/* 有限多步轨迹 + 离散伴随梯度                                          */
+TcbssTrajectory* tcbss_trajectory_create(const TcbssParams* params) {
+    if (params == nullptr) {
+        setError("tcbss_trajectory_create: params is NULL");
+        return nullptr;
+    }
+    try {
+        g_last_error.clear();
+        auto* holder = new TrajectoryHolder(toParams(*params));
+        return reinterpret_cast<TcbssTrajectory*>(holder);
+    } catch (const std::exception& e) {
+        setError(e.what());
+        return nullptr;
+    } catch (...) {
+        setError("tcbss_trajectory_create: unknown error");
+        return nullptr;
+    }
+}
+
+void tcbss_trajectory_destroy(TcbssTrajectory* t) {
+    delete asTrajectory(t);
+}
+
+double tcbss_trajectory_loss(const TcbssTrajectory* t,
+                             double theta_c0,
+                             double dtheta_c,
+                             double ddtheta_c,
+                             double dt,
+                             size_t num_steps,
+                             const double* tau,
+                             double tau_b_fixed,
+                             double tau_s_fixed,
+                             const TcbssState* x0,
+                             double w_psi_b,
+                             double w_psi_s,
+                             double w_dpsi_b,
+                             double w_dpsi_s,
+                             double w_tau_b,
+                             double w_tau_s,
+                             const double* target_psi_b,
+                             const double* target_psi_s,
+                             const double* target_dpsi_b,
+                             const double* target_dpsi_s,
+                             double* out_psi_b,
+                             double* out_psi_s,
+                             double* out_dpsi_b,
+                             double* out_dpsi_s) {
+    if (t == nullptr) {
+        setError("tcbss_trajectory_loss: trajectory is NULL");
+        return -1.0;
+    }
+    if (x0 == nullptr) {
+        setError("tcbss_trajectory_loss: x0 is NULL");
+        return -1.0;
+    }
+    const auto* holder = asTrajectory(t);
+    const char* err =
+        tcbss::validateTrajectoryConfig(holder->params, num_steps, dt);
+    if (err != nullptr) {
+        setError(err);
+        return -1.0;
+    }
+
+    try {
+        const tcbss::LossSpec spec = makeSpec(w_psi_b, w_psi_s, w_dpsi_b, w_dpsi_s, w_tau_b,
+                                              w_tau_s, target_psi_b, target_psi_s,
+                                              target_dpsi_b, target_dpsi_s);
+        return tcbss::computeTrajectoryLoss(holder->params, theta_c0, dtheta_c, ddtheta_c, dt,
+                                            num_steps, tau, tau_b_fixed, tau_s_fixed, spec,
+                                            toState(*x0), out_psi_b, out_psi_s, out_dpsi_b,
+                                            out_dpsi_s);
+    } catch (const std::exception& e) {
+        setError(e.what());
+        return -1.0;
+    } catch (...) {
+        setError("tcbss_trajectory_loss: unknown error");
+        return -1.0;
+    }
+}
+
+double tcbss_trajectory_gradient(TcbssTrajectory* t,
+                                 double theta_c0,
+                                 double dtheta_c,
+                                 double ddtheta_c,
+                                 double dt,
+                                 size_t num_steps,
+                                 const double* tau,
+                                 const TcbssState* x0,
+                                 double w_psi_b,
+                                 double w_psi_s,
+                                 double w_dpsi_b,
+                                 double w_dpsi_s,
+                                 double w_tau_b,
+                                 double w_tau_s,
+                                 const double* target_psi_b,
+                                 const double* target_psi_s,
+                                 const double* target_dpsi_b,
+                                 const double* target_dpsi_s,
+                                 double* grad_tau,
+                                 TcbssState* out_final_state) {
+    if (t == nullptr) {
+        setError("tcbss_trajectory_gradient: trajectory is NULL");
+        return -1.0;
+    }
+    if (x0 == nullptr || tau == nullptr || grad_tau == nullptr) {
+        setError("tcbss_trajectory_gradient: x0 / tau / grad_tau must not be NULL");
+        return -1.0;
+    }
+    auto* holder = asTrajectory(t);
+    const char* err =
+        tcbss::validateTrajectoryConfig(holder->params, num_steps, dt);
+    if (err != nullptr) {
+        setError(err);
+        return -1.0;
+    }
+
+    try {
+        const tcbss::LossSpec spec = makeSpec(w_psi_b, w_psi_s, w_dpsi_b, w_dpsi_s, w_tau_b,
+                                              w_tau_s, target_psi_b, target_psi_s,
+                                              target_dpsi_b, target_dpsi_s);
+        tcbss::State final_state{};
+        const double loss = tcbss::simulateAndGradient(
+            holder->params, theta_c0, dtheta_c, ddtheta_c, dt, num_steps, tau, spec,
+            toState(*x0), holder->workspace, grad_tau,
+            (out_final_state != nullptr) ? &final_state : nullptr,
+            /*with_step_jacobians=*/false);
+        if (out_final_state != nullptr) *out_final_state = toCState(final_state);
+        return loss;
+    } catch (const std::exception& e) {
+        setError(e.what());
+        return -1.0;
+    } catch (...) {
+        setError("tcbss_trajectory_gradient: unknown error");
+        return -1.0;
     }
 }
 
