@@ -17,10 +17,15 @@
 //   psi_b = theta_c + theta_b,  psi_s = theta_c + theta_b + theta_s
 //   dpsi_b = dtheta_c + dtheta_b, dpsi_s = dtheta_c + dtheta_b + dtheta_s
 //
-// 被辨识参数（固定顺序，共 14 个；lambda_ 不参与）：
+// 被辨识参数（固定顺序，共 14 个）：
 //   0 mb   1 Ib   2 Pbx  3 Pby  4 ms   5 Is   6 Psx  7 Psy
-//   8 Dx   9 Dy  10 gx  11 gy  12 fbc 13 fbv 14 fsc 15 fsv
-//   —— 实际为 16 个。kParamGradientCount 给出准确值。
+//   8 Dx   9 Dy  10 fbc 11 fbv 12 fsc 13 fsv
+//   （kParamGradientCount / paramGradientNames() 给出权威值与顺序）
+//
+// 不在其中的量：
+//   * gx / gy：重力矢量是**随采集数据一起给出的已知输入**（存在 Params 里
+//     供正演使用），不是被辨识参数；
+//   * lambda：平滑摩擦参数，固定常数。
 
 #include <cstddef>
 
@@ -29,11 +34,10 @@
 
 namespace tcbss {
 
-/// 每步内固定的 RK4 子步数（与力矩梯度模式保持一致）。
-inline constexpr int kParamRefinement = 4;
+/// refinement 为运行期参数（语义见 trajectory.hpp：每主步重复 refinement 次经典 RK4）。
 
 /// 参与辨识的参数个数。
-inline constexpr int kParamGradientCount = 16;
+inline constexpr int kParamGradientCount = 14;
 
 /// 参数名（用于 Python 侧校验顺序）。
 const char* const* paramGradientNames();
@@ -53,17 +57,20 @@ struct ParamLossSpec {
 /// 调用方分配一次、反复复用的缓冲。
 struct ParamGradientWorkspace {
     std::size_t num_steps = 0;
+    int refinement = 0;
     std::size_t num_substeps = 0;
     /// 各步末状态，长度 K（损失是在步末状态上定义的）。
     State* X = nullptr;
-    /// 各子步起始状态，长度 K*kParamRefinement（损失梯度回传需要）。
+    /// 各子步起始状态，长度 K*refinement（损失梯度回传需要）。
     State* Xsub = nullptr;
     /// 各子步的四阶段状态雅可比 Jx（前向灵敏度传播需要），4*16 doubles/子步。
     double* Jx = nullptr;
     /// 损失对各子步末状态的梯度，4 doubles/子步。
     double* dLdX = nullptr;
+    /// 单个子步的 4 个阶段缓冲（运行期分配，避免热路径反复构造 Eval）。
+    void* evbuf = nullptr;
 
-    bool resize(std::size_t steps);
+    bool resize(std::size_t steps, int refine);
     void release();
     ~ParamGradientWorkspace() { release(); }
     ParamGradientWorkspace() = default;
@@ -72,7 +79,8 @@ struct ParamGradientWorkspace {
 };
 
 /// 配置校验；返回 nullptr 表示合法。
-const char* validateParamGradientConfig(const Params& p, std::size_t num_steps, double dt);
+const char* validateParamGradientConfig(const Params& p, std::size_t num_steps, double dt,
+                                        int refinement);
 
 /// 仅正向：计算损失值，并可选导出四个全局量序列。
 double computeParamGradientLoss(const Params& p,
@@ -80,6 +88,7 @@ double computeParamGradientLoss(const Params& p,
                                 double dtheta_c,
                                 double ddtheta_c,
                                 double dt,
+                                int refinement,
                                 std::size_t num_steps,
                                 const double* tau,
                                 const ParamLossSpec& spec,
@@ -99,6 +108,7 @@ double computeParamGradient(const Params& p,
                             double dtheta_c,
                             double ddtheta_c,
                             double dt,
+                            int refinement,
                             std::size_t num_steps,
                             const double* tau,
                             const ParamLossSpec& spec,

@@ -1,6 +1,9 @@
 # CMake 构建产物
 build/
 
+# 生成的数据与辨识结果（数据集、真值、图片）
+data/
+
 # Python
 __pycache__/
 *.pyc

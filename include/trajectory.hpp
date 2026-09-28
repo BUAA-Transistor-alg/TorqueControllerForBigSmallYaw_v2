@@ -26,7 +26,7 @@
 //   * theta_c 序列为外部给定、不参与优化的已知量；每步内基座角加速度常值，
 //     位置按 theta_c(tau) = theta_c0 + dtheta_c*tau + 0.5*ddtheta_c*tau^2 外推。
 //   * 两个控制力矩在每一步内为常值（零阶保持）。
-//   * 步长 dt 相同，每步内做 kTrajectoryRefinement 个 RK4 子步。
+//   * 步长 dt 相同，每步内做 refinement 个 RK4 子步（refinement 为运行期参数）。
 //   * 力矩序列按 AoS 存放：tau[i*2+0] = tau_b[i]，tau[i*2+1] = tau_s[i]。
 
 #include <cstddef>
@@ -40,11 +40,17 @@ namespace tcbss {
 // 常量
 // ---------------------------------------------------------------------------
 
-/// 每步内固定的 RK4 子步数（固定容量，避免运行期分配）。
-inline constexpr int kTrajectoryRefinement = 4;
+/// refinement 为运行期参数：每个主步 dt 内**重复 refinement 次经典 4 阶段 RK4**，
+/// 子步长 dt/refinement（与 Simulator::step 的语义完全一致）。
+inline constexpr int kRefinementMin = 1;
+inline constexpr int kRefinementMax = 4096;
+inline constexpr int kRefinementRecommended100Hz = 8;
 
 /// 配置合法性检查。返回 nullptr 表示合法，否则返回静态错误字符串。
-const char* validateTrajectoryConfig(const Params& p, std::size_t num_steps, double dt);
+const char* validateTrajectoryConfig(const Params& p,
+                                     std::size_t num_steps,
+                                     double dt,
+                                     int refinement);
 
 // ---------------------------------------------------------------------------
 // 损失规格
@@ -78,23 +84,24 @@ struct LossSpec {
 /// 反向不需要阶段导数 k_i，也不需要 Phi/Psi，因此都不保存、不计算
 /// （除非显式打开 with_step_jacobians）。
 struct TrajectoryRecord {
-    State x;                                  ///< 子步起始状态
-    double Jx[kTrajectoryRefinement][4][4];    ///< 各阶段 d(f)/d(x)，行主序
-    double Ju[kTrajectoryRefinement][4][2];    ///< 各阶段 d(f)/d(u)
-    double Phi[4][4];                          ///< 仅当 with_step_jacobians=true 时填充
-    double Psi[4][2];                          ///< 仅当 with_step_jacobians=true 时填充
+    State x;                    ///< 子步起始状态
+    double* Jx = nullptr;       ///< 4 阶段 * 16，指向 workspace 扁平区
+    double* Ju = nullptr;       ///< 4 阶段 * 8，同上
+    double* phi_psi = nullptr;  ///< 前 16 为整步传播子 W=dY'/dY，后 8 为 Psi=dY'/du
 };
 
 /// 调用方一次性分配、反复复用的缓冲。
 struct TrajectoryWorkspace {
     std::size_t num_steps = 0;             ///< 已分配的步数 K
-    std::size_t num_substeps = 0;          ///< = K * kTrajectoryRefinement
+    int refinement = 0;                    ///< 每主步的 RK4 子步数
+    std::size_t num_substeps = 0;          ///< = K * refinement
     TrajectoryRecord* records = nullptr;   ///< 长度 num_substeps
+    double* stage_data = nullptr;          ///< Jx/Ju/phi_psi 的扁平存储
     State* X = nullptr;                    ///< 长度 K，各步末状态
     double* dLdX = nullptr;                ///< 长度 K*4，损失对各步末状态的梯度
 
-    /// 分配（仅当步数变化时重新分配）。返回 false 表示分配失败。
-    bool resize(std::size_t steps);
+    /// 分配（仅当 (steps, refine) 变化时重新分配）。返回 false 表示分配失败。
+    bool resize(std::size_t steps, int refine);
 
     /// 释放全部缓冲。
     void release();
@@ -118,6 +125,7 @@ double computeTrajectoryLoss(const Params& p,
                              double dtheta_c,
                              double ddtheta_c,
                              double dt,
+                             int refinement,
                              std::size_t num_steps,
                              const double* tau,
                              double tau_b_fixed,
@@ -142,6 +150,7 @@ double simulateAndGradient(const Params& p,
                            double dtheta_c,
                            double ddtheta_c,
                            double dt,
+                           int refinement,
                            std::size_t num_steps,
                            const double* tau,
                            const LossSpec& spec,

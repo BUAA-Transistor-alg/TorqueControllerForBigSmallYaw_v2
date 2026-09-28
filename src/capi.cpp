@@ -73,9 +73,10 @@ TcbssState toCState(const tcbss::State& s) {
 /// 轨迹求解器的 C++ 侧持有点：参数 + 可复用缓冲。
 struct TrajectoryHolder {
     tcbss::Params params;
+    int refinement;
     tcbss::TrajectoryWorkspace workspace;
 
-    explicit TrajectoryHolder(const tcbss::Params& p) : params(p) {}
+    TrajectoryHolder(const tcbss::Params& p, int r) : params(p), refinement(r) {}
 };
 
 TrajectoryHolder* asTrajectory(TcbssTrajectory* t) {
@@ -115,9 +116,10 @@ tcbss::LossSpec makeSpec(double w_psi_b,
 /// 参数梯度求解器的 C++ 侧持有点。
 struct ParamGradientHolder {
     tcbss::Params params;
+    int refinement;
     tcbss::ParamGradientWorkspace workspace;
 
-    explicit ParamGradientHolder(const tcbss::Params& p) : params(p) {}
+    ParamGradientHolder(const tcbss::Params& p, int r) : params(p), refinement(r) {}
 };
 
 ParamGradientHolder* asParamGradient(TcbssTrajectory* t) {
@@ -270,14 +272,14 @@ void tcbss_step(TcbssSimulator* sim,
 
 /* ==================================================================== */
 /* 有限多步轨迹 + 离散伴随梯度                                          */
-TcbssTrajectory* tcbss_trajectory_create(const TcbssParams* params) {
+TcbssTrajectory* tcbss_trajectory_create(const TcbssParams* params, int refinement) {
     if (params == nullptr) {
         setError("tcbss_trajectory_create: params is NULL");
         return nullptr;
     }
     try {
         g_last_error.clear();
-        auto* holder = new TrajectoryHolder(toParams(*params));
+        auto* holder = new TrajectoryHolder(toParams(*params), refinement);
         return reinterpret_cast<TcbssTrajectory*>(holder);
     } catch (const std::exception& e) {
         setError(e.what());
@@ -297,6 +299,7 @@ double tcbss_trajectory_loss(const TcbssTrajectory* t,
                              double dtheta_c,
                              double ddtheta_c,
                              double dt,
+                             int refinement,
                              size_t num_steps,
                              const double* tau,
                              double tau_b_fixed,
@@ -326,7 +329,7 @@ double tcbss_trajectory_loss(const TcbssTrajectory* t,
     }
     const auto* holder = asTrajectory(t);
     const char* err =
-        tcbss::validateTrajectoryConfig(holder->params, num_steps, dt);
+        tcbss::validateTrajectoryConfig(holder->params, num_steps, dt, refinement);
     if (err != nullptr) {
         setError(err);
         return -1.0;
@@ -337,7 +340,7 @@ double tcbss_trajectory_loss(const TcbssTrajectory* t,
                                               w_tau_s, target_psi_b, target_psi_s,
                                               target_dpsi_b, target_dpsi_s);
         return tcbss::computeTrajectoryLoss(holder->params, theta_c0, dtheta_c, ddtheta_c, dt,
-                                            num_steps, tau, tau_b_fixed, tau_s_fixed, spec,
+                                            refinement, num_steps, tau, tau_b_fixed, tau_s_fixed, spec,
                                             toState(*x0), out_psi_b, out_psi_s, out_dpsi_b,
                                             out_dpsi_s);
     } catch (const std::exception& e) {
@@ -354,6 +357,7 @@ double tcbss_trajectory_gradient(TcbssTrajectory* t,
                                  double dtheta_c,
                                  double ddtheta_c,
                                  double dt,
+                                 int refinement,
                                  size_t num_steps,
                                  const double* tau,
                                  const TcbssState* x0,
@@ -379,7 +383,7 @@ double tcbss_trajectory_gradient(TcbssTrajectory* t,
     }
     auto* holder = asTrajectory(t);
     const char* err =
-        tcbss::validateTrajectoryConfig(holder->params, num_steps, dt);
+        tcbss::validateTrajectoryConfig(holder->params, num_steps, dt, refinement);
     if (err != nullptr) {
         setError(err);
         return -1.0;
@@ -391,7 +395,7 @@ double tcbss_trajectory_gradient(TcbssTrajectory* t,
                                               target_dpsi_b, target_dpsi_s);
         tcbss::State final_state{};
         const double loss = tcbss::simulateAndGradient(
-            holder->params, theta_c0, dtheta_c, ddtheta_c, dt, num_steps, tau, spec,
+            holder->params, theta_c0, dtheta_c, ddtheta_c, dt, refinement, num_steps, tau, spec,
             toState(*x0), holder->workspace, grad_tau,
             (out_final_state != nullptr) ? &final_state : nullptr,
             /*with_step_jacobians=*/false);
@@ -418,7 +422,7 @@ const char* tcbss_param_gradient_name(int index) {
     return tcbss::paramGradientNames()[index];
 }
 
-TcbssTrajectory* tcbss_param_gradient_create(const TcbssParams* params) {
+TcbssTrajectory* tcbss_param_gradient_create(const TcbssParams* params, int refinement) {
     if (params == nullptr) {
         setError("tcbss_param_gradient_create: params is NULL");
         return nullptr;
@@ -426,7 +430,7 @@ TcbssTrajectory* tcbss_param_gradient_create(const TcbssParams* params) {
     try {
         g_last_error.clear();
         return reinterpret_cast<TcbssTrajectory*>(
-            new ParamGradientHolder(toParams(*params)));
+            new ParamGradientHolder(toParams(*params), refinement));
     } catch (const std::exception& e) {
         setError(e.what());
         return nullptr;
@@ -440,11 +444,42 @@ void tcbss_param_gradient_destroy(TcbssTrajectory* t) {
     delete asParamGradient(t);
 }
 
+int tcbss_param_gradient_set_params(TcbssTrajectory* t, const TcbssParams* params) {
+    if (t == nullptr) {
+        setError("tcbss_param_gradient_set_params: trajectory is NULL");
+        return 0;
+    }
+    if (params == nullptr) {
+        setError("tcbss_param_gradient_set_params: params is NULL");
+        return 0;
+    }
+    try {
+        g_last_error.clear();
+        asParamGradient(t)->params = toParams(*params);
+        return 1;
+    } catch (const std::exception& e) {
+        setError(e.what());
+        return 0;
+    } catch (...) {
+        setError("tcbss_param_gradient_set_params: unknown error");
+        return 0;
+    }
+}
+
+void tcbss_param_gradient_get_params(const TcbssTrajectory* t, TcbssParams* out) {
+    if (t == nullptr || out == nullptr) {
+        setError("tcbss_param_gradient_get_params: trajectory or out is NULL");
+        return;
+    }
+    *out = toCParams(asParamGradient(t)->params);
+}
+
 double tcbss_param_gradient_loss(const TcbssTrajectory* t,
                                  double theta_c0,
                                  double dtheta_c,
                                  double ddtheta_c,
                                  double dt,
+                                 int refinement,
                                  size_t num_steps,
                                  const double* tau,
                                  const TcbssState* x0,
@@ -469,7 +504,7 @@ double tcbss_param_gradient_loss(const TcbssTrajectory* t,
         return -1.0;
     }
     const auto* holder = asParamGradient(t);
-    if (const char* err = tcbss::validateParamGradientConfig(holder->params, num_steps, dt)) {
+    if (const char* err = tcbss::validateParamGradientConfig(holder->params, num_steps, dt, refinement)) {
         setError(err);
         return -1.0;
     }
@@ -478,7 +513,7 @@ double tcbss_param_gradient_loss(const TcbssTrajectory* t,
             w_psi_b, w_psi_s, w_dpsi_b, w_dpsi_s, target_psi_b, target_psi_s,
             target_dpsi_b, target_dpsi_s);
         return tcbss::computeParamGradientLoss(holder->params, theta_c0, dtheta_c, ddtheta_c,
-                                              dt, num_steps, tau, spec, toState(*x0),
+                                              dt, refinement, num_steps, tau, spec, toState(*x0),
                                               out_psi_b, out_psi_s, out_dpsi_b, out_dpsi_s);
     } catch (const std::exception& e) {
         setError(e.what());
@@ -494,6 +529,7 @@ double tcbss_param_gradient_run(TcbssTrajectory* t,
                                 double dtheta_c,
                                 double ddtheta_c,
                                 double dt,
+                                int refinement,
                                 size_t num_steps,
                                 const double* tau,
                                 const TcbssState* x0,
@@ -516,7 +552,7 @@ double tcbss_param_gradient_run(TcbssTrajectory* t,
         return -1.0;
     }
     auto* holder = asParamGradient(t);
-    if (const char* err = tcbss::validateParamGradientConfig(holder->params, num_steps, dt)) {
+    if (const char* err = tcbss::validateParamGradientConfig(holder->params, num_steps, dt, refinement)) {
         setError(err);
         return -1.0;
     }
@@ -526,7 +562,7 @@ double tcbss_param_gradient_run(TcbssTrajectory* t,
             target_dpsi_b, target_dpsi_s);
         tcbss::State final_state{};
         const double loss = tcbss::computeParamGradient(
-            holder->params, theta_c0, dtheta_c, ddtheta_c, dt, num_steps, tau, spec,
+            holder->params, theta_c0, dtheta_c, ddtheta_c, dt, refinement, num_steps, tau, spec,
             toState(*x0), holder->workspace, grad_p,
             (out_final_state != nullptr) ? &final_state : nullptr);
         if (out_final_state != nullptr) *out_final_state = toCState(final_state);

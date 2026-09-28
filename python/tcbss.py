@@ -151,7 +151,7 @@ def _load_library() -> ctypes.CDLL:
 
     # ---- 轨迹梯度接口 ----
     lib.tcbss_trajectory_create.restype = ctypes.c_void_p
-    lib.tcbss_trajectory_create.argtypes = [ctypes.POINTER(_CParams)]
+    lib.tcbss_trajectory_create.argtypes = [ctypes.POINTER(_CParams), ctypes.c_int]
 
     lib.tcbss_trajectory_destroy.restype = None
     lib.tcbss_trajectory_destroy.argtypes = [ctypes.c_void_p]
@@ -163,6 +163,7 @@ def _load_library() -> ctypes.CDLL:
         ctypes.c_void_p,                                  # t
         ctypes.c_double, ctypes.c_double, ctypes.c_double,  # theta_c0, dtheta_c, ddtheta_c
         ctypes.c_double,                                  # dt
+        ctypes.c_int,                                     # refinement
         ctypes.c_size_t,                                  # num_steps
         _dbl_p,                                           # tau
         ctypes.c_double, ctypes.c_double,                 # tau_b_fixed, tau_s_fixed
@@ -178,6 +179,7 @@ def _load_library() -> ctypes.CDLL:
         ctypes.c_void_p,                                  # t
         ctypes.c_double, ctypes.c_double, ctypes.c_double,  # theta_c0, dtheta_c, ddtheta_c
         ctypes.c_double,                                  # dt
+        ctypes.c_int,                                     # refinement
         ctypes.c_size_t,                                  # num_steps
         _dbl_p,                                           # tau
         ctypes.POINTER(_CState),                          # x0
@@ -196,16 +198,24 @@ def _load_library() -> ctypes.CDLL:
     lib.tcbss_param_gradient_name.argtypes = [ctypes.c_int]
 
     lib.tcbss_param_gradient_create.restype = ctypes.c_void_p
-    lib.tcbss_param_gradient_create.argtypes = [ctypes.POINTER(_CParams)]
+    lib.tcbss_param_gradient_create.argtypes = [ctypes.POINTER(_CParams), ctypes.c_int]
 
     lib.tcbss_param_gradient_destroy.restype = None
     lib.tcbss_param_gradient_destroy.argtypes = [ctypes.c_void_p]
+
+    lib.tcbss_param_gradient_set_params.restype = ctypes.c_int
+    lib.tcbss_param_gradient_set_params.argtypes = [ctypes.c_void_p,
+                                                    ctypes.POINTER(_CParams)]
+
+    lib.tcbss_param_gradient_get_params.restype = None
+    lib.tcbss_param_gradient_get_params.argtypes = [ctypes.c_void_p,
+                                                    ctypes.POINTER(_CParams)]
 
     lib.tcbss_param_gradient_loss.restype = ctypes.c_double
     lib.tcbss_param_gradient_loss.argtypes = [
         ctypes.c_void_p,
         ctypes.c_double, ctypes.c_double, ctypes.c_double,
-        ctypes.c_double, ctypes.c_size_t,
+        ctypes.c_double, ctypes.c_int, ctypes.c_size_t,
         _dbl_p, ctypes.POINTER(_CState),
         ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
         _dbl_p, _dbl_p, _dbl_p, _dbl_p,
@@ -216,7 +226,7 @@ def _load_library() -> ctypes.CDLL:
     lib.tcbss_param_gradient_run.argtypes = [
         ctypes.c_void_p,
         ctypes.c_double, ctypes.c_double, ctypes.c_double,
-        ctypes.c_double, ctypes.c_size_t,
+        ctypes.c_double, ctypes.c_int, ctypes.c_size_t,
         _dbl_p, ctypes.POINTER(_CState),
         ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
         _dbl_p, _dbl_p, _dbl_p, _dbl_p,
@@ -500,13 +510,14 @@ class Trajectory:
         loss, grad = traj.gradient(...)      # grad 形状 (K, 2)
     """
 
-    def __init__(self, params: Params):
+    def __init__(self, params: Params, refinement: int = 4):
         c_params = params._to_c()
-        handle = _lib.tcbss_trajectory_create(ctypes.byref(c_params))
+        handle = _lib.tcbss_trajectory_create(ctypes.byref(c_params), int(refinement))
         if not handle:
             raise RuntimeError(f"tcbss_trajectory_create 失败: {_last_error()}")
         self._handle = handle
         self._params = params
+        self._refinement = int(refinement)
 
     # -- 生命周期 ---------------------------------------------------------
     def close(self) -> None:
@@ -570,6 +581,7 @@ class Trajectory:
         value = _lib.tcbss_trajectory_loss(
             self._require_handle(),
             float(theta_c0), float(dtheta_c), float(ddtheta_c), float(dt),
+            ctypes.c_int(self._refinement),
             ctypes.c_size_t(num_steps),
             _dbl_ptr(tau_arr),
             0.0, 0.0,
@@ -618,6 +630,7 @@ class Trajectory:
         value = _lib.tcbss_trajectory_gradient(
             self._require_handle(),
             float(theta_c0), float(dtheta_c), float(ddtheta_c), float(dt),
+            ctypes.c_int(self._refinement),
             ctypes.c_size_t(num_steps),
             _dbl_ptr(tau_arr),
             ctypes.byref(x0_c),
@@ -664,7 +677,7 @@ class Trajectory:
 
 
 # ---------------------------------------------------------------------------
-# 系统参数辨识模式：对 16 个动力学参数求损失的解析梯度
+# 系统参数辨识模式：对 14 个动力学参数求损失的解析梯度（gx/gy 是已知输入，不辨识）
 # ---------------------------------------------------------------------------
 PARAM_GRADIENT_NAMES = tuple(
     _lib.tcbss_param_gradient_name(i).decode()
@@ -712,13 +725,14 @@ class ParamGradient:
         # grad 形状 (16,)，顺序见 PARAM_GRADIENT_NAMES
     """
 
-    def __init__(self, params: Params):
+    def __init__(self, params: Params, refinement: int = 4):
         c_params = params._to_c()
-        handle = _lib.tcbss_param_gradient_create(ctypes.byref(c_params))
+        handle = _lib.tcbss_param_gradient_create(ctypes.byref(c_params), int(refinement))
         if not handle:
             raise RuntimeError(f"tcbss_param_gradient_create 失败: {_last_error()}")
         self._handle = handle
         self._params = params
+        self._refinement = int(refinement)
 
     def close(self) -> None:
         if getattr(self, "_handle", None):
@@ -744,7 +758,23 @@ class ParamGradient:
 
     @property
     def params(self) -> Params:
-        return self._params
+        """当前求导点参数（从 C 句柄读回，反映 set_params 的结果）。"""
+        c = _CParams()
+        _lib.tcbss_param_gradient_get_params(self._require_handle(), ctypes.byref(c))
+        return Params._from_c(c)
+
+    def set_params(self, params: Params) -> None:
+        """就地更新求导点参数（不重新分配缓冲）。
+
+        **优化循环里每次更新参数后都必须调用**，否则 loss/梯度会一直停留
+        在创建时的参数点上，表现为"loss 不下降、且与学习率无关"。
+        """
+        c_params = params._to_c()
+        ok = _lib.tcbss_param_gradient_set_params(self._require_handle(),
+                                                  ctypes.byref(c_params))
+        if not ok:
+            raise RuntimeError(f"tcbss_param_gradient_set_params 失败: {_last_error()}")
+        self._params = params
 
     @staticmethod
     def _prepare(tau, num_steps=None):
@@ -781,6 +811,7 @@ class ParamGradient:
         val = _lib.tcbss_param_gradient_loss(
             self._require_handle(),
             float(theta_c0), float(dtheta_c), float(ddtheta_c), float(dt),
+            ctypes.c_int(self._refinement),
             ctypes.c_size_t(K), _dbl_ptr(tau_arr), ctypes.byref(x0_c),
             float(spec.w_psi_b), float(spec.w_psi_s),
             float(spec.w_dpsi_b), float(spec.w_dpsi_s),
@@ -802,6 +833,7 @@ class ParamGradient:
         val = _lib.tcbss_param_gradient_run(
             self._require_handle(),
             float(theta_c0), float(dtheta_c), float(ddtheta_c), float(dt),
+            ctypes.c_int(self._refinement),
             ctypes.c_size_t(K), _dbl_ptr(tau_arr), ctypes.byref(x0_c),
             float(spec.w_psi_b), float(spec.w_psi_s),
             float(spec.w_dpsi_b), float(spec.w_dpsi_s),

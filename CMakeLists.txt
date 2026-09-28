@@ -53,13 +53,14 @@ set_target_properties(tcbss PROPERTIES
 message(STATUS "tcbss 动态库输出目录: ${CMAKE_BINARY_DIR}")
 
 # ---------------------------------------------------------------------------
-# 自检程序：轨迹梯度（离散伴随）vs 中心差分
+# 自检程序：轨迹梯度（离散伴随）与参数梯度（前向灵敏度）vs 中心差分
 # 运行: ./build/tcbss_trajectory_test
 # ---------------------------------------------------------------------------
 add_executable(tcbss_trajectory_test
     tests/test_trajectory_gradient.cpp
     src/dynamics.cpp
     src/trajectory.cpp
+    src/param_gradient.cpp
 )
 target_include_directories(tcbss_trajectory_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(tcbss_trajectory_test PRIVATE -Wall -Wextra -Wpedantic)

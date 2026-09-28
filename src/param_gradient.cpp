@@ -1,5 +1,7 @@
 #include "param_gradient.hpp"
 
+#include "trajectory.hpp"  // kRefinementMin/Max
+
 #include <cmath>
 #include <cstdlib>
 
@@ -27,11 +29,12 @@ inline void sincos3(double a, double b, double c, double& sa, double& ca, double
 }
 
 /// 参数索引（与头文件注释、paramGradientNames() 严格一致）。
+/// 注意：重力 gx/gy 是随采集数据一起给出的**已知量**，不是被辨识参数，
+/// 因此不在此枚举内（它仍留在 Params 里供正演使用）。
 enum ParamIndex {
     kMb = 0, kIb, kPbx, kPby,
     kMs, kIs, kPsx, kPsy,
-    kDx, kDy, kGx, kGy,
-    kFbc, kFbv, kFsc, kFsv
+    kDx, kDy, kFbc, kFbv, kFsc, kFsv
 };
 
 constexpr int NP = kParamGradientCount;
@@ -100,18 +103,20 @@ inline void accelOnly(const Params& p,
 
 /// 按参数索引构造扰动后的 Params（用于局部差分）。
 inline Params paramsWithDelta(const Params& p, int idx, double delta) {
-    double v[16] = {p.mb,  p.Ib,  p.Pbx, p.Pby, p.ms,  p.Is,  p.Psx, p.Psy,
-                    p.Dx,  p.Dy,  p.gx,  p.gy,  p.fbc, p.fbv, p.fsc, p.fsv};
+    double v[NP] = {p.mb,  p.Ib,  p.Pbx, p.Pby, p.ms,  p.Is,  p.Psx,
+                    p.Psy, p.Dx,  p.Dy,  p.fbc, p.fbv, p.fsc, p.fsv};
     v[idx] += delta;
     return Params(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
-                  v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15], p.lambda);
+                  v[8], v[9],
+                  p.gx, p.gy,   // 重力是已知量，不参与求导
+                  v[10], v[11], v[12], v[13], p.lambda);
 }
 
 /// 返回该参数的解析偏导是否已经验证过。
 /// 已验证者用闭式；未验证者退回局部中心差分（正确但更慢）。
 inline bool analyticPartialVerified(int idx) {
     (void)idx;
-    return true;   // 全部 16 个参数的解析偏导均已用 FD 逐项核对
+    return true;   // 全部 14 个参数的解析偏导均已用 FD 逐项核对
 }
 
 struct Derived {
@@ -211,18 +216,7 @@ inline void paramPartials(const Params& p, double ct, double st, int idx,
             q.d_gb_sin = p.gy * p.ms;
             q.d_gb_cos = p.gx * p.ms;
             break;
-        case kGx:
-            q.d_gs_sin = p.ms * p.Psx;
-            q.d_gs_cos = p.ms * p.Psy;
-            q.d_gb_sin = p.mb * p.Pbx + p.ms * p.Dx;
-            q.d_gb_cos = p.mb * p.Pby + p.ms * p.Dy;
-            break;
-        case kGy:
-            q.d_gs_sin = p.ms * p.Psy;
-            q.d_gs_cos = -p.ms * p.Psx;
-            q.d_gb_sin = p.mb * p.Pby + p.ms * p.Dy;
-            q.d_gb_cos = -(p.mb * p.Pbx + p.ms * p.Dx);
-            break;
+        // 重力 gx/gy 是已知量，不参与求导：没有 kGx / kGy 分支。
         case kFbc:
             q.d_fbc = 1.0;
             break;
@@ -334,9 +328,8 @@ inline void evaluate(const Params& p,
     // 保证与解析共享同一模型，代价是每参数 2 次额外加速度求值）。
     for (int i = 0; i < NP; ++i) {
         if (!analyticPartialVerified(i)) {
-            const double base_i[16] = {p.mb,  p.Ib,  p.Pbx, p.Pby, p.ms,  p.Is,
-                                       p.Psx, p.Psy, p.Dx,  p.Dy,  p.gx,  p.gy,
-                                       p.fbc, p.fbv, p.fsc, p.fsv};
+            const double base_i[NP] = {p.mb,  p.Ib,  p.Pbx, p.Pby, p.ms,  p.Is,  p.Psx,
+                                       p.Psy, p.Dx,  p.Dy,  p.fbc, p.fbv, p.fsc, p.fsv};
             const double scale = std::fabs(base_i[i]) > 1.0 ? std::fabs(base_i[i]) : 1.0;
             const double hstep = 1e-7 * scale;
             double bp, bs, mp, ms_;
@@ -387,15 +380,6 @@ inline void baseAt(double tc0, double dtc0, double ddtc, double tau, double& tc,
     dtc = dtc0 + ddtc * tau;
 }
 
-inline void matmul4(const double A[4][4], const double B[4][4], double out[4][4]) {
-    for (int i = 0; i < 4; ++i) {
-        for (int j = 0; j < 4; ++j) {
-            out[i][j] = A[i][0] * B[0][j] + A[i][1] * B[1][j] + A[i][2] * B[2][j] +
-                        A[i][3] * B[3][j];
-        }
-    }
-}
-
 inline double targetAt(const double* seq, std::size_t k) {
     return (seq != nullptr) ? seq[k] : 0.0;
 }
@@ -433,10 +417,49 @@ inline double stepLoss(const ParamLossSpec& w,
 
 const char* const kNames[NP] = {
     "mb", "Ib", "Pbx", "Pby", "ms", "Is", "Psx", "Psy",
-    "Dx", "Dy", "gx", "gy", "fbc", "fbv", "fsc", "fsv"};
+    "Dx", "Dy", "fbc", "fbv", "fsc", "fsv"};
 
-/// 单个 RK4 子步：给定起始状态与灵敏度 S，返回末端状态与末端灵敏度。
-/// 用"四阶段 dk_i/dp 的显式链式"，与 dY/dy = A4 完全同构。
+/// 只要状态推进的经典 4 阶段 RK4（纯损失路径用，不碰灵敏度）。
+inline void substepStateOnly(const Params& p,
+                             const Derived& d,
+                             State& x,
+                             double Tb,
+                             double Ts,
+                             double tc0,
+                             double dtc0,
+                             double ddtc,
+                             double t0,
+                             double h,
+                             Eval* ev) {
+    double tc_s, dtc_s;
+    baseAt(tc0, dtc0, ddtc, t0, tc_s, dtc_s);
+    evaluate(p, d, x, Tb, Ts, tc_s, dtc_s, ddtc, ev[0]);
+    const State x2 = advance(x, ev[0].dx, 0.5 * h);
+    baseAt(tc0, dtc0, ddtc, t0 + 0.5 * h, tc_s, dtc_s);
+    evaluate(p, d, x2, Tb, Ts, tc_s, dtc_s, ddtc, ev[1]);
+    const State x3 = advance(x, ev[1].dx, 0.5 * h);
+    evaluate(p, d, x3, Tb, Ts, tc_s, dtc_s, ddtc, ev[2]);
+    const State x4 = advance(x, ev[2].dx, h);
+    baseAt(tc0, dtc0, ddtc, t0 + h, tc_s, dtc_s);
+    evaluate(p, d, x4, Tb, Ts, tc_s, dtc_s, ddtc, ev[3]);
+    const double w1 = h / 6.0, w2 = 2.0 * h / 6.0;
+    x.theta_b += w1 * (ev[0].dx.dtheta_b + ev[3].dx.dtheta_b) +
+                 w2 * (ev[1].dx.dtheta_b + ev[2].dx.dtheta_b);
+    x.dtheta_b += w1 * (ev[0].dx.ddtheta_b + ev[3].dx.ddtheta_b) +
+                  w2 * (ev[1].dx.ddtheta_b + ev[2].dx.ddtheta_b);
+    x.theta_s += w1 * (ev[0].dx.dtheta_s + ev[3].dx.dtheta_s) +
+                 w2 * (ev[1].dx.dtheta_s + ev[2].dx.dtheta_s);
+    x.dtheta_s += w1 * (ev[0].dx.ddtheta_s + ev[3].dx.ddtheta_s) +
+                  w2 * (ev[1].dx.ddtheta_s + ev[2].dx.ddtheta_s);
+}
+
+/// 单个子步（经典 4 阶段 RK4）+ 参数灵敏度前传。
+/// 与 include/rk4.hpp 的阶段/权重完全一致；灵敏度用 dk_i/dp 的显式链式：
+///   dk1/dp = Jx1 S + Jp1
+///   dk2/dp = Jx2 (S + (h/2) dk1/dp) + Jp2
+///   dk3/dp = Jx3 (S + (h/2) dk2/dp) + Jp3
+///   dk4/dp = Jx4 (S +  h    dk3/dp) + Jp4
+///   dY'/dp = S + (h/6)(dk1 + 2 dk2 + 2 dk3 + dk4)
 inline void rk4StepWithSens(const Params& p,
                             const Derived& d,
                             const State& x,
@@ -446,112 +469,108 @@ inline void rk4StepWithSens(const Params& p,
                             double tc0,
                             double dtc0,
                             double ddtc,
-                            double t_base,
+                            double t0,
                             double h,
+                            Eval* ev,
                             State& x_next,
                             double S_next[4][NP]) {
     double tc_s, dtc_s;
-    Eval e1, e2, e3, e4;
+    baseAt(tc0, dtc0, ddtc, t0, tc_s, dtc_s);
+    evaluate(p, d, x, Tb, Ts, tc_s, dtc_s, ddtc, ev[0]);
+    const State x2 = advance(x, ev[0].dx, 0.5 * h);
+    baseAt(tc0, dtc0, ddtc, t0 + 0.5 * h, tc_s, dtc_s);
+    evaluate(p, d, x2, Tb, Ts, tc_s, dtc_s, ddtc, ev[1]);
+    const State x3 = advance(x, ev[1].dx, 0.5 * h);
+    evaluate(p, d, x3, Tb, Ts, tc_s, dtc_s, ddtc, ev[2]);
+    const State x4 = advance(x, ev[2].dx, h);
+    baseAt(tc0, dtc0, ddtc, t0 + h, tc_s, dtc_s);
+    evaluate(p, d, x4, Tb, Ts, tc_s, dtc_s, ddtc, ev[3]);
 
-    baseAt(tc0, dtc0, ddtc, t_base, tc_s, dtc_s);
-    evaluate(p, d, x, Tb, Ts, tc_s, dtc_s, ddtc, e1);
-    State x2 = advance(x, e1.dx, 0.5 * h);
-
-    baseAt(tc0, dtc0, ddtc, t_base + 0.5 * h, tc_s, dtc_s);
-    evaluate(p, d, x2, Tb, Ts, tc_s, dtc_s, ddtc, e2);
-    State x3 = advance(x, e2.dx, 0.5 * h);
-    evaluate(p, d, x3, Tb, Ts, tc_s, dtc_s, ddtc, e3);
-
-    State x4 = advance(x, e3.dx, h);
-    baseAt(tc0, dtc0, ddtc, t_base + h, tc_s, dtc_s);
-    evaluate(p, d, x4, Tb, Ts, tc_s, dtc_s, ddtc, e4);
-
-    // --- 状态推进 ---
     const double w1 = h / 6.0, w2 = 2.0 * h / 6.0;
-    x_next.theta_b = x.theta_b + w1 * (e1.dx.dtheta_b + e4.dx.dtheta_b) +
-                     w2 * (e2.dx.dtheta_b + e3.dx.dtheta_b);
-    x_next.dtheta_b = x.dtheta_b + w1 * (e1.dx.ddtheta_b + e4.dx.ddtheta_b) +
-                      w2 * (e2.dx.ddtheta_b + e3.dx.ddtheta_b);
-    x_next.theta_s = x.theta_s + w1 * (e1.dx.dtheta_s + e4.dx.dtheta_s) +
-                     w2 * (e2.dx.dtheta_s + e3.dx.dtheta_s);
-    x_next.dtheta_s = x.dtheta_s + w1 * (e1.dx.ddtheta_s + e4.dx.ddtheta_s) +
-                      w2 * (e2.dx.ddtheta_s + e3.dx.ddtheta_s);
+    x_next.theta_b = x.theta_b + w1 * (ev[0].dx.dtheta_b + ev[3].dx.dtheta_b) +
+                     w2 * (ev[1].dx.dtheta_b + ev[2].dx.dtheta_b);
+    x_next.dtheta_b = x.dtheta_b + w1 * (ev[0].dx.ddtheta_b + ev[3].dx.ddtheta_b) +
+                      w2 * (ev[1].dx.ddtheta_b + ev[2].dx.ddtheta_b);
+    x_next.theta_s = x.theta_s + w1 * (ev[0].dx.dtheta_s + ev[3].dx.dtheta_s) +
+                     w2 * (ev[1].dx.dtheta_s + ev[2].dx.dtheta_s);
+    x_next.dtheta_s = x.dtheta_s + w1 * (ev[0].dx.ddtheta_s + ev[3].dx.ddtheta_s) +
+                      w2 * (ev[1].dx.ddtheta_s + ev[2].dx.ddtheta_s);
 
-    // --- 灵敏度：先求各阶段的 dk_i/dp ---
-    //   dk1/dp = Jp1
-    //   dk2/dp = Jp2 + (h/2) J1 dk1/dp
-    //   dk3/dp = Jp3 + (h/2) J2 dk2/dp
-    //   dk4/dp = Jp4 +  h    J3 dk3/dp
-    // 再 dY'/dp = (h/6)(dk1 + 2 dk2 + 2 dk3 + dk4) = A4 * S + Jp_eff
-    double dk[4][4][NP];
+    // --- 参数灵敏度：与上面状态更新逐项对应的显式 4 阶段链式 ---
+    //   dk1 = Jx1*S            + Jp1 ; dx2 = S + (h/2) dk1
+    //   dk2 = Jx2*dx2          + Jp2 ; dx3 = S + (h/2) dk2
+    //   dk3 = Jx3*dx3          + Jp3 ; dx4 = S +  h    dk3
+    //   dk4 = Jx4*dx4          + Jp4
+    //   S'  = S + (h/6)(dk1 + 2 dk2 + 2 dk3 + dk4)
+    //
+    // 说明：不要写成 S' = A4*S + jp_eff 的形式。A4 = I + h*Jx3*A3 只是 k4
+    // 那一路的链式因子，它不等于整步传播子 dY'/dY = W =
+    // I + (h/6)(Jx1 + 2 Jx2 A2 + 2 Jx3 A3 + Jx4 A4)；用 A4 代替 W 会让
+    // 灵敏度只剩 O(h^3) 精度（状态是 O(h^5)），在长轨迹上累积成可见偏差。
+    // 显式链式与状态更新同源，逐项对应，不存在这种近似。
+    double dk1[4][NP], dk2[4][NP], dk3[4][NP], dk4[4][NP];
     for (int i = 0; i < 4; ++i)
-        for (int j = 0; j < NP; ++j) dk[0][i][j] = e1.Jp[i][j];
-    for (int i = 0; i < 4; ++i) {
         for (int j = 0; j < NP; ++j) {
-            double a = e2.Jp[i][j];
-            for (int c = 0; c < 4; ++c) a += (0.5 * h) * e1.Jx[i][c] * dk[0][c][j];
-            dk[1][i][j] = a;
+            double a = ev[0].Jp[i][j];
+            for (int c = 0; c < 4; ++c) a += ev[0].Jx[i][c] * S[c][j];
+            dk1[i][j] = a;
         }
-    }
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 4; ++i)
         for (int j = 0; j < NP; ++j) {
-            double a = e3.Jp[i][j];
-            for (int c = 0; c < 4; ++c) a += (0.5 * h) * e2.Jx[i][c] * dk[1][c][j];
-            dk[2][i][j] = a;
+            double a = ev[1].Jp[i][j];
+            for (int c = 0; c < 4; ++c)
+                a += ev[1].Jx[i][c] * (S[c][j] + 0.5 * h * dk1[c][j]);
+            dk2[i][j] = a;
         }
-    }
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 4; ++i)
         for (int j = 0; j < NP; ++j) {
-            double a = e4.Jp[i][j];
-            for (int c = 0; c < 4; ++c) a += h * e3.Jx[i][c] * dk[2][c][j];
-            dk[3][i][j] = a;
+            double a = ev[2].Jp[i][j];
+            for (int c = 0; c < 4; ++c)
+                a += ev[2].Jx[i][c] * (S[c][j] + 0.5 * h * dk2[c][j]);
+            dk3[i][j] = a;
         }
-    }
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < NP; ++j) {
+            double a = ev[3].Jp[i][j];
+            for (int c = 0; c < 4; ++c)
+                a += ev[3].Jx[i][c] * (S[c][j] + h * dk3[c][j]);
+            dk4[i][j] = a;
+        }
 
-    // 整步：Phi 用状态雅可比链（与 dY/dy 一致），Jp_eff = (h/6)(dk1+2dk2+2dk3+dk4)
-    const double hh = 0.5 * h;
-    double A2[4][4], A3[4][4], A4m[4][4], tmp[4][4];
     for (int i = 0; i < 4; ++i)
-        for (int j = 0; j < 4; ++j) A2[i][j] = (i == j ? 1.0 : 0.0) + hh * e1.Jx[i][j];
-    matmul4(e2.Jx, A2, tmp);
-    for (int i = 0; i < 4; ++i)
-        for (int j = 0; j < 4; ++j) A3[i][j] = (i == j ? 1.0 : 0.0) + hh * tmp[i][j];
-    matmul4(e3.Jx, A3, tmp);
-    for (int i = 0; i < 4; ++i)
-        for (int j = 0; j < 4; ++j) A4m[i][j] = (i == j ? 1.0 : 0.0) + h * tmp[i][j];
-
-    for (int i = 0; i < 4; ++i) {
-        for (int j = 0; j < NP; ++j) {
-            const double jp_eff = w1 * (dk[0][i][j] + dk[3][i][j]) +
-                                  w2 * (dk[1][i][j] + dk[2][i][j]);
-            double acc = 0.0;
-            for (int a = 0; a < 4; ++a) acc += A4m[i][a] * S[a][j];
-            S_next[i][j] = acc + jp_eff;
-        }
-    }
+        for (int j = 0; j < NP; ++j)
+            S_next[i][j] = S[i][j] + w1 * (dk1[i][j] + dk4[i][j]) +
+                           w2 * (dk2[i][j] + dk3[i][j]);
 }
 
 }  // namespace
 
 const char* const* paramGradientNames() { return kNames; }
 
-const char* validateParamGradientConfig(const Params& p, std::size_t num_steps, double dt) {
+const char* validateParamGradientConfig(const Params& p, std::size_t num_steps, double dt,
+                                        int refinement) {
     if (!(dt > 0.0)) return "dt must be > 0";
     if (num_steps < 1) return "num_steps must be >= 1";
+    if (refinement < kRefinementMin || refinement > kRefinementMax) {
+        return "refinement out of range";
+    }
     if (!(p.lambda > 0.0)) return "lambda must be > 0";
     return nullptr;
 }
 
-bool ParamGradientWorkspace::resize(std::size_t steps) {
-    if (steps == num_steps && X != nullptr) return true;
+bool ParamGradientWorkspace::resize(std::size_t steps, int refine) {
+    if (steps == num_steps && refine == refinement && X != nullptr) return true;
     release();
     num_steps = steps;
-    num_substeps = steps * static_cast<std::size_t>(kParamRefinement);
+    refinement = refine;
+    num_substeps = steps * static_cast<std::size_t>(refine);
     X = static_cast<State*>(std::calloc(steps, sizeof(State)));
     Xsub = static_cast<State*>(std::calloc(num_substeps, sizeof(State)));
     Jx = static_cast<double*>(std::calloc(num_substeps * 16, sizeof(double)));
+    evbuf = std::malloc(sizeof(Eval) * 4);
     dLdX = static_cast<double*>(std::calloc(num_substeps * 4, sizeof(double)));
-    if (X == nullptr || Xsub == nullptr || Jx == nullptr || dLdX == nullptr) {
+    if (X == nullptr || Xsub == nullptr || Jx == nullptr || dLdX == nullptr ||
+        evbuf == nullptr) {
         release();
         return false;
     }
@@ -559,9 +578,10 @@ bool ParamGradientWorkspace::resize(std::size_t steps) {
 }
 
 void ParamGradientWorkspace::release() {
-    std::free(X); std::free(Xsub); std::free(Jx); std::free(dLdX);
-    X = nullptr; Xsub = nullptr; Jx = nullptr; dLdX = nullptr;
+    std::free(X); std::free(Xsub); std::free(Jx); std::free(dLdX); std::free(evbuf);
+    X = nullptr; Xsub = nullptr; Jx = nullptr; dLdX = nullptr; evbuf = nullptr;
     num_steps = 0;
+    refinement = 0;
     num_substeps = 0;
 }
 
@@ -570,6 +590,7 @@ double computeParamGradientLoss(const Params& p,
                                 double dtheta_c,
                                 double ddtheta_c,
                                 double dt,
+                                int refinement,
                                 std::size_t num_steps,
                                 const double* tau,
                                 const ParamLossSpec& spec,
@@ -578,9 +599,12 @@ double computeParamGradientLoss(const Params& p,
                                 double* out_psi_s,
                                 double* out_dpsi_b,
                                 double* out_dpsi_s) {
+    if (validateParamGradientConfig(p, num_steps, dt, refinement) != nullptr) return 0.0;
     const Derived d = makeDerived(p);
-    const double h = dt / static_cast<double>(kParamRefinement);
+    const double h = dt / static_cast<double>(refinement);
     const double inv_k = 1.0 / static_cast<double>(num_steps);
+    Eval* ev = static_cast<Eval*>(std::malloc(sizeof(Eval) * 4));
+    if (ev == nullptr) return 0.0;
 
     State x = x0;
     double loss = 0.0;
@@ -589,12 +613,9 @@ double computeParamGradientLoss(const Params& p,
         const double Ts = tau[2 * k + 1];
         const double t_base = static_cast<double>(k) * dt;
 
-        for (int s = 0; s < kParamRefinement; ++s) {
-            double Sdummy[4][NP] = {};
-            State x_next;
-            rk4StepWithSens(p, d, x, Sdummy, Tb, Ts, theta_c0, dtheta_c, ddtheta_c, t_base, h,
-                            x_next, Sdummy);
-            x = x_next;
+        for (int s = 0; s < refinement; ++s) {
+            substepStateOnly(p, d, x, Tb, Ts, theta_c0, dtheta_c, ddtheta_c,
+                             static_cast<double>(s) * h, h, ev);
         }
 
         double tc_end, dtc_end;
@@ -610,6 +631,7 @@ double computeParamGradientLoss(const Params& p,
 
         loss += stepLoss(spec, tc_end, dtc_end, x, k, inv_k);
     }
+    std::free(ev);
     return loss;
 }
 
@@ -618,6 +640,7 @@ double computeParamGradient(const Params& p,
                             double dtheta_c,
                             double ddtheta_c,
                             double dt,
+                            int refinement,
                             std::size_t num_steps,
                             const double* tau,
                             const ParamLossSpec& spec,
@@ -626,10 +649,10 @@ double computeParamGradient(const Params& p,
                             double* grad_p,
                             State* out_final_state) {
     const Derived d = makeDerived(p);
-    const double h = dt / static_cast<double>(kParamRefinement);
+    const double h = dt / static_cast<double>(refinement);
     const double inv_k = 1.0 / static_cast<double>(num_steps);
 
-    if (tau == nullptr || !ws.resize(num_steps)) {
+    if (tau == nullptr || !ws.resize(num_steps, refinement)) {
         if (grad_p != nullptr) {
             for (int i = 0; i < NP; ++i) grad_p[i] = 0.0;
         }
@@ -648,10 +671,11 @@ double computeParamGradient(const Params& p,
         const double Ts = tau[2 * k + 1];
         const double t_base = static_cast<double>(k) * dt;
 
-        for (int s = 0; s < kParamRefinement; ++s) {
+        for (int s = 0; s < refinement; ++s) {
             double Snext[4][NP];
             State x_next;
-            rk4StepWithSens(p, d, x, S, Tb, Ts, theta_c0, dtheta_c, ddtheta_c, t_base, h,
+            rk4StepWithSens(p, d, x, S, Tb, Ts, theta_c0, dtheta_c, ddtheta_c,
+                            static_cast<double>(s) * h, h, static_cast<Eval*>(ws.evbuf),
                             x_next, Snext);
             x = x_next;
             for (int i = 0; i < 4; ++i)
