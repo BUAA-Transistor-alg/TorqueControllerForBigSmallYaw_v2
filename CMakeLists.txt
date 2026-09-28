@@ -26,6 +26,7 @@ add_library(tcbss SHARED
     src/dynamics.cpp
     src/simulator.cpp
     src/trajectory.cpp
+    src/param_gradient.cpp
     src/capi.cpp
 )
 
@@ -39,7 +40,7 @@ target_compile_options(tcbss PRIVATE -Wall -Wextra -Wpedantic)
 # 轨迹梯度模块是计算热区（每步 4 子步 × 4 阶段），单独提高优化等级。
 # 用生成器表达式按编译器选择，避免逐个探测优化选项。
 # ---------------------------------------------------------------------------
-set_source_files_properties(src/trajectory.cpp PROPERTIES
+set_source_files_properties(src/trajectory.cpp src/param_gradient.cpp PROPERTIES
     COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O3;-funroll-loops;-fno-math-errno>")
 
 # 产物统一放到 build/ 根目录，方便 python/ 下按相对路径加载。

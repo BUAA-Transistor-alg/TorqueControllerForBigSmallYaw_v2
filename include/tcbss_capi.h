@@ -210,6 +210,83 @@ double tcbss_trajectory_gradient(TcbssTrajectory* t,
                                  double* grad_tau,
                                  TcbssState* out_final_state);
 
+/* ==================================================================== */
+/* 系统参数辨识模式：对 16 个动力学参数求损失的解析梯度                  */
+/* ==================================================================== */
+
+/*
+ * 与上面的力矩梯度模式完全独立（不同的句柄、不同的函数），互不影响：
+ *   * 力矩序列 tau 是**已知输入**；
+ *   * 决策变量是 16 个动力学参数，通过前向灵敏度求导，无需反向扫描。
+ *
+ * 损失（全局量的四项时间均值加权和，k = 0..K-1）：
+ *   L = (1/2K) sum_k [ w_psi_b (psi_b - psi_b*)^2 + w_psi_s (psi_s - psi_s*)^2
+ *                    + w_dpsi_b (dpsi_b - dpsi_b*)^2 + w_dpsi_s (dpsi_s - dpsi_s*)^2 ]
+ *   psi_b  = theta_c + theta_b          psi_s  = theta_c + theta_b + theta_s
+ *   dpsi_b = dtheta_c + dtheta_b        dpsi_s = dtheta_c + dtheta_b + dtheta_s
+ *
+ * 参数顺序（固定，共 16 个；lambda_ 不参与）：
+ *   0 mb  1 Ib  2 Pbx  3 Pby  4 ms  5 Is  6 Psx  7 Psy
+ *   8 Dx  9 Dy 10 gx  11 gy  12 fbc 13 fbv 14 fsc 15 fsv
+ */
+
+/* 参数个数与名字（用于校验顺序；名字为静态字符串，无需释放）。 */
+int tcbss_param_gradient_count(void);
+const char* tcbss_param_gradient_name(int index);
+
+/* 创建 / 销毁参数梯度求解器（缓冲可跨调用复用）。 */
+TcbssTrajectory* tcbss_param_gradient_create(const TcbssParams* params);
+void tcbss_param_gradient_destroy(TcbssTrajectory* t);
+
+/*
+ * 仅前向：计算损失值，并可导出四个全局量序列（out_* 可为 NULL，长度 K）。
+ * 失败返回 -1 并通过 tcbss_last_error() 给出原因。
+ */
+double tcbss_param_gradient_loss(const TcbssTrajectory* t,
+                                 double theta_c0,
+                                 double dtheta_c,
+                                 double ddtheta_c,
+                                 double dt,
+                                 size_t num_steps,
+                                 const double* tau,
+                                 const TcbssState* x0,
+                                 double w_psi_b,
+                                 double w_psi_s,
+                                 double w_dpsi_b,
+                                 double w_dpsi_s,
+                                 const double* target_psi_b,
+                                 const double* target_psi_s,
+                                 const double* target_dpsi_b,
+                                 const double* target_dpsi_s,
+                                 double* out_psi_b,
+                                 double* out_psi_s,
+                                 double* out_dpsi_b,
+                                 double* out_dpsi_s);
+
+/*
+ * 正向 + 前向参数灵敏度：返回损失，并写出 dL/dp（长度 16）。
+ * grad_p 不可为 NULL。out_final_state 可为 NULL。
+ */
+double tcbss_param_gradient_run(TcbssTrajectory* t,
+                                double theta_c0,
+                                double dtheta_c,
+                                double ddtheta_c,
+                                double dt,
+                                size_t num_steps,
+                                const double* tau,
+                                const TcbssState* x0,
+                                double w_psi_b,
+                                double w_psi_s,
+                                double w_dpsi_b,
+                                double w_dpsi_s,
+                                const double* target_psi_b,
+                                const double* target_psi_s,
+                                const double* target_dpsi_b,
+                                const double* target_dpsi_s,
+                                double* grad_p,
+                                TcbssState* out_final_state);
+
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

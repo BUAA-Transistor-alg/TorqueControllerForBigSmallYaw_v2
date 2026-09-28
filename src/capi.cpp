@@ -6,6 +6,7 @@
 
 #include "params.hpp"
 #include "simulator.hpp"
+#include "param_gradient.hpp"
 #include "state.hpp"
 #include "trajectory.hpp"
 
@@ -102,6 +103,44 @@ tcbss::LossSpec makeSpec(double w_psi_b,
     s.w_dpsi_s = w_dpsi_s;
     s.w_tau_b = w_tau_b;
     s.w_tau_s = w_tau_s;
+    s.target_psi_b = target_psi_b;
+    s.target_psi_s = target_psi_s;
+    s.target_dpsi_b = target_dpsi_b;
+    s.target_dpsi_s = target_dpsi_s;
+    return s;
+}
+
+
+
+/// 参数梯度求解器的 C++ 侧持有点。
+struct ParamGradientHolder {
+    tcbss::Params params;
+    tcbss::ParamGradientWorkspace workspace;
+
+    explicit ParamGradientHolder(const tcbss::Params& p) : params(p) {}
+};
+
+ParamGradientHolder* asParamGradient(TcbssTrajectory* t) {
+    return reinterpret_cast<ParamGradientHolder*>(t);
+}
+
+const ParamGradientHolder* asParamGradient(const TcbssTrajectory* t) {
+    return reinterpret_cast<const ParamGradientHolder*>(t);
+}
+
+tcbss::ParamLossSpec makeParamSpec(double w_psi_b,
+                                   double w_psi_s,
+                                   double w_dpsi_b,
+                                   double w_dpsi_s,
+                                   const double* target_psi_b,
+                                   const double* target_psi_s,
+                                   const double* target_dpsi_b,
+                                   const double* target_dpsi_s) {
+    tcbss::ParamLossSpec s;
+    s.w_psi_b = w_psi_b;
+    s.w_psi_s = w_psi_s;
+    s.w_dpsi_b = w_dpsi_b;
+    s.w_dpsi_s = w_dpsi_s;
     s.target_psi_b = target_psi_b;
     s.target_psi_s = target_psi_s;
     s.target_dpsi_b = target_dpsi_b;
@@ -363,6 +402,140 @@ double tcbss_trajectory_gradient(TcbssTrajectory* t,
         return -1.0;
     } catch (...) {
         setError("tcbss_trajectory_gradient: unknown error");
+        return -1.0;
+    }
+}
+
+
+/* ==================================================================== */
+/* 系统参数辨识模式                                                     */
+int tcbss_param_gradient_count(void) {
+    return tcbss::kParamGradientCount;
+}
+
+const char* tcbss_param_gradient_name(int index) {
+    if (index < 0 || index >= tcbss::kParamGradientCount) return "";
+    return tcbss::paramGradientNames()[index];
+}
+
+TcbssTrajectory* tcbss_param_gradient_create(const TcbssParams* params) {
+    if (params == nullptr) {
+        setError("tcbss_param_gradient_create: params is NULL");
+        return nullptr;
+    }
+    try {
+        g_last_error.clear();
+        return reinterpret_cast<TcbssTrajectory*>(
+            new ParamGradientHolder(toParams(*params)));
+    } catch (const std::exception& e) {
+        setError(e.what());
+        return nullptr;
+    } catch (...) {
+        setError("tcbss_param_gradient_create: unknown error");
+        return nullptr;
+    }
+}
+
+void tcbss_param_gradient_destroy(TcbssTrajectory* t) {
+    delete asParamGradient(t);
+}
+
+double tcbss_param_gradient_loss(const TcbssTrajectory* t,
+                                 double theta_c0,
+                                 double dtheta_c,
+                                 double ddtheta_c,
+                                 double dt,
+                                 size_t num_steps,
+                                 const double* tau,
+                                 const TcbssState* x0,
+                                 double w_psi_b,
+                                 double w_psi_s,
+                                 double w_dpsi_b,
+                                 double w_dpsi_s,
+                                 const double* target_psi_b,
+                                 const double* target_psi_s,
+                                 const double* target_dpsi_b,
+                                 const double* target_dpsi_s,
+                                 double* out_psi_b,
+                                 double* out_psi_s,
+                                 double* out_dpsi_b,
+                                 double* out_dpsi_s) {
+    if (t == nullptr) {
+        setError("tcbss_param_gradient_loss: trajectory is NULL");
+        return -1.0;
+    }
+    if (x0 == nullptr || tau == nullptr) {
+        setError("tcbss_param_gradient_loss: x0 / tau must not be NULL");
+        return -1.0;
+    }
+    const auto* holder = asParamGradient(t);
+    if (const char* err = tcbss::validateParamGradientConfig(holder->params, num_steps, dt)) {
+        setError(err);
+        return -1.0;
+    }
+    try {
+        const tcbss::ParamLossSpec spec = makeParamSpec(
+            w_psi_b, w_psi_s, w_dpsi_b, w_dpsi_s, target_psi_b, target_psi_s,
+            target_dpsi_b, target_dpsi_s);
+        return tcbss::computeParamGradientLoss(holder->params, theta_c0, dtheta_c, ddtheta_c,
+                                              dt, num_steps, tau, spec, toState(*x0),
+                                              out_psi_b, out_psi_s, out_dpsi_b, out_dpsi_s);
+    } catch (const std::exception& e) {
+        setError(e.what());
+        return -1.0;
+    } catch (...) {
+        setError("tcbss_param_gradient_loss: unknown error");
+        return -1.0;
+    }
+}
+
+double tcbss_param_gradient_run(TcbssTrajectory* t,
+                                double theta_c0,
+                                double dtheta_c,
+                                double ddtheta_c,
+                                double dt,
+                                size_t num_steps,
+                                const double* tau,
+                                const TcbssState* x0,
+                                double w_psi_b,
+                                double w_psi_s,
+                                double w_dpsi_b,
+                                double w_dpsi_s,
+                                const double* target_psi_b,
+                                const double* target_psi_s,
+                                const double* target_dpsi_b,
+                                const double* target_dpsi_s,
+                                double* grad_p,
+                                TcbssState* out_final_state) {
+    if (t == nullptr) {
+        setError("tcbss_param_gradient_run: trajectory is NULL");
+        return -1.0;
+    }
+    if (x0 == nullptr || tau == nullptr || grad_p == nullptr) {
+        setError("tcbss_param_gradient_run: x0 / tau / grad_p must not be NULL");
+        return -1.0;
+    }
+    auto* holder = asParamGradient(t);
+    if (const char* err = tcbss::validateParamGradientConfig(holder->params, num_steps, dt)) {
+        setError(err);
+        return -1.0;
+    }
+    try {
+        const tcbss::ParamLossSpec spec = makeParamSpec(
+            w_psi_b, w_psi_s, w_dpsi_b, w_dpsi_s, target_psi_b, target_psi_s,
+            target_dpsi_b, target_dpsi_s);
+        tcbss::State final_state{};
+        const double loss = tcbss::computeParamGradient(
+            holder->params, theta_c0, dtheta_c, ddtheta_c, dt, num_steps, tau, spec,
+            toState(*x0), holder->workspace, grad_p,
+            (out_final_state != nullptr) ? &final_state : nullptr);
+        if (out_final_state != nullptr) *out_final_state = toCState(final_state);
+        return loss;
+    } catch (const std::exception& e) {
+        setError(e.what());
+        return -1.0;
+    } catch (...) {
+        setError("tcbss_param_gradient_run: unknown error");
         return -1.0;
     }
 }

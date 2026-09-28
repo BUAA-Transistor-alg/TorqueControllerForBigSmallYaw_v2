@@ -30,7 +30,8 @@ from typing import Sequence
 
 import numpy as np
 
-__all__ = ["Params", "State", "Simulator", "Trajectory", "TrajectoryLoss", "library_path"]
+__all__ = ["Params", "State", "Simulator", "Trajectory", "TrajectoryLoss",
+           "ParamGradient", "ParamLossSpec", "PARAM_GRADIENT_NAMES", "library_path"]
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +186,41 @@ def _load_library() -> ctypes.CDLL:
         _dbl_p, _dbl_p, _dbl_p, _dbl_p,                   # targets
         _dbl_p,                                           # grad_tau
         ctypes.POINTER(_CState),                          # out_final_state
+    ]
+
+    # ---- 参数辨识模式 ----
+    lib.tcbss_param_gradient_count.restype = ctypes.c_int
+    lib.tcbss_param_gradient_count.argtypes = []
+
+    lib.tcbss_param_gradient_name.restype = ctypes.c_char_p
+    lib.tcbss_param_gradient_name.argtypes = [ctypes.c_int]
+
+    lib.tcbss_param_gradient_create.restype = ctypes.c_void_p
+    lib.tcbss_param_gradient_create.argtypes = [ctypes.POINTER(_CParams)]
+
+    lib.tcbss_param_gradient_destroy.restype = None
+    lib.tcbss_param_gradient_destroy.argtypes = [ctypes.c_void_p]
+
+    lib.tcbss_param_gradient_loss.restype = ctypes.c_double
+    lib.tcbss_param_gradient_loss.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_double, ctypes.c_double, ctypes.c_double,
+        ctypes.c_double, ctypes.c_size_t,
+        _dbl_p, ctypes.POINTER(_CState),
+        ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
+        _dbl_p, _dbl_p, _dbl_p, _dbl_p,
+        _dbl_p, _dbl_p, _dbl_p, _dbl_p,
+    ]
+
+    lib.tcbss_param_gradient_run.restype = ctypes.c_double
+    lib.tcbss_param_gradient_run.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_double, ctypes.c_double, ctypes.c_double,
+        ctypes.c_double, ctypes.c_size_t,
+        _dbl_p, ctypes.POINTER(_CState),
+        ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
+        _dbl_p, _dbl_p, _dbl_p, _dbl_p,
+        _dbl_p, ctypes.POINTER(_CState),
     ]
 
     return lib
@@ -625,3 +661,158 @@ class Trajectory:
     def __repr__(self) -> str:
         return f"Trajectory({self._params!r})"
 
+
+
+# ---------------------------------------------------------------------------
+# 系统参数辨识模式：对 16 个动力学参数求损失的解析梯度
+# ---------------------------------------------------------------------------
+PARAM_GRADIENT_NAMES = tuple(
+    _lib.tcbss_param_gradient_name(i).decode()
+    for i in range(_lib.tcbss_param_gradient_count())
+)
+"""参与辨识的参数名，顺序与 C 接口严格一致。"""
+
+
+@dataclass(frozen=True)
+class ParamLossSpec:
+    """全局量 psi 的四项时间均值加权损失。
+
+        L = (1/2K) sum_k [ w_psi_b  (psi_b  - psi_b*)^2
+                         + w_psi_s  (psi_s  - psi_s*)^2
+                         + w_dpsi_b (dpsi_b - dpsi_b*)^2
+                         + w_dpsi_s (dpsi_s - dpsi_s*)^2 ]
+
+    其中 psi_b = theta_c + theta_b，psi_s = theta_c + theta_b + theta_s，
+    dpsi_b = dtheta_c + dtheta_b，dpsi_s = dtheta_c + dtheta_b + dtheta_s。
+    目标序列为 None 时该项退化为惩罚幅值。序列长度必须等于 num_steps。
+    """
+
+    w_psi_b: float = 0.0
+    w_psi_s: float = 0.0
+    w_dpsi_b: float = 0.0
+    w_dpsi_s: float = 0.0
+    target_psi_b: Sequence[float] | None = None
+    target_psi_s: Sequence[float] | None = None
+    target_dpsi_b: Sequence[float] | None = None
+    target_dpsi_s: Sequence[float] | None = None
+
+
+class ParamGradient:
+    """参数辨识求解器：力矩序列为已知输入，对动力学参数求损失梯度。
+
+    与 Trajectory 完全独立（不同句柄、不同函数），互不影响。
+    内部用前向灵敏度，不需要反向扫描，也不保存历史状态。
+
+    :param params: 全部系统参数（作为求导点，也是正演所用参数）
+
+    用法::
+
+        pg = ParamGradient(PARAMS)
+        loss, grad = pg.gradient(theta_c0, dtheta_c, ddtheta_c, dt, tau, x0, spec)
+        # grad 形状 (16,)，顺序见 PARAM_GRADIENT_NAMES
+    """
+
+    def __init__(self, params: Params):
+        c_params = params._to_c()
+        handle = _lib.tcbss_param_gradient_create(ctypes.byref(c_params))
+        if not handle:
+            raise RuntimeError(f"tcbss_param_gradient_create 失败: {_last_error()}")
+        self._handle = handle
+        self._params = params
+
+    def close(self) -> None:
+        if getattr(self, "_handle", None):
+            _lib.tcbss_param_gradient_destroy(self._handle)
+            self._handle = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "ParamGradient":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def _require_handle(self) -> ctypes.c_void_p:
+        if not getattr(self, "_handle", None):
+            raise RuntimeError("ParamGradient 已关闭")
+        return self._handle
+
+    @property
+    def params(self) -> Params:
+        return self._params
+
+    @staticmethod
+    def _prepare(tau, num_steps=None):
+        arr = np.ascontiguousarray(tau, dtype=np.float64)
+        if arr.ndim == 1 and arr.shape[0] == 2 and num_steps is not None:
+            arr = np.tile(arr, (num_steps, 1))          # 常值力矩展开
+        if arr.ndim != 2 or arr.shape[1] != 2:
+            raise ValueError("tau 形状必须是 (K, 2) 或长度 2 的常值序列")
+        return arr, arr.shape[0]
+
+    @staticmethod
+    def _targets(spec, K):
+        out = []
+        for name in ("target_psi_b", "target_psi_s", "target_dpsi_b", "target_dpsi_s"):
+            seq = getattr(spec, name)
+            a = _dbl_array(seq)
+            if a is not None and a.size != K:
+                raise ValueError(f"{name} 长度为 {a.size}，应为 K={K}")
+            out.append(a)
+        return out
+
+    def loss(self, theta_c0, dtheta_c, ddtheta_c, dt, tau, x0, spec,
+             return_sequences: bool = False):
+        """仅前向：返回损失值；return_sequences=True 时额外返回四个全局量序列。"""
+        tau_arr, K = self._prepare(tau)
+        t = self._targets(spec, K)
+        x0_c = x0._to_c()
+        if return_sequences:
+            buf = [np.zeros(K, dtype=np.float64) for _ in range(4)]
+            bufp = [b.ctypes.data_as(ctypes.POINTER(ctypes.c_double)) for b in buf]
+        else:
+            buf = None
+            bufp = [ctypes.cast(None, ctypes.POINTER(ctypes.c_double))] * 4
+        val = _lib.tcbss_param_gradient_loss(
+            self._require_handle(),
+            float(theta_c0), float(dtheta_c), float(ddtheta_c), float(dt),
+            ctypes.c_size_t(K), _dbl_ptr(tau_arr), ctypes.byref(x0_c),
+            float(spec.w_psi_b), float(spec.w_psi_s),
+            float(spec.w_dpsi_b), float(spec.w_dpsi_s),
+            _dbl_ptr(t[0]), _dbl_ptr(t[1]), _dbl_ptr(t[2]), _dbl_ptr(t[3]),
+            bufp[0], bufp[1], bufp[2], bufp[3],
+        )
+        if val < 0.0:
+            raise RuntimeError(f"tcbss_param_gradient_loss 失败: {_last_error()}")
+        return (val, *buf) if return_sequences else val
+
+    def gradient(self, theta_c0, dtheta_c, ddtheta_c, dt, tau, x0, spec,
+                 return_final_state: bool = False):
+        """正向 + 前向参数灵敏度，返回 (loss, grad)，grad 形状 (16,)。"""
+        tau_arr, K = self._prepare(tau)
+        t = self._targets(spec, K)
+        x0_c = x0._to_c()
+        grad = np.zeros(len(PARAM_GRADIENT_NAMES), dtype=np.float64)
+        final_c = _CState()
+        val = _lib.tcbss_param_gradient_run(
+            self._require_handle(),
+            float(theta_c0), float(dtheta_c), float(ddtheta_c), float(dt),
+            ctypes.c_size_t(K), _dbl_ptr(tau_arr), ctypes.byref(x0_c),
+            float(spec.w_psi_b), float(spec.w_psi_s),
+            float(spec.w_dpsi_b), float(spec.w_dpsi_s),
+            _dbl_ptr(t[0]), _dbl_ptr(t[1]), _dbl_ptr(t[2]), _dbl_ptr(t[3]),
+            _dbl_ptr(grad), ctypes.byref(final_c),
+        )
+        if val < 0.0:
+            raise RuntimeError(f"tcbss_param_gradient_run 失败: {_last_error()}")
+        if return_final_state:
+            return val, grad, State._from_c(final_c)
+        return val, grad
+
+    def __repr__(self) -> str:
+        return f"ParamGradient({self._params!r})"
