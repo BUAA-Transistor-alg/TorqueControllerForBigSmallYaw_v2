@@ -360,10 +360,18 @@ def _smooth(y: np.ndarray, w: int = 7) -> np.ndarray:
 
 
 def _regression_block(c: Case) -> tuple[np.ndarray, np.ndarray]:
-    """单条数据贡献 2K 行（每个采样点两行：两个广义坐标）。"""
+    """单条数据贡献 2K 行，列为 **12 个可辨识组合**（列满秩，条件数好）。
+
+    为什么不用 17 个"聚合量"直接回归：那 17 列里有 5 组**严格共线**（I_B≡I_D、
+    A≡B、C≡−D、R≡U、S≡V），设计矩阵 rank 只有 12/17；而 θ_s 被限制在 ±30° 后
+    cos θ_s 几乎不变，列之间进一步接近共线，条件数实测 1.4e18 → 摩擦解出来是
+    负值。把 5 组共线列解析地合并成下面 12 列后，条件数降到 ~73，结果才可信。
+
+    列顺序：0 I_BD  1 I_S  2 A+B  3 C−D  4 P  5 Q2  6 R+U  7 S+V
+            8 fbc   9 fbv  10 fsc 11 fsv
+    """
     tc, dtc = c.theta_c_seq, c.dtheta_c_seq
     ddtc = c.ddtheta_c
-    tb = c.psi_b - tc
     ts = c.psi_s - c.psi_b
     dtb = _smooth(c.dpsi_b - dtc)
     dts = _smooth(c.dpsi_s - c.dpsi_b)
@@ -376,69 +384,58 @@ def _regression_block(c: Case) -> tuple[np.ndarray, np.ndarray]:
     gx, gy = c.gx, c.gy
     Tb, Ts = c.tau[:, 0], c.tau[:, 1]
     n = c.K
-    R = np.zeros((2 * n, 17))
+    R = np.zeros((2 * n, 12))
     y = np.zeros(2 * n)
     dc = dts * (2.0 * (dtc + dtb) + dts)          # C1 的公共因子
     for k in range(n):
-        rb = np.zeros(17)
-        rs = np.zeros(17)
+        rb = np.zeros(12)
+        rs = np.zeros(12)
         # --- 第 1 行：M11·ddtb + M12·ddts + C1 + G1 + M11·ddtc − Qb = 0
-        rb[0] += ddtb[k] + ddtc
-        rb[1] += ddtb[k] + ddts[k] + ddtc
-        rb[2] += ddtb[k] + ddtc
-        mfacb = 2.0 * ddtb[k] + ddts[k] + 2.0 * ddtc
-        for idx, coef in ((3, ct[k]), (4, ct[k]), (5, st[k]), (6, -st[k])):
-            rb[idx] += coef * mfacb
-        rb[3] += -st[k] * dc[k]
-        rb[4] += -st[k] * dc[k]
-        rb[5] += ct[k] * dc[k]
-        rb[6] += -ct[k] * dc[k]
-        rb[9] += gx * sb[k] - gy * cb[k]        # R
-        rb[10] += gy * sb[k] + gx * cb[k]       # S
-        rb[11] += gx * sb[k] - gy * cb[k]       # U
-        rb[12] += gy * sb[k] + gx * cb[k]       # V
-        rb[7] += gx * ss[k] - gy * cs[k]        # P
-        rb[8] += gy * ss[k] + gx * cs[k]        # Q2
-        rb[14] += dtb[k]
-        rb[13] += np.tanh(_LAM * dtb[k])
+        rb[0] += ddtb[k] + ddtc                        # I_BD = I_B + I_D
+        rb[1] += ddtb[k] + ddts[k] + ddtc              # I_S
+        rb[2] += ct[k] * (2.0 * ddtb[k] + ddts[k] + 2.0 * ddtc) - st[k] * dc[k]   # A+B
+        rb[3] += st[k] * (2.0 * ddtb[k] + ddts[k] + 2.0 * ddtc) + ct[k] * dc[k]   # C−D
+        rb[6] += gx * sb[k] - gy * cb[k]               # R+U
+        rb[7] += gy * sb[k] + gx * cb[k]               # S+V
+        rb[4] += gx * ss[k] - gy * cs[k]               # P
+        rb[5] += gy * ss[k] + gx * cs[k]               # Q2
+        rb[9] += dtb[k]
+        rb[8] += np.tanh(_LAM * dtb[k])
         y[2 * k] = Tb[k]
         # --- 第 2 行：M12·ddtb + M22·ddts + C2 + G2 + M12·ddtc − Qs = 0
         rs[1] += ddtb[k] + ddts[k] + ddtc
-        mfacs = ddtb[k] + ddtc
-        for idx, coef in ((3, ct[k]), (4, ct[k]), (5, st[k]), (6, -st[k])):
-            rs[idx] += coef * mfacs
-        rs[3] += st[k] * dtb[k] ** 2            # C2 = (A st + B st − C ct + D ct)·ḃb²
-        rs[4] += st[k] * dtb[k] ** 2
-        rs[5] += -ct[k] * dtb[k] ** 2
-        rs[6] += ct[k] * dtb[k] ** 2
-        rs[7] += gx * ss[k] - gy * cs[k]
-        rs[8] += gy * ss[k] + gx * cs[k]
-        rs[16] += dts[k]
-        rs[15] += np.tanh(_LAM * dts[k])
+        rs[2] += ct[k] * (ddtb[k] + ddtc) + st[k] * dtb[k] ** 2                    # A+B
+        rs[3] += st[k] * (ddtb[k] + ddtc) - ct[k] * dtb[k] ** 2                    # C−D
+        rs[4] += gx * ss[k] - gy * cs[k]
+        rs[5] += gy * ss[k] + gx * cs[k]
+        rs[11] += dts[k]
+        rs[10] += np.tanh(_LAM * dts[k])
         y[2 * k + 1] = Ts[k]
         R[2 * k] = rb
         R[2 * k + 1] = rs
     return R, y
 
 
-def algebraic_init(cases: list[Case], nominal=(1.0, 1.0)) -> tuple[dict, dict]:
-    """在测量数据上做闭式最小二乘，解出 12 个可辨识聚合组合，再回代成物理参数。
+def algebraic_init(cases: list[Case], nominal=(1.0, 1.0),
+                   friction: tuple[float, float, float, float] | None = None
+                   ) -> tuple[dict, dict]:
+    """在测量数据上做闭式最小二乘，解出 12 个可辨识组合，再回代成物理参数。
 
-    返回 (物理参数字典, 诊断信息)。两个不可辨识方向（mb、ms 的标度）取使参数
-    全部可行的、且最接近 nominal 的值；它们不影响 loss，只影响参数沿平坦谷的落点。
+    friction 若给出 (fbc, fbv, fsc, fsv) 则**直接采用**（来自匀速旋转实验），
+    否则用回归自己的结果。注意 (mb, ms) 的可行性判据只看 Ib/Is，与摩擦无关——
+    因此摩擦解坏掉也不会像以前那样让整个初始化抛异常。
     """
     R = np.vstack([_regression_block(c)[0] for c in cases])
     y = np.concatenate([_regression_block(c)[1] for c in cases])
     xs, *_ = np.linalg.lstsq(R, y, rcond=None)
 
-    I_S = xs[1]
-    I_BD = xs[0] + xs[2]
-    AB = xs[3] + xs[4]
-    CmD = xs[5] - xs[6]
-    P, Q2 = xs[7], xs[8]
-    RU = xs[9] + xs[11]
-    SV = xs[10] + xs[12]
-    fbc, fbv, fsc, fsv = xs[13], xs[14], xs[15], xs[16]
+    I_BD, I_S = xs[0], xs[1]
+    AB, CmD = xs[2], xs[3]
+    P, Q2 = xs[4], xs[5]
+    RU, SV = xs[6], xs[7]
+    if friction is None:
+        friction = (xs[8], xs[9], xs[10], xs[11])
+    fbc, fbv, fsc, fsv = friction
     det = P * P + Q2 * Q2
 
     def back(mb: float, ms: float) -> dict:
@@ -454,10 +451,11 @@ def algebraic_init(cases: list[Case], nominal=(1.0, 1.0)) -> tuple[dict, dict]:
                     Dx=Dx, Dy=Dy, fbc=fbc, fbv=fbv, fsc=fsc, fsv=fsv)
 
     def feasible(p: dict) -> bool:
-        v = np.array(list(p.values()), dtype=np.float64)
+        # 可行性只看动力学参数；摩擦由独立实验给出，不参与这个判据
+        v = np.array([p["mb"], p["Ib"], p["Pbx"], p["Pby"],
+                      p["ms"], p["Is"], p["Psx"], p["Psy"], p["Dx"], p["Dy"]])
         return bool(np.isfinite(v).all() and p["mb"] > 0 and p["ms"] > 0
-                    and p["Ib"] > 1e-6 and p["Is"] > 1e-6
-                    and p["fbc"] > 0 and p["fbv"] > 0 and p["fsc"] > 0 and p["fsv"] > 0)
+                    and p["Ib"] > 1e-6 and p["Is"] > 1e-6)
 
     best, best_cost = None, np.inf
     for mb in np.geomspace(0.02, 100.0, 140):
@@ -487,6 +485,42 @@ def parse_stages(spec: str) -> list[tuple[int, float]]:
         raise ValueError(f"课程表为空: {spec!r}")
     total_w = sum(w for _, w in out)
     return [(k, w / total_w) for k, w in out]
+
+
+def fit_friction_sweep(sweep_path, p_dyn: dict) -> tuple[float, float, dict]:
+    """用匀速旋转实验的稳态数据拟合关节 b 的两个摩擦系数。
+
+    稳态关系（θ̈_b=θ̈_s=0、θ̇_s≈0、基座静止，见 gen_friction_sweep.py 的推导）：
+        Tb = G1(ψ_b) + fbv·ω + fbc·tanh(λ·ω)
+    用 p_dyn（已辨识的动力学参数）把 G1 精确减掉，剩下的就是 (ω, tanh(λω)) 的二维
+    线性最小二乘——实测残差 ~3e-4 N·m、条件数 ~2，比主回归（cond 1e18）好十几个
+    数量级，所以摩擦能真正解出来。
+
+    返回 (fbc, fbv, 诊断信息)。
+    """
+    d = np.load(sweep_path)
+    ms, Psx, Psy = p_dyn["ms"], p_dyn["Psx"], p_dyn["Psy"]
+    mb, Pbx, Pby = p_dyn["mb"], p_dyn["Pbx"], p_dyn["Pby"]
+    Dx, Dy = p_dyn["Dx"], p_dyn["Dy"]
+    P, Q2 = ms * Psx, ms * Psy
+    R, S = mb * Pbx, mb * Pby
+    U, V = ms * Dx, ms * Dy
+    gx, gy = d["gx"], d["gy"]
+    gb_sin = gx * (R + U) + gy * (S + V)
+    gb_cos = gx * (S + V) - gy * (R + U)
+    gs_sin = gx * P + gy * Q2
+    gs_cos = gx * Q2 - gy * P
+    G1 = (gb_sin * d["mean_sin_psi_b"] + gb_cos * d["mean_cos_psi_b"]
+          + gs_sin * d["mean_sin_psi_s"] + gs_cos * d["mean_cos_psi_s"])
+    yv = d["tb_mean"] - G1
+    A = np.column_stack([d["omega"], d["tanh_omega"]])
+    (fbv, fbc), *_ = np.linalg.lstsq(A, yv, rcond=None)
+    resid = yv - A @ np.array([fbv, fbc])
+    info = dict(n=int(len(yv)), residual=float(np.std(resid)),
+                cond=float(np.linalg.cond(A)),
+                omega_abs_min=float(np.abs(d["omega"]).min()),
+                omega_abs_max=float(np.abs(d["omega"]).max()))
+    return float(fbc), float(fbv), info
 
 
 # 默认课程：窗口从 20 步逐步拉长到 300 步，权重集中在长窗口。
@@ -520,6 +554,13 @@ def main() -> int:
     ap.add_argument("--mass-nominal", type=float, nargs=2, default=(1.0, 1.0),
                     metavar=("MB", "MS"),
                     help="代数初始化中两个不可辨识标度 mb/ms 的标称值（不影响 loss）")
+    ap.add_argument("--friction-sweep", type=str,
+                    default=str(REPO / "data" / "friction" / "sweep.npz"),
+                    help="匀速旋转摩擦实验数据；用它独立拟合 fbc/fbv，"
+                         "关节 s 取一半（fsc=fbc/2, fsv=fbv/2）")
+    ap.add_argument("--no-friction-sweep", dest="use_friction_sweep",
+                    action="store_false",
+                    help="不用匀速旋转实验，摩擦仍由主回归给出（实测会解成负值）")
     ap.add_argument("--init-orders", type=str, default=f"{LOG10_ORDERS_MIN},{LOG10_ORDERS_MAX}",
                     help='--init random 时，初值偏离真值的数量级区间 "min,max"')
     ap.add_argument("--seed", type=int, default=1)
@@ -573,7 +614,26 @@ def main() -> int:
     truth_ident = {n: truth[n] for n in PARAM_NAMES}
     rng = np.random.default_rng(args.seed)
     if args.init == "algebraic":
-        p_init, ainfo = algebraic_init(cases, nominal=tuple(args.mass_nominal))
+        # ---- 摩擦：先用匀速旋转实验独立拟合（关节 s 取一半），再连同动力学一起回代 ----
+        friction = None
+        sweep_path = Path(args.friction_sweep)
+        if args.use_friction_sweep and sweep_path.exists():
+            p_dyn, _ = algebraic_init(cases, nominal=tuple(args.mass_nominal),
+                                      friction=(0.0, 0.0, 0.0, 0.0))
+            fbc, fbv, finfo = fit_friction_sweep(sweep_path, p_dyn)
+            friction = (fbc, fbv, 0.5 * fbc, 0.5 * fbv)   # s 取其一半
+            print(f"匀速旋转实验拟合摩擦（{finfo['n']} 个速度点，"
+                  f"|ω| {finfo['omega_abs_min']:.4f}~{finfo['omega_abs_max']:.2f} rad/s，"
+                  f"残差 {finfo['residual']:.2e} N·m，cond {finfo['cond']:.1f}）:")
+            print(f"  fbc={fbc:.5f}  fbv={fbv:.5f}   真值 {truth['fbc']:.5f} / {truth['fbv']:.5f}"
+                  f"   （相对误差 {abs(fbc-truth['fbc'])/truth['fbc']:.2%} / "
+                  f"{abs(fbv-truth['fbv'])/truth['fbv']:.2%}）")
+            print(f"  关节 s 取一半: fsc={0.5*fbc:.5f} fsv={0.5*fbv:.5f}   "
+                  f"真值 {truth['fsc']:.5f} / {truth['fsv']:.5f}")
+        elif args.use_friction_sweep:
+            print(f"（未找到 {sweep_path}，摩擦改用主回归结果）")
+        p_init, ainfo = algebraic_init(cases, nominal=tuple(args.mass_nominal),
+                                      friction=friction)
         ps = ParamSpec(truth, rng, orders=(0.0, 0.0))
         ps.theta = torch.tensor(
             ParamSpec.to_theta([p_init[n] for n in PARAM_NAMES]),

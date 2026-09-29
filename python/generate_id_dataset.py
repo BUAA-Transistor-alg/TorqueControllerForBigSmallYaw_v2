@@ -41,7 +41,7 @@ HERE = Path(__file__).resolve().parent          # 本文件所在目录：python
 REPO = HERE.parent                              # 仓库根
 sys.path.insert(0, str(HERE))
 
-from tcbss import Params, State, Trajectory, TrajectoryLoss  # noqa: E402
+from tcbss import Params, Simulator, State, Trajectory, TrajectoryLoss  # noqa: E402
 
 # ===========================================================================
 # 1. 真实动力学参数
@@ -59,18 +59,34 @@ TRUE_PARAMS = dict(
 PARAM_NAMES = ["mb", "Ib", "Pbx", "Pby", "ms", "Is", "Psx", "Psy",
                "Dx", "Dy", "fbc", "fbv", "fsc", "fsv"]
 
-# 重力矢量：每条数据在半径 GRAVITY_RADIUS 的圆**内**均匀采样（按面积均匀）。
-GRAVITY_RADIUS = 9.81
+# ===========================================================================
+# 等效重力：摆平面整体放在斜坡上，起作用的只是重力【在摆平面内】的分量
+#   * 平面水平时重力垂直于摆平面 -> 平面内等效重力 = 0（大部分采集时间是这种）
+#   * 斜坡倾角 α <= RAMP_MAX_DEG 时，平面内等效重力 = 9.81*sin(α) <= 3.36 m/s²，
+#     方向在平面内任意
+# 所以 |gx,gy| 的上界是 9.81*sin(20°)=3.36，而**不是** 9.81。
+# ===========================================================================
+GRAVITY_MAG = 9.81                      # 真实重力加速度大小
+RAMP_MAX_DEG = 20.0                     # 斜坡最大倾角
+G_INPLANE_MAX = GRAVITY_MAG * np.sin(np.radians(RAMP_MAX_DEG))   # ≈ 3.355
+FLAT_PROB = 0.6                         # "大部分时间放在平面上"：平面内重力=0 的比例
+ALPHA_MIN_DEG = 1.0                     # 倾斜时的最小倾角（避免退化的极小重力）
 
 
-def sample_gravity(rng: np.random.Generator) -> tuple[float, float]:
-    """在半径 GRAVITY_RADIUS 的圆内均匀采样重力矢量。
+def sample_gravity(rng: np.random.Generator) -> tuple[float, float, float]:
+    """采样摆平面内的等效重力矢量。
 
-    按面积均匀：r = R*sqrt(u)（若取 r = R*u 会过度集中于圆心）。
+    返回 (gx, gy, alpha_deg)：
+      * 以 FLAT_PROB 的概率放在水平面上 -> (0, 0, 0)
+      * 否则倾角 α ~ U(ALPHA_MIN_DEG, RAMP_MAX_DEG)，平面内等效重力
+        = 9.81*sin(α)，方向在平面内均匀
     """
-    r = GRAVITY_RADIUS * np.sqrt(rng.uniform(0.0, 1.0))
+    if rng.random() < FLAT_PROB:
+        return 0.0, 0.0, 0.0
+    alpha = np.radians(rng.uniform(ALPHA_MIN_DEG, RAMP_MAX_DEG))
+    mag = GRAVITY_MAG * np.sin(alpha)
     phi = rng.uniform(0.0, 2.0 * np.pi)
-    return float(r * np.cos(phi)), float(r * np.sin(phi))
+    return float(mag * np.cos(phi)), float(mag * np.sin(phi)), float(np.degrees(alpha))
 
 
 # ===========================================================================
@@ -97,6 +113,63 @@ TAU_S_MAX = 1.0           # N*m
 RAMP_TIME = 0.2           # s，首尾平滑时间
 N_SIN_MIN, N_SIN_MAX = 3, 5
 FREQ_MIN, FREQ_MAX = 0.2, 2.0   # Hz
+
+# ---------------------------------------------------------------------------
+# θ_s 机械限位约束
+#   机构 θ_s 机械限位 ±45°；超过 ±35° 电控会介入降力矩，于是"记录的发送力矩"
+#   不再等于"实际施加力矩"，该条数据对辨识就失效了。因此：
+#     * 设计目标：整条轨迹 max|θ_s| <= THETA_S_TARGET_DEG（留 5° 余量）
+#     * 硬约束：  实测 max|θ_s| > THETA_S_LIMIT_DEG 直接丢弃该条
+#   注意 θ_s 是关节 s 相对关节 b 的角，**不受基座 θ_c 影响**，但会被关节 b 的
+#   加速度通过惯性耦合 M12*qdd_b 拖着走，所以必须闭环稳定（见 make_excitation）。
+# ---------------------------------------------------------------------------
+THETA_S_LIMIT_DEG = 35.0
+THETA_S_TARGET_DEG = 30.0
+THETA_S0_DEG = 5.0            # 初始 θ_s 抖动（不再整圈随机）
+DTHETA_S0_MAX = 0.2           # 初始 θ̇_s [rad/s]
+TS_REF_DEG = 15.0             # θ_s 参考轨迹幅值
+TB_REF_RAD = 0.8              # θ_b 参考轨迹幅值
+KP_B, KD_B = 36.0, 3.4        # 关节 b 的 PD 增益
+KP_S, KD_S = 30.0, 2.0        # 关节 s 的 PD 增益
+MAX_ATTEMPTS = 60             # 单条数据最多尝试次数
+SHRINK = 0.85                 # 每次失败后参考幅值的收缩系数
+TS_FREQ_LO, TS_FREQ_HI = 0.5, 3.0   # θ_s 参考频带（避开 ~0.7Hz 固有频率）
+TB_FREQ_LO, TB_FREQ_HI = 0.2, 1.5   # θ_b 参考频带
+
+# ---------------------------------------------------------------------------
+# 两关节速度限幅（采集时的保护）
+#   参考轨迹按【位置和速度双重归一化】设计，先天不超速；控制器里再加一层**连续
+#   速度障碍**：超出限幅时给出正比于超出量的刹车力矩。用 softplus 平滑，处处可导、
+#   没有开关跳变（原来用的是 `min(T,0)` 式的单边钳位，会在限幅点跳变、喂出抖振）。
+#   超限**不丢弃**该条数据，只统计越界比例。
+# ---------------------------------------------------------------------------
+V_MAX_B = 3.0                 # 关节 b 速度限幅 [rad/s]
+V_MAX_S = 3.0                 # 关节 s 速度限幅 [rad/s]
+V_REF_MARGIN = 0.8            # 参考速度只用到限幅的 80%，给跟踪误差留余量
+V_BARRIER_GAIN = 0.5          # 障碍增益 = GAIN * TAU_*_MAX / (1 rad/s 超出量)
+V_BARRIER_BETA = 20.0         # softplus 锐度；越大越接近硬限幅，越小越平滑
+
+
+def _soft_relu(x: float, beta: float) -> float:
+    """(1/beta)*log(1+exp(beta*x))：beta→∞ 时趋近 max(x,0)，且处处可导。"""
+    z = beta * x
+    if z > 30.0:
+        return float(x)
+    if z < -30.0:
+        return 0.0
+    return float(np.log1p(np.exp(z)) / beta)
+
+
+def velocity_barrier(v: float, v_max: float, k: float,
+                     beta: float = V_BARRIER_BETA) -> float:
+    """连续速度障碍：|v| 超过 v_max 时输出正比于超出量的【刹车】力矩。
+
+        barrier(v) = -k*softplus(v - v_max) + k*softplus(-v - v_max)
+
+    |v| < v_max 时两项都≈0（softplus 在负半轴指数衰减）；v > v_max 时 ≈ -k(v-v_max)
+    即反向刹车；v < -v_max 时 ≈ +k(-v-v_max)。全程连续可导，没有跳变。
+    """
+    return -k * _soft_relu(v - v_max, beta) + k * _soft_relu(-v - v_max, beta)
 
 
 def make_torque_curve(rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
@@ -128,6 +201,69 @@ def make_torque_curve(rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]
     return curve[0], curve[1]
 
 
+def make_excitation(params: Params, x0: State, theta_c0: float,
+                    rng: np.random.Generator,
+                    ts_ref_deg: float = TS_REF_DEG,
+                    tb_ref_rad: float = TB_REF_RAD,
+                    v_max_b: float = V_MAX_B,
+                    v_max_s: float = V_MAX_S
+                    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """用 PD 跟踪预设计的参考轨迹来生成激励力矩（记录的就是实际施加的力矩）。
+
+    为什么必须闭环：θ_s 会被关节 b 的加速度通过惯性耦合 M12*qdd_b 硬拖着走。
+    实测纯开环随机正弦下，即使 Ts 幅值降到满幅的 1/10，max|θ_s| 仍有 816°；
+    把 Tb 也压到 1/10 才降到 140°，都远达不到 ±30°。闭环后参考轨迹按限位设计，
+    实测 max|θ_s| 可压到 25~30°。
+
+    参考轨迹（位置 + 速度**双重归一化**，先天满足速度限幅）：
+      * θ_b^d：0.2~1.5 Hz 多正弦，位置幅值 tb_ref_rad、速度幅值 ≤ V_REF_MARGIN*v_max_b
+      * θ_s^d：0.5~3.0 Hz 多正弦，位置幅值 ts_ref_deg、速度幅值 ≤ V_REF_MARGIN*v_max_s
+    力矩 = PD(参考 − 实际) + 连续速度障碍，再经 TAU_*_MAX 限幅，**原样记录**：
+    记录力矩即实际施加力矩，对辨识来说仍是合法的已知输入。
+
+    超速不丢弃数据：参考已按上限设计，控制器再用连续速度障碍（softplus 平滑，
+    无开关跳变）给出正比于超出量的刹车力矩。
+
+    返回 (tau_b, tau_s, theta_s_ref, dtheta_s_ref)。
+    """
+    t = np.arange(NUM_STEPS) * DT
+
+    def multisine(lo: float, hi: float, amp_pos: float, v_cap: float, n: int = 4):
+        """多正弦位置参考：同时按位置幅值 amp_pos 和速度幅值 v_cap 归一化。"""
+        y = np.zeros(NUM_STEPS)
+        dy = np.zeros(NUM_STEPS)
+        for _ in range(n):
+            f = rng.uniform(lo, hi)
+            a = rng.uniform(0.3, 1.0)
+            p = rng.uniform(0.0, 2.0 * np.pi)
+            y += a * np.sin(2.0 * np.pi * f * t + p)
+            dy += a * 2.0 * np.pi * f * np.cos(2.0 * np.pi * f * t + p)
+        sc = min(amp_pos / max(np.abs(y).max(), 1e-12),
+                 v_cap / max(np.abs(dy).max(), 1e-12))
+        return y * sc, dy * sc
+
+    yb, dyb = multisine(TB_FREQ_LO, TB_FREQ_HI, tb_ref_rad, V_REF_MARGIN * v_max_b)
+    ys, dys = multisine(TS_FREQ_LO, TS_FREQ_HI, np.radians(ts_ref_deg),
+                        V_REF_MARGIN * v_max_s)
+
+    tb = np.zeros(NUM_STEPS)
+    ts = np.zeros(NUM_STEPS)
+    with Simulator(params, DT, REFINEMENT) as sim:
+        sim.set_state(State(theta_b=x0.theta_b + yb[0], dtheta_b=x0.dtheta_b + dyb[0],
+                            theta_s=x0.theta_s + ys[0], dtheta_s=x0.dtheta_s + dys[0]))
+        for k in range(NUM_STEPS):
+            st = sim.state
+            ub = KP_B * ((x0.theta_b + yb[k]) - st.theta_b) + KD_B * (dyb[k] - st.dtheta_b)
+            us = KP_S * ((x0.theta_s + ys[k]) - st.theta_s) + KD_S * (dys[k] - st.dtheta_s)
+            # 连续速度障碍：超出限幅时叠加正比于超出量的刹车力矩（无开关跳变）
+            ub += velocity_barrier(st.dtheta_b, v_max_b, V_BARRIER_GAIN * TAU_B_MAX)
+            us += velocity_barrier(st.dtheta_s, v_max_s, V_BARRIER_GAIN * TAU_S_MAX)
+            tb[k] = np.clip(ub, -TAU_B_MAX, TAU_B_MAX)
+            ts[k] = np.clip(us, -TAU_S_MAX, TAU_S_MAX)
+            sim.step(tb[k], ts[k], theta_c0, 0.0, 0.0)
+    return tb, ts, x0.theta_s + ys, dys
+
+
 def simulate(params: Params, x0: State, tau_b: np.ndarray, tau_s: np.ndarray,
              theta_c0: float, dtheta_c: float, ddtheta_c: float,
              refinement: int = REFINEMENT
@@ -155,38 +291,84 @@ def main() -> int:
     print(f"数据目录: {out_dir}")
     print(f"轨迹条数: {args.num}   dt={DT}s ({1/DT:.0f}Hz)   时长={DURATION}s   "
           f"K={NUM_STEPS}   记录 refinement={REFINEMENT}")
-    print(f"重力: 每条数据在半径 {GRAVITY_RADIUS} 的圆内独立均匀采样")
+    print(f"等效重力: 摆平面内分量；水平面内为 0（概率 {FLAT_PROB:.0%}），"
+          f"倾斜时 α~U({ALPHA_MIN_DEG},{RAMP_MAX_DEG})°，|g|=9.81·sinα ≤ {G_INPLANE_MAX:.3f} m/s²")
+    print(f"θ_s 限位: 设计目标 ≤{THETA_S_TARGET_DEG:.0f}°，硬约束 ≤{THETA_S_LIMIT_DEG:.0f}°"
+          f"（超出丢弃），激励用 PD 闭环（Ts 参考 ±{TS_REF_DEG:.0f}°）")
+    print(f"速度限幅: 关节 b/s 均 ±{V_MAX_B:.1f}/±{V_MAX_S:.1f} rad/s（软限幅，超限不丢弃）")
 
-    for idx in range(args.num):
-        seed = args.seed + idx
-        rng = np.random.default_rng(seed)
+    idx = 0
+    attempts = 0
+    max_attempts_total = args.num * MAX_ATTEMPTS
+    rejected_limit = 0
+    ts_max_all = []
+    vb_all, vs_all = [], []
+    over_b = over_s = 0
+    while idx < args.num and attempts < max_attempts_total:
+        attempts += 1
+        rng = np.random.default_rng(args.seed + attempts)
 
-        # --- 本条数据的重力（已知输入）与完整参数 ---
-        gx, gy = sample_gravity(rng)
+        # --- 本条数据的等效重力（已知输入）与完整参数 ---
+        gx, gy, alpha_deg = sample_gravity(rng)
         params = Params(**TRUE_PARAMS, gx=gx, gy=gy)
 
-        # --- 初始状态 ---
         theta_c0 = float(rng.uniform(-np.pi, np.pi))
         dtheta_c = 0.0
         ddtheta_c = 0.0
-        x0 = State(
-            theta_b=float(rng.uniform(-np.pi, np.pi)),
-            dtheta_b=float(rng.uniform(-1.0, 1.0)),
-            theta_s=float(rng.uniform(-np.pi, np.pi)),
-            dtheta_s=float(rng.uniform(-1.0, 1.0)),
-        )
 
-        # --- 力矩曲线：先叠加高斯白噪，作为【实际施加】的力矩 ---
-        tau_b_clean, tau_s_clean = make_torque_curve(rng)
-        tau_b = tau_b_clean + rng.normal(0.0, SIGMA_TAU, NUM_STEPS)
-        tau_s = tau_s_clean + rng.normal(0.0, SIGMA_TAU, NUM_STEPS)
+        # 逐次尝试：每次失败就把参考幅值收缩，直到 max|θ_s| 进入目标范围
+        accepted = None
+        fallback = None
+        for k_try in range(MAX_ATTEMPTS):
+            sc = SHRINK ** k_try
+            x0 = State(
+                theta_b=float(rng.uniform(-np.pi, np.pi)),
+                dtheta_b=float(rng.uniform(-1.0, 1.0)),
+                # θ_s 不再整圈随机：从 0 附近起，避免一起步就超机械限位
+                theta_s=float(np.radians(rng.uniform(-THETA_S0_DEG, THETA_S0_DEG))),
+                dtheta_s=float(rng.uniform(-DTHETA_S0_MAX, DTHETA_S0_MAX)),
+            )
+            # --- 闭环生成激励力矩（记录力矩 = 实际施加力矩）---
+            tau_b_clean, tau_s_clean, ts_ref, _ = make_excitation(
+                params, x0, theta_c0, rng,
+                ts_ref_deg=TS_REF_DEG * sc, tb_ref_rad=TB_REF_RAD * sc)
+            # 力矩测量噪声 -> 作为【实际施加】的力矩
+            tau_b = tau_b_clean + rng.normal(0.0, SIGMA_TAU, NUM_STEPS)
+            tau_s = tau_s_clean + rng.normal(0.0, SIGMA_TAU, NUM_STEPS)
+            # 用【实际施加】的力矩开环复现，记录的状态才是该力矩的真实响应（数据自洽）
+            psi_b, psi_s, dpsi_b, dpsi_s = simulate(
+                params, x0, tau_b, tau_s, theta_c0, dtheta_c, ddtheta_c, REFINEMENT)
+            ts_deg = float(np.degrees(np.abs(psi_s - psi_b).max()))
+            if ts_deg <= THETA_S_TARGET_DEG:
+                accepted = (x0, tau_b, tau_s, tau_b_clean, tau_s_clean, ts_ref,
+                            psi_b, psi_s, dpsi_b, dpsi_s, ts_deg)
+                break
+            if ts_deg <= THETA_S_LIMIT_DEG and fallback is None:
+                fallback = (x0, tau_b, tau_s, tau_b_clean, tau_s_clean, ts_ref,
+                            psi_b, psi_s, dpsi_b, dpsi_s, ts_deg)
+        else:
+            rejected_limit += 1
 
-        # 用【实际施加】的力矩仿真，记录的状态才是该力矩的真实响应，数据自洽。
-        # 若反之（用干净力矩仿真、却把含噪力矩当精确输入交给辨识），噪声会被
-        # 混沌工况指数放大：实测 41/120 条 psi 偏移 >0.05 rad、最大 10.6 rad，
-        # 真值参数处 loss 从 2.6e-3 涨到 33，辨识必然发散。
-        psi_b, psi_s, dpsi_b, dpsi_s = simulate(
-            params, x0, tau_b, tau_s, theta_c0, dtheta_c, ddtheta_c, REFINEMENT)
+        if accepted is None:
+            # 目标(30°)没达到；若有满足硬约束(35°)的候选就退而用之，否则丢弃该条
+            if fallback is None:
+                continue
+            accepted = fallback
+
+        (x0, tau_b, tau_s, tau_b_clean, tau_s_clean, ts_ref,
+         psi_b, psi_s, dpsi_b, dpsi_s, ts_deg) = accepted
+        ts_max_all.append(ts_deg)
+        seed = args.seed + attempts
+
+        # --- 速度限幅统计（超限不丢弃，只看越界比例）---
+        v_b = np.abs(dpsi_b)
+        v_s = np.abs(dpsi_s - dpsi_b)
+        v_b_max = float(v_b.max())
+        v_s_max = float(v_s.max())
+        vb_all.append(v_b_max)
+        vs_all.append(v_s_max)
+        over_b += int((v_b > V_MAX_B).sum())
+        over_s += int((v_s > V_MAX_S).sum())
 
         # --- 状态曲线叠加高斯白噪 ---
         psi_b_n = psi_b + rng.normal(0.0, SIGMA_POS, NUM_STEPS)
@@ -214,6 +396,15 @@ def main() -> int:
             # 重力矢量：随采集数据一起保存的**已知输入**，不是被辨识参数
             gx=np.float64(gx),
             gy=np.float64(gy),
+            # 摆平面倾斜角（deg）：0 表示水平面（平面内重力为 0）
+            gravity_alpha_deg=np.float64(alpha_deg),
+            # θ_s 限位相关（供追溯/筛选；辨识不使用）
+            theta_s_max_deg=np.float64(ts_deg),
+            theta_s_ref=np.asarray(ts_ref, dtype=np.float64),
+            # 速度限幅（已知约束；辨识不使用）
+            v_max=np.array([V_MAX_B, V_MAX_S], dtype=np.float64),
+            max_dtheta_b=np.float64(v_b_max),
+            max_dtheta_s=np.float64(v_s_max),
             # 实测序列（含噪）
             psi_b=psi_b_n.astype(np.float64),
             psi_s=psi_s_n.astype(np.float64),
@@ -232,12 +423,26 @@ def main() -> int:
         )
 
         if idx % 20 == 0 or idx == args.num - 1:
-            span_b = tau_b.max() - tau_b.min()
-            span_s = tau_s.max() - tau_s.min()
-            print(f"  [{idx + 1:4d}/{args.num}] |Tb|max={np.abs(tau_b).max():.2f} "
-                  f"|Ts|max={np.abs(tau_s).max():.2f}  "
+            print(f"  [{idx + 1:4d}/{args.num}] α={alpha_deg:5.1f}°  "
+                  f"|Tb|max={np.abs(tau_b).max():.2f} |Ts|max={np.abs(tau_s).max():.2f}  "
+                  f"max|θs|={ts_deg:5.1f}°  max|θ̇b|={v_b_max:4.2f} max|θ̇s|={v_s_max:4.2f}  "
                   f"psi_b范围={psi_b.max() - psi_b.min():.2f} "
                   f"psi_s范围={psi_s.max() - psi_s.min():.2f}")
+        idx += 1
+
+    ts_arr = np.array(ts_max_all) if ts_max_all else np.zeros(0)
+    if ts_arr.size:
+        print(f"θ_s 峰值统计: 中位 {np.median(ts_arr):.1f}°，最大 {ts_arr.max():.1f}°，"
+              f"超过 {THETA_S_TARGET_DEG:.0f}°（退回硬约束内）的条数 "
+              f"{int((ts_arr > THETA_S_TARGET_DEG).sum())}/{ts_arr.size}")
+    if vb_all:
+        n_samp = idx * NUM_STEPS
+        print(f"速度限幅(±{V_MAX_B:.1f}/{V_MAX_S:.1f} rad/s): "
+              f"max|θ̇b| 中位 {np.median(vb_all):.2f}、超限样本 {over_b}/{n_samp} "
+              f"({100.0*over_b/n_samp:.2f}%)；max|θ̇s| 中位 {np.median(vs_all):.2f}、"
+              f"超限样本 {over_s}/{n_samp} ({100.0*over_s/n_samp:.2f}%)")
+    print(f"总尝试 {attempts} 次生成 {idx} 条；其中 {rejected_limit} 次连 {THETA_S_LIMIT_DEG:.0f}° "
+          f"都没达到已丢弃")
 
     # --- 保存真实参数 ---
     with open(out_dir / "truth_params.txt", "w", encoding="utf-8") as f:
