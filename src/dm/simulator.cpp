@@ -5,7 +5,8 @@
 #include "dynamics.hpp"
 #include "rk4.hpp"
 
-namespace tcbss {
+namespace tcbs {
+namespace dm {
 
 Simulator::Simulator(const Params& params, double dt, int refinement)
     : params_(params),
@@ -62,4 +63,5 @@ State Simulator::step(double Tb,
     return state_;
 }
 
-}  // namespace tcbss
+}  // namespace dm
+}  // namespace tcbs

@@ -1,5 +1,5 @@
-#ifndef TCBSS_CAPI_H
-#define TCBSS_CAPI_H
+#ifndef CAPI_DM_H
+#define CAPI_DM_H
 
 #include <stddef.h>
 
@@ -9,10 +9,10 @@
  * 供 ctypes / C / 其它语言调用。所有角度单位为 rad，力矩为 N*m，时间为 s。
  *
  * 生命周期：
- *     TcbssSimulator* sim = tcbss_create(&params, dt, refinement);
- *     if (!sim) { fprintf(stderr, "%s\n", tcbss_last_error()); }
+ *     TcbsSimulator* sim = tcbs_create(&params, dt, refinement);
+ *     if (!sim) { fprintf(stderr, "%s\n", tcbs_last_error()); }
  *     ...
- *     tcbss_destroy(sim);
+ *     tcbs_destroy(sim);
  *
  * 本文件不使用任何 C++ 特性，可直接被 C 编译器包含。
  */
@@ -21,14 +21,14 @@
 extern "C" {
 #endif
 
-/* 不透明句柄：内部是 C++ 的 tcbss::Simulator。 */
-typedef struct TcbssSimulator TcbssSimulator;
+/* 不透明句柄：内部是 C++ 的 tcbs::Simulator。 */
+typedef struct TcbsSimulator TcbsSimulator;
 
 /* 不透明句柄：内部是 C++ 的有限多步轨迹梯度求解器（离散伴随法）。 */
-typedef struct TcbssTrajectory TcbssTrajectory;
+typedef struct TcbsTrajectory TcbsTrajectory;
 
-/* 系统参数。字段顺序与 tcbss::Params 完全一致。 */
-typedef struct TcbssParams {
+/* 系统参数。字段顺序与 tcbs::Params 完全一致。 */
+typedef struct TcbsParams {
     double mb;      /* 连杆 b 质量 */
     double Ib;      /* 连杆 b 转动惯量 */
     double Pbx;     /* 连杆 b 质心局部坐标 x */
@@ -49,15 +49,15 @@ typedef struct TcbssParams {
     double fsc;     /* 关节 s 库仑摩擦系数 */
     double fsv;     /* 关节 s 粘滞摩擦系数 */
     double lambda_; /* 平滑摩擦力参数（通常取 100） */
-} TcbssParams;
+} TcbsParams;
 
 /* 两个广义坐标的位置与速度。 */
-typedef struct TcbssState {
+typedef struct TcbsState {
     double theta_b;
     double dtheta_b;
     double theta_s;
     double dtheta_s;
-} TcbssState;
+} TcbsState;
 
 /* ------------------------------------------------------------------ */
 /* 构造 / 析构                                                        */
@@ -65,43 +65,43 @@ typedef struct TcbssState {
 
 /*
  * 创建仿真器。params 不可为 NULL，dt 必须 > 0，refinement 必须 >= 1。
- * 成功返回句柄；失败返回 NULL，可通过 tcbss_last_error() 获取原因。
- * 必须用 tcbss_destroy() 释放。
+ * 成功返回句柄；失败返回 NULL，可通过 tcbs_last_error() 获取原因。
+ * 必须用 tcbs_destroy() 释放。
  */
-TcbssSimulator* tcbss_create(const TcbssParams* params, double dt, int refinement);
+TcbsSimulator* tcbs_create(const TcbsParams* params, double dt, int refinement);
 
 /* 销毁仿真器；传入 NULL 是安全的。 */
-void tcbss_destroy(TcbssSimulator* sim);
+void tcbs_destroy(TcbsSimulator* sim);
 
 /* 最近一次失败的错误信息（线程局部），无错误时返回空字符串。 */
-const char* tcbss_last_error(void);
+const char* tcbs_last_error(void);
 
 /* ------------------------------------------------------------------ */
 /* 状态设置 / 读取                                                    */
 /* ------------------------------------------------------------------ */
 
 /* 直接设置当前两个广义坐标的位置与速度。 */
-void tcbss_set_state(TcbssSimulator* sim, TcbssState state);
-void tcbss_set_generalized(TcbssSimulator* sim,
+void tcbs_set_state(TcbsSimulator* sim, TcbsState state);
+void tcbs_set_generalized(TcbsSimulator* sim,
                            double theta_b,
                            double dtheta_b,
                            double theta_s,
                            double dtheta_s);
 
 /* 分别设置单个广义坐标的位置与速度。 */
-void tcbss_set_theta_b(TcbssSimulator* sim, double theta_b, double dtheta_b);
-void tcbss_set_theta_s(TcbssSimulator* sim, double theta_s, double dtheta_s);
+void tcbs_set_theta_b(TcbsSimulator* sim, double theta_b, double dtheta_b);
+void tcbs_set_theta_s(TcbsSimulator* sim, double theta_s, double dtheta_s);
 
 /* 读取当前状态；out 不可为 NULL。 */
-void tcbss_get_state(const TcbssSimulator* sim, TcbssState* out);
+void tcbs_get_state(const TcbsSimulator* sim, TcbsState* out);
 
 /* ------------------------------------------------------------------ */
 /* 参数查询                                                           */
 /* ------------------------------------------------------------------ */
 
-double tcbss_get_dt(const TcbssSimulator* sim);
-int tcbss_get_refinement(const TcbssSimulator* sim);
-void tcbss_get_params(const TcbssSimulator* sim, TcbssParams* out);
+double tcbs_get_dt(const TcbsSimulator* sim);
+int tcbs_get_refinement(const TcbsSimulator* sim);
+void tcbs_get_params(const TcbsSimulator* sim, TcbsParams* out);
 
 /* ------------------------------------------------------------------ */
 /* 仿真一步                                                           */
@@ -111,13 +111,13 @@ void tcbss_get_params(const TcbssSimulator* sim, TcbssParams* out);
  * 输入两个驱动力矩、theta_c 的位置/速度/加速度，推进一个 dt。
  * out 可为 NULL（此时只更新内部状态）。
  */
-void tcbss_step(TcbssSimulator* sim,
+void tcbs_step(TcbsSimulator* sim,
                 double Tb,
                 double Ts,
                 double theta_c,
                 double dtheta_c,
                 double ddtheta_c,
-                TcbssState* out);
+                TcbsState* out);
 
 /* ==================================================================== */
 /* 有限多步轨迹 + 损失对每一步力矩的解析梯度（离散伴随法）              */
@@ -141,10 +141,10 @@ void tcbss_step(TcbssSimulator* sim,
  */
 
 /* 轨迹求解器：创建一次，缓冲可跨多次调用复用（内部按最大 K 自动扩容）。 */
-TcbssTrajectory* tcbss_trajectory_create(const TcbssParams* params, int refinement);
+TcbsTrajectory* tcbs_trajectory_create(const TcbsParams* params, int refinement);
 
 /* 销毁；传入 NULL 是安全的。 */
-void tcbss_trajectory_destroy(TcbssTrajectory* t);
+void tcbs_trajectory_destroy(TcbsTrajectory* t);
 
 /*
  * 仅前向：计算损失值，并可导出四个全局量序列。
@@ -157,9 +157,9 @@ void tcbss_trajectory_destroy(TcbssTrajectory* t);
  *   tau         NULL 时全部步使用 (tau_b_fixed, tau_s_fixed)；否则长度 2K
  *   out_*       长度 K 的输出，可为 NULL
  *
- * 失败返回 -1 并通过 tcbss_last_error() 给出原因。
+ * 失败返回 -1 并通过 tcbs_last_error() 给出原因。
  */
-double tcbss_trajectory_loss(const TcbssTrajectory* t,
+double tcbs_trajectory_loss(const TcbsTrajectory* t,
                              double theta_c0,
                              double dtheta_c,
                              double ddtheta_c,
@@ -169,7 +169,7 @@ double tcbss_trajectory_loss(const TcbssTrajectory* t,
                              const double* tau,
                              double tau_b_fixed,
                              double tau_s_fixed,
-                             const TcbssState* x0,
+                             const TcbsState* x0,
                              double w_psi_b,
                              double w_psi_s,
                              double w_dpsi_b,
@@ -188,9 +188,9 @@ double tcbss_trajectory_loss(const TcbssTrajectory* t,
 /*
  * 正向 + 反向伴随：返回损失值，并写出 dL/dtau（长度 2K，dL/dtau[2k] = dL/dTb_k）。
  * grad_tau 不可为 NULL。out_final_state 可为 NULL。
- * 失败返回 -1 并通过 tcbss_last_error() 给出原因。
+ * 失败返回 -1 并通过 tcbs_last_error() 给出原因。
  */
-double tcbss_trajectory_gradient(TcbssTrajectory* t,
+double tcbs_trajectory_gradient(TcbsTrajectory* t,
                                  double theta_c0,
                                  double dtheta_c,
                                  double ddtheta_c,
@@ -198,7 +198,7 @@ double tcbss_trajectory_gradient(TcbssTrajectory* t,
                                  int refinement,
                                  size_t num_steps,
                                  const double* tau,
-                                 const TcbssState* x0,
+                                 const TcbsState* x0,
                                  double w_psi_b,
                                  double w_psi_s,
                                  double w_dpsi_b,
@@ -210,7 +210,7 @@ double tcbss_trajectory_gradient(TcbssTrajectory* t,
                                  const double* target_dpsi_b,
                                  const double* target_dpsi_s,
                                  double* grad_tau,
-                                 TcbssState* out_final_state);
+                                 TcbsState* out_final_state);
 
 /* ==================================================================== */
 /* 系统参数辨识模式：对 14 个动力学参数求损失的解析梯度                  */
@@ -232,34 +232,34 @@ double tcbss_trajectory_gradient(TcbssTrajectory* t,
  *   8 Dx  9 Dy 10 fbc 11 fbv 12 fsc 13 fsv
  *
  * 不参与辨识：gx / gy（重力矢量是随采集数据一起给出的已知输入，
- * 仍保存在 TcbssParams 里供正演使用）、lambda_（固定常数）。
+ * 仍保存在 TcbsParams 里供正演使用）、lambda_（固定常数）。
  */
 
 /* 参数个数与名字（用于校验顺序；名字为静态字符串，无需释放）。 */
-int tcbss_param_gradient_count(void);
-const char* tcbss_param_gradient_name(int index);
+int tcbs_param_gradient_count(void);
+const char* tcbs_param_gradient_name(int index);
 
 /* 创建 / 销毁参数梯度求解器（缓冲可跨调用复用）。 */
-TcbssTrajectory* tcbss_param_gradient_create(const TcbssParams* params, int refinement);
-void tcbss_param_gradient_destroy(TcbssTrajectory* t);
+TcbsTrajectory* tcbs_param_gradient_create(const TcbsParams* params, int refinement);
+void tcbs_param_gradient_destroy(TcbsTrajectory* t);
 
 /*
  * 就地更新求导点参数（不重新分配缓冲，refinement 不变）。
  *
  * 优化循环里**必须**在每次更新参数后调用它，否则 loss/梯度会一直停留在
  * 创建时的参数点上——这是"梯度与参数错配"最隐蔽的一种形态。
- * 失败返回 0 并通过 tcbss_last_error() 给出原因。
+ * 失败返回 0 并通过 tcbs_last_error() 给出原因。
  */
-int tcbss_param_gradient_set_params(TcbssTrajectory* t, const TcbssParams* params);
+int tcbs_param_gradient_set_params(TcbsTrajectory* t, const TcbsParams* params);
 
 /* 读回当前求导点参数（可为 NULL 表示不需要）。 */
-void tcbss_param_gradient_get_params(const TcbssTrajectory* t, TcbssParams* out);
+void tcbs_param_gradient_get_params(const TcbsTrajectory* t, TcbsParams* out);
 
 /*
  * 仅前向：计算损失值，并可导出四个全局量序列（out_* 可为 NULL，长度 K）。
- * 失败返回 -1 并通过 tcbss_last_error() 给出原因。
+ * 失败返回 -1 并通过 tcbs_last_error() 给出原因。
  */
-double tcbss_param_gradient_loss(const TcbssTrajectory* t,
+double tcbs_param_gradient_loss(const TcbsTrajectory* t,
                                  double theta_c0,
                                  double dtheta_c,
                                  double ddtheta_c,
@@ -267,7 +267,7 @@ double tcbss_param_gradient_loss(const TcbssTrajectory* t,
                                  int refinement,
                                  size_t num_steps,
                                  const double* tau,
-                                 const TcbssState* x0,
+                                 const TcbsState* x0,
                                  double w_psi_b,
                                  double w_psi_s,
                                  double w_dpsi_b,
@@ -285,7 +285,7 @@ double tcbss_param_gradient_loss(const TcbssTrajectory* t,
  * 正向 + 前向参数灵敏度：返回损失，并写出 dL/dp（长度 14）。
  * grad_p 不可为 NULL。out_final_state 可为 NULL。
  */
-double tcbss_param_gradient_run(TcbssTrajectory* t,
+double tcbs_param_gradient_run(TcbsTrajectory* t,
                                 double theta_c0,
                                 double dtheta_c,
                                 double ddtheta_c,
@@ -293,7 +293,7 @@ double tcbss_param_gradient_run(TcbssTrajectory* t,
                                 int refinement,
                                 size_t num_steps,
                                 const double* tau,
-                                const TcbssState* x0,
+                                const TcbsState* x0,
                                 double w_psi_b,
                                 double w_psi_s,
                                 double w_dpsi_b,
@@ -303,11 +303,11 @@ double tcbss_param_gradient_run(TcbssTrajectory* t,
                                 const double* target_dpsi_b,
                                 const double* target_dpsi_s,
                                 double* grad_p,
-                                TcbssState* out_final_state);
+                                TcbsState* out_final_state);
 
 
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif
 
-#endif /* TCBSS_CAPI_H */
+#endif /* CAPI_DM_H */

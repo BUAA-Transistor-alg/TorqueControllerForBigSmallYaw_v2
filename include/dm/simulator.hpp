@@ -12,7 +12,8 @@
 #include "params.hpp"
 #include "state.hpp"
 
-namespace tcbss {
+namespace tcbs {
+namespace dm {
 
 class Simulator {
 public:
@@ -73,4 +74,5 @@ private:
     State state_;
 };
 
-}  // namespace tcbss
+}  // namespace dm
+}  // namespace tcbs

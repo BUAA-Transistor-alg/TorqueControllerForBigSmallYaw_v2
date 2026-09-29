@@ -1,6 +1,6 @@
 """二阶摆（big/small yaw）实时仿真演示。
 
-动力学由 build/libtcbss.so 提供（见 python/tcbss.py 的 ctypes 包装），
+动力学由 build/libtcbs.so 提供（见 python/capi/capi_dm.py 的 ctypes 包装），
 本脚本负责：设置仿真参数、读取按键力矩、用 pygame 绘制二阶摆。
 
 坐标系约定：向右为 x 正方向，向上为 y 正方向（屏幕 y 轴已翻转）。
@@ -25,7 +25,7 @@ import math
 
 import pygame
 
-from tcbss import Params, Simulator, State
+from capi import Params, Simulator, State
 
 # ===========================================================================
 # 1. 仿真参数（全部写死为常量）

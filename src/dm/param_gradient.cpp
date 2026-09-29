@@ -7,17 +7,18 @@
 
 // 与 trajectory.cpp 相同的 sincos 优化（热区每子步 3 组三角）。
 #if defined(__GNUC__) && !defined(__clang__)
-#define TCBSS_PARAM_HAVE_SINCOS 1
+#define TCBS_PARAM_HAVE_SINCOS 1
 #endif
 
-namespace tcbss {
+namespace tcbs {
+namespace dm {
 namespace {
 
 constexpr double kDetEpsilon = 1e-12;
 
 inline void sincos3(double a, double b, double c, double& sa, double& ca, double& sb,
                     double& cb, double& sc, double& cc) {
-#if TCBSS_PARAM_HAVE_SINCOS
+#if TCBS_PARAM_HAVE_SINCOS
     ::sincos(a, &sa, &ca);
     ::sincos(b, &sb, &cb);
     ::sincos(c, &sc, &cc);
@@ -703,4 +704,5 @@ double computeParamGradient(const Params& p,
     return loss;
 }
 
-}  // namespace tcbss
+}  // namespace dm
+}  // namespace tcbs

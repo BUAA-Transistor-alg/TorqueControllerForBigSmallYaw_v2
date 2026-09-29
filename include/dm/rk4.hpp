@@ -8,7 +8,8 @@
 
 #include "state.hpp"
 
-namespace tcbss {
+namespace tcbs {
+namespace dm {
 
 /// 在区间 [t, t + h] 上对 y 做一次 RK4 推进，返回区间末端状态。
 template <typename Deriv>
@@ -32,4 +33,5 @@ State rk4Step(const Deriv& deriv, const State& y, double t, double h) {
     return out;
 }
 
-}  // namespace tcbss
+}  // namespace dm
+}  // namespace tcbs

@@ -26,7 +26,8 @@
 #include "params.hpp"
 #include "state.hpp"
 
-namespace tcbss {
+namespace tcbs {
+namespace dm {
 
 /// 与角度有关的运动学中间量。
 struct Kinematics {
@@ -110,4 +111,5 @@ StateDerivative computeDerivative(const Params& p,
                                   double ddtheta_c,
                                   const State& state);
 
-}  // namespace tcbss
+}  // namespace dm
+}  // namespace tcbs

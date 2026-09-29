@@ -6,7 +6,8 @@
 //   theta_b : 广义坐标 1（对应连杆 b 的相对角）
 //   theta_s : 广义坐标 2（对应连杆 s 的相对角）
 
-namespace tcbss {
+namespace tcbs {
+namespace dm {
 
 /// 两个广义坐标的当前位置与速度。
 struct State {
@@ -34,4 +35,5 @@ inline State advance(const State& y, const StateDerivative& k, double s) {
     return out;
 }
 
-}  // namespace tcbss
+}  // namespace dm
+}  // namespace tcbs

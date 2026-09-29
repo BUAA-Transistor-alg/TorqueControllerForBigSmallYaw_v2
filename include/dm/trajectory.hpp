@@ -34,7 +34,8 @@
 #include "params.hpp"
 #include "state.hpp"
 
-namespace tcbss {
+namespace tcbs {
+namespace dm {
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -160,4 +161,5 @@ double simulateAndGradient(const Params& p,
                            State* out_final_state,
                            bool with_step_jacobians);
 
-}  // namespace tcbss
+}  // namespace dm
+}  // namespace tcbs

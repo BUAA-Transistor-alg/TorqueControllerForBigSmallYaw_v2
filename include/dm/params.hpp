@@ -5,7 +5,8 @@
 // 本结构体刻意不提供任何默认值：默认构造被删除，只能通过全参数构造函数
 // 创建，从而在编译期杜绝“少传参数”。
 
-namespace tcbss {
+namespace tcbs {
+namespace dm {
 
 struct Params {
     // ---- 连杆 b ----
@@ -71,4 +72,5 @@ struct Params {
           lambda(lambda_) {}
 };
 
-}  // namespace tcbss
+}  // namespace dm
+}  // namespace tcbs

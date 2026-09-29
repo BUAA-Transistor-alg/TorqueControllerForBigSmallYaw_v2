@@ -2,7 +2,7 @@
 // 以及参数梯度模块（前向灵敏度）的解析 dL/dp vs 中心差分。
 //
 // 直接运行即可，全部通过返回 0，否则返回 1。
-// 构建：cmake 里以 tcbss_trajectory_test 目标生成到 build/ 根目录。
+// 构建：cmake 里以 tcbs_trajectory_test 目标生成到 build/ 根目录。
 
 #include <cmath>
 #include <cstdio>
@@ -24,8 +24,8 @@ struct Config {
 
 /// 按参数梯度模块的编号（见 param_gradient.hpp）给单个参数加增量。
 /// 重力 gx/gy 是已知输入、不在辨识集内，故没有对应分支。
-tcbss::Params withParamDelta(const tcbss::Params& p, int idx, double d) {
-    tcbss::Params q = p;
+tcbs::dm::Params withParamDelta(const tcbs::dm::Params& p, int idx, double d) {
+    tcbs::dm::Params q = p;
     switch (idx) {
         case 0: q.mb += d; break;
         case 1: q.Ib += d; break;
@@ -69,7 +69,7 @@ struct Rng {
 }  // namespace
 
 int main() {
-    using namespace tcbss;
+    using namespace tcbs::dm;
 
     // 与 python/pendulum_sim.py 相同的物理参数
     const Params p(/*mb*/ 1.5, /*Ib*/ 0.030, /*Pbx*/ 0.0, /*Pby*/ 0.180,

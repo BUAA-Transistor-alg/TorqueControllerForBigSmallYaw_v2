@@ -2,7 +2,7 @@
 
 // 系统参数辨识模式：对 14 个动力学参数求损失的解析梯度。
 //
-// 与 include/trajectory.hpp 的区别（两者互不影响）：
+// 与 include/dm/trajectory.hpp 的区别（两者互不影响）：
 //   * trajectory.hpp 求 dL/d(tau)：力矩是决策变量，用离散伴随反向传播；
 //   * 本文件求 dL/dp：力矩序列是**已知输入**，14 个动力学参数是决策变量。
 //     参数维数固定且与步数 K 无关，因此用前向灵敏度即可，且**不需要反向扫描**、
@@ -32,7 +32,8 @@
 #include "params.hpp"
 #include "state.hpp"
 
-namespace tcbss {
+namespace tcbs {
+namespace dm {
 
 /// refinement 为运行期参数（语义见 trajectory.hpp：每主步重复 refinement 次经典 RK4）。
 
@@ -117,4 +118,5 @@ double computeParamGradient(const Params& p,
                             double* grad_p,
                             State* out_final_state);
 
-}  // namespace tcbss
+}  // namespace dm
+}  // namespace tcbs

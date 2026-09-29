@@ -54,7 +54,7 @@ HERE = Path(__file__).resolve().parent          # 本文件所在目录：python
 REPO = HERE.parent                              # 仓库根
 sys.path.insert(0, str(HERE))
 
-from tcbss import (Params, State, ParamGradient, ParamLossSpec,  # noqa: E402
+from capi import (Params, State, ParamGradient, ParamLossSpec,  # noqa: E402
                    PARAM_GRADIENT_NAMES)
 
 DATA_DIR = REPO / "data" / "sim"
@@ -337,7 +337,7 @@ def case_loss(pg: ParamGradient, case: Case, K: int) -> float:
 # ===========================================================================
 # 代数初始化：把运动方程对"聚合量"线性化后做闭式最小二乘
 #
-# 运动方程（见 src/param_gradient.cpp 的 evaluate）：
+# 运动方程（见 src/dm/param_gradient.cpp 的 evaluate）：
 #     M(θ_s)·q̈ + C(q̇,θ_s) + G(θ) + M·ddθ_c = Q(τ, q̇)
 #     M11 = I_B + I_D + I_S + 2·ms·h,  M12 = I_S + ms·h,  M22 = I_S
 #     ms·h   = A·ct + B·ct + C·st − D·st

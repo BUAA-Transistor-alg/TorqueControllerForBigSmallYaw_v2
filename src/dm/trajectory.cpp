@@ -5,17 +5,18 @@
 
 // sincos 是 GNU 扩展：一次调用同时得到 sin 与 cos。
 #if defined(__GNUC__) && !defined(__clang__)
-#define TCBSS_HAVE_SINCOS 1
+#define TCBS_HAVE_SINCOS 1
 #endif
 
-namespace tcbss {
+namespace tcbs {
+namespace dm {
 namespace {
 
 constexpr double kDetEpsilon = 1e-12;
 
 inline void sincos3(double a, double b, double c, double& sa, double& ca, double& sb,
                     double& cb, double& sc, double& cc) {
-#if TCBSS_HAVE_SINCOS
+#if TCBS_HAVE_SINCOS
     ::sincos(a, &sa, &ca);
     ::sincos(b, &sb, &cb);
     ::sincos(c, &sc, &cc);
@@ -523,4 +524,5 @@ double computeTrajectoryLoss(const Params& p,
     return loss;
 }
 
-}  // namespace tcbss
+}  // namespace dm
+}  // namespace tcbs

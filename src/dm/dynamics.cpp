@@ -2,7 +2,8 @@
 
 #include <cmath>
 
-namespace tcbss {
+namespace tcbs {
+namespace dm {
 namespace {
 
 /// 行列式奇异判据（理论上正定系统不会触发，工程上保留安全检查）。
@@ -181,4 +182,5 @@ StateDerivative computeDerivative(const Params& p,
     return d;
 }
 
-}  // namespace tcbss
+}  // namespace dm
+}  // namespace tcbs
