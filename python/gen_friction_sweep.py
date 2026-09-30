@@ -17,6 +17,10 @@
 
     python3 python/gen_friction_sweep.py --alpha-deg 0
     python3 python/gen_friction_sweep.py --alpha-deg 12 --append
+
+    # 真实硬件（RealEnv）：状态来自通信、力矩下发给 MCU、不加噪声、忙等精确帧控制
+    python3 python/gen_friction_sweep.py --real
+    python3 python/gen_friction_sweep.py --real --out data/friction_real/sweep.npz --append
 """
 
 from __future__ import annotations
@@ -31,10 +35,12 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import sim_config as cfg                                  # noqa: E402
-from env import SimEnv                                      # noqa: E402
+from capi import ImuLocation                                # noqa: E402
+from env import RealEnv, SimEnv                             # noqa: E402
 
 
-def run_one(env: SimEnv, omega_ref: float) -> dict | None:
+def run_one(env, omega_ref: float, vel_tol_frac: float = 0.02,
+            vel_tol_abs: float = 0.0) -> dict | None:
     """在**当前状态**上做一次匀速旋转实验，返回测量段统计量；不达标返回 None。
 
     控制器：
@@ -60,11 +66,13 @@ def run_one(env: SimEnv, omega_ref: float) -> dict | None:
 
     m = slice(cfg.FS_N_SETTLE, n)
     omega = float(dthb[m].mean())
-    # 稳态判据：测量速度本身带噪，所以比较"前半均值 vs 后半均值"与均值的标准误
+    # 稳态判据：前半均值 vs 后半均值，容差 = 测量速度噪声的标准误 + 相对项 + 绝对项。
+    # 仿真环境 sigma_vel 就是注入的噪声；真实环境 sigma=(0,0,0)，靠 --fs-vel-tol-* 给裕度
+    # （真实编码器有量化/滞后，容差太紧会把所有点都判失败）。
     half = cfg.FS_N_MEAS // 2
     v1 = dthb[cfg.FS_N_SETTLE:cfg.FS_N_SETTLE + half].mean()
     v2 = dthb[cfg.FS_N_SETTLE + half:].mean()
-    se = max(cfg.SIGMA_VEL, 1e-6) / np.sqrt(half) + 0.02 * abs(omega_ref)
+    se = max(env.sigma[1], 1e-6) / np.sqrt(half) + vel_tol_frac * abs(omega_ref) + vel_tol_abs
     if abs(v1 - v2) > 4.0 * se:
         return None
     if np.abs(ths[m]).max() > np.radians(cfg.THETA_S_TARGET_DEG):
@@ -93,7 +101,9 @@ def run_one(env: SimEnv, omega_ref: float) -> dict | None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", type=str, default=str(cfg.DATA_DIR_FRICTION / "sweep.npz"))
+    ap.add_argument("--out", type=str, default=None,
+                    help="输出 npz；缺省时 --real 用 data/friction_real/sweep.npz，"
+                         "否则用 data/friction/sweep.npz")
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--zero-gravity", action="store_true",
                     help="把等效重力强制设为 0（水平面）；不给则在倾角范围内随机")
@@ -106,38 +116,78 @@ def main() -> int:
     ap.add_argument("--sigma-tau", type=float, default=cfg.SIGMA_TAU)
     ap.add_argument("--append", action="store_true",
                     help="把本次结果追加到已有 sweep.npz（多个重力会话拼接）")
+
+    # ---- 真实硬件环境（RealEnv）----
+    ap.add_argument("--real", action="store_true",
+                    help="用真实硬件环境：状态来自通信严格反解、力矩下发给 MCU、"
+                         "不加噪声、perf_counter_ns+忙等精确帧控制。"
+                         "此时 --zero-gravity/--gravity-seed/--no-noise/--sigma-* 均无效")
+    ap.add_argument("--imu-location", choices=("head", "big_yaw"), default="head",
+                    help="[--real] IMU 安装构型（决定严格反解的运动学链）")
+    ap.add_argument("--spin-us", type=float, default=300.0,
+                    help="[--real] 每帧末尾纯自旋等待的时长 [µs]（越大越准越费 CPU）")
+    ap.add_argument("--tau-b-max", type=float, default=cfg.TAU_B_MAX,
+                    help="[--real] 关节 b 下发前硬限幅 [N·m]")
+    ap.add_argument("--tau-s-max", type=float, default=cfg.TAU_S_MAX,
+                    help="[--real] 关节 s 下发前硬限幅 [N·m]")
+    ap.add_argument("--gravity-settle-s", type=float, default=0.3,
+                    help="[--real] 会话开始对反解重力取平均的时长 [s]")
+    ap.add_argument("--ready-timeout-s", type=float, default=5.0,
+                    help="[--real] 等待 MCU+IMU 首个有效样本的超时 [s]")
+    ap.add_argument("--fs-vel-tol-frac", type=float, default=0.02,
+                    help="稳态判据的相对容差（真实编码器有量化/滞后，建议放宽到 ~0.1）")
+    ap.add_argument("--fs-vel-tol-abs", type=float, default=0.0,
+                    help="稳态判据的绝对容差 [rad/s]（真机建议给一点，如 0.02）")
     args = ap.parse_args()
 
+    if args.out is None:
+        args.out = str((cfg.DATA_DIR_FRICTION_REAL if args.real
+                        else cfg.DATA_DIR_FRICTION) / "sweep.npz")
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"匀速旋转摩擦采集: 数据 -> {out_path}")
+    print(f"匀速旋转摩擦采集: {'真实硬件' if args.real else '仿真'} 数据 -> {out_path}")
     print(f"  速度表 [rad/s]: {cfg.OMEGA_LIST}")
     print(f"  每段 {cfg.FS_N_SETTLE} 步稳定 + {cfg.FS_N_MEAS} 步测量 "
           f"(dt={cfg.DT}s, 共 {(cfg.FS_N_SETTLE+cfg.FS_N_MEAS)*cfg.DT:.1f}s)")
+    print(f"  稳态判据: |v1-v2| <= 4*(σ_v/√n + {args.fs_vel_tol_frac:g}*|ω_ref| "
+          f"+ {args.fs_vel_tol_abs:g})")
 
     rows = []
     tried = failed = 0
     rng = np.random.default_rng(args.seed)
-    # 整个程序运行期间只构造一次环境；重力由环境随机确定、只读
-    env = SimEnv(zero_gravity=args.zero_gravity, noise=args.noise,
-                 sigma_pos=args.sigma_pos, sigma_vel=args.sigma_vel,
-                 sigma_tau=args.sigma_tau, seed=args.gravity_seed)
+    # 整个程序运行期间只构造一次环境
+    if args.real:
+        env = RealEnv(
+            dt=cfg.DT,
+            imu_location=(ImuLocation.ON_HEAD if args.imu_location == "head"
+                          else ImuLocation.ON_BIG_YAW),
+            tau_b_max=args.tau_b_max, tau_s_max=args.tau_s_max,
+            spin_us=args.spin_us, gravity_settle_s=args.gravity_settle_s,
+            ready_timeout_s=args.ready_timeout_s)
+    else:
+        env = SimEnv(zero_gravity=args.zero_gravity, noise=args.noise,
+                     sigma_pos=args.sigma_pos, sigma_vel=args.sigma_vel,
+                     sigma_tau=args.sigma_tau, seed=args.gravity_seed)
     gx, gy = env.gravity
     alpha = env.gravity_alpha_deg
-    print(f"  等效重力（构造时随机确定，不可设置）: α={alpha:.3f}°  "
-          f"(gx,gy)=({gx:.4f},{gy:.4f})  |g|={np.hypot(gx, gy):.4f} m/s²")
+    print(f"  等效重力（{'反解得到' if args.real else '构造时随机确定'}，不可设置）: "
+          f"α={alpha:.3f}°  (gx,gy)=({gx:.4f},{gy:.4f})  |g|={np.hypot(gx, gy):.4f} m/s²")
     with env:
         for omega_ref in cfg.OMEGA_LIST:
             tried += 1
-            r = run_one(env, omega_ref)
+            r = run_one(env, omega_ref, args.fs_vel_tol_frac, args.fs_vel_tol_abs)
             if r is None:
                 failed += 1
                 continue
-            r.update(gx=gx, gy=gy, alpha_deg=float(alpha))
+            r.update(gx=gx, gy=gy, alpha_deg=float(alpha),
+                     real=np.float64(1.0 if args.real else 0.0))
             rows.append(r)
             print(f"  ω={omega_ref:+.3f}: ok  ⟨Tb⟩={r['tb_mean']:+.5f} N·m  "
                   f"⟨ω⟩={r['omega']:+.4f}  max|θs|={r['theta_s_max_deg']:.3f}°")
+        if args.real:
+            print(f"  帧统计: frames={env.frame_count} late={env.late_count} "
+                  f"平均周期={env.mean_period*1e3:.3f}ms 最大={env.max_period*1e3:.3f}ms")
 
     if not rows:
         print("本次没有成功的实验")
@@ -149,9 +199,14 @@ def main() -> int:
             old = {k: np.asarray(d[k]) for k in d.files}
     keys = sorted(rows[0].keys())
     new = {k: np.array([r[k] for r in rows], dtype=np.float64) for k in keys}
+    # 旧文件可能缺少本次新增的列（例如 real）：按旧条数补 0，保证各列等长
+    n_old = int(np.asarray(old["omega"]).size) if "omega" in old else 0
     merged = {}
     for k in keys:
-        merged[k] = np.concatenate([old[k], new[k]]) if k in old else new[k]
+        prev = old.get(k)
+        if prev is None:
+            prev = np.zeros(n_old, dtype=np.float64)
+        merged[k] = np.concatenate([prev, new[k]])
     np.savez_compressed(out_path, **merged)
 
     print(f"\n完成：本次 {len(rows)}/{tried} 条成功（失败 {failed}），"

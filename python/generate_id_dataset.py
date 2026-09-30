@@ -20,6 +20,15 @@
     python3 python/generate_id_dataset.py --num 20 --alpha-deg 0 --start-index 0
     # 倾角 12°、平面内方向 90°
     python3 python/generate_id_dataset.py --num 20 --alpha-deg 12 --start-index 20
+
+    # 真实硬件（RealEnv）：状态来自通信严格反解、力矩下发给 MCU、不加噪声、
+    # perf_counter_ns + 忙等精确帧控制；数据默认写到 data/sim_real
+    python3 python/generate_id_dataset.py --real --num 20 --start-index 0
+
+之后用同一套辨识脚本读真实数据::
+
+    python3 python/identify_params.py --data data/sim_real \
+        --friction-sweep data/friction_real/sweep.npz
 """
 
 from __future__ import annotations
@@ -34,9 +43,10 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import sim_config as cfg                                  # noqa: E402
+from capi import ImuLocation                              # noqa: E402
 from capi import State as _State                          # noqa: E402
 from capi import State                                 # noqa: E402
-from env import SimEnv                                      # noqa: E402
+from env import RealEnv, SimEnv                             # noqa: E402
 
 DATA_DIR = cfg.DATA_DIR_SIM
 
@@ -44,7 +54,8 @@ DATA_DIR = cfg.DATA_DIR_SIM
 # ===========================================================================
 # 无重置时的"控回初值"控制器
 # ===========================================================================
-def reposition(env: SimEnv, theta_b_target: float) -> tuple[bool, int, State]:
+def reposition(env, theta_b_target: float,
+               max_steps: int = cfg.REPOS_MAX_STEPS) -> tuple[bool, int, State]:
     """用控制力矩把状态控回 (θ_b=target, θ̇_b=0, θ_s=0, θ̇_s=0)。
 
     环境不支持重置，只能这样回去。两个关键点：
@@ -65,7 +76,7 @@ def reposition(env: SimEnv, theta_b_target: float) -> tuple[bool, int, State]:
     a0 = cfg.CTRL_LPF_ALPHA
     eps_eff = env.sigma[0] * np.sqrt(a0 / (2.0 - a0)) if env.noise else 0.0
     tol = max(cfg.REPOS_TOL_RAD, cfg.REPOS_TOL_SIGMA * eps_eff)
-    for i in range(cfg.REPOS_MAX_STEPS):
+    for i in range(max_steps):
         m = env.state()
         a = cfg.CTRL_LPF_ALPHA
         filt = _State(theta_b=filt.theta_b + a * (m.theta_b - filt.theta_b),
@@ -97,10 +108,10 @@ def reposition(env: SimEnv, theta_b_target: float) -> tuple[bool, int, State]:
         if (abs(tgt - filt.theta_b) < tol and abs(filt.dtheta_b) < cfg.REPOS_TOL_VEL
                 and abs(filt.theta_s) < tol and abs(filt.dtheta_s) < cfg.REPOS_TOL_VEL):
             return True, i + 1, _average_state(env, cfg.X0_AVG)
-    return False, cfg.REPOS_MAX_STEPS, _average_state(env, cfg.X0_AVG)
+    return False, max_steps, _average_state(env, cfg.X0_AVG)
 
 
-def _average_state(env: SimEnv, n: int) -> _State:
+def _average_state(env, n: int) -> _State:
     """在当前状态附近多采几次取平均，作为对真实状态的估计（用于记录 x0）。"""
     acc = []
     for _ in range(max(1, n)):
@@ -151,7 +162,7 @@ def _velocity_barrier(v: float, v_max: float, k: float,
 # ===========================================================================
 # 在环境上跑一条激励轨迹（在线闭环 + 噪声注入实际力矩）
 # ===========================================================================
-def run_excitation(env: SimEnv, rng, ts_ref_deg: float, tb_ref_rad: float) -> dict:
+def run_excitation(env, rng, ts_ref_deg: float, tb_ref_rad: float) -> dict:
     """从**当前状态**出发跑一条激励轨迹。
 
     力矩噪声直接加到实际施加的力矩上，因此"记录力矩 = 实际施加力矩"，
@@ -201,7 +212,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--num", type=int, default=cfg.DEFAULT_NUM,
                     help="本次会话生成多少条轨迹")
-    ap.add_argument("--out", type=str, default=str(DATA_DIR))
+    ap.add_argument("--out", type=str, default=None,
+                    help="输出目录；缺省时 --real 用 data/sim_real，否则用 data/sim")
     ap.add_argument("--seed", type=int, default=cfg.DEFAULT_SEED)
     ap.add_argument("--start-index", type=int, default=0,
                     help="本会话第一条的编号（多次运行拼接数据集时用）")
@@ -217,29 +229,63 @@ def main() -> int:
                     help="传给环境的传感器角速度噪声 σ [rad/s]")
     ap.add_argument("--sigma-tau", type=float, default=cfg.SIGMA_TAU,
                     help="传给环境的执行器力矩噪声 σ [N·m]")
+
+    # ---- 真实硬件环境（RealEnv）----
+    ap.add_argument("--real", action="store_true",
+                    help="用真实硬件环境：状态来自通信严格反解、力矩下发给 MCU、"
+                         "不加噪声、perf_counter_ns+忙等精确帧控制。"
+                         "此时 --zero-gravity/--gravity-seed/--no-noise/--sigma-* 均无效")
+    ap.add_argument("--imu-location", choices=("head", "big_yaw"), default="head",
+                    help="[--real] IMU 安装构型（决定严格反解的运动学链）")
+    ap.add_argument("--spin-us", type=float, default=300.0,
+                    help="[--real] 每帧末尾纯自旋等待的时长 [µs]（越大越准越费 CPU）")
+    ap.add_argument("--tau-b-max", type=float, default=cfg.TAU_B_MAX,
+                    help="[--real] 关节 b 下发前硬限幅 [N·m]")
+    ap.add_argument("--tau-s-max", type=float, default=cfg.TAU_S_MAX,
+                    help="[--real] 关节 s 下发前硬限幅 [N·m]")
+    ap.add_argument("--gravity-settle-s", type=float, default=0.3,
+                    help="[--real] 会话开始对反解重力取平均的时长 [s]")
+    ap.add_argument("--ready-timeout-s", type=float, default=5.0,
+                    help="[--real] 等待 MCU+IMU 首个有效样本的超时 [s]")
+    ap.add_argument("--max-repos-steps", type=int, default=cfg.REPOS_MAX_STEPS,
+                    help="[--real] 控回初值的最多步数（真机收敛慢时调大）")
     args = ap.parse_args()
 
+    if args.out is None:
+        args.out = str(cfg.DATA_DIR_SIM_REAL if args.real else DATA_DIR)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
 
-    print(f"数据目录: {out_dir}   会话轨迹数: {args.num}   起始编号: {args.start_index}")
+    print(f"数据目录: {out_dir}   会话轨迹数: {args.num}   起始编号: {args.start_index}   "
+          f"数据源: {'真实硬件' if args.real else '仿真'}")
     print(f"采样: dt={cfg.DT}s ({1/cfg.DT:.0f}Hz)  K={cfg.NUM_STEPS}  "
-          f"refinement={cfg.REFINEMENT}")
+          f"refinement={cfg.REFINEMENT}（回放用）")
     print(f"约束: θ_s 目标 ≤{cfg.THETA_S_TARGET_DEG:.0f}° / 硬限 "
           f"{cfg.THETA_S_LIMIT_DEG:.0f}°；速度 ±{cfg.V_MAX_B:.1f}/±{cfg.V_MAX_S:.1f} rad/s")
-    print(f"噪声（由仿真环境在接口内施加）: {'启用' if args.noise else '关闭'}  "
-          f"σ_pos={args.sigma_pos:g} rad  σ_vel={args.sigma_vel:g} rad/s  "
-          f"σ_tau={args.sigma_tau:g} N·m")
+    if not args.real:
+        print(f"噪声（由仿真环境在接口内施加）: {'启用' if args.noise else '关闭'}  "
+              f"σ_pos={args.sigma_pos:g} rad  σ_vel={args.sigma_vel:g} rad/s  "
+              f"σ_tau={args.sigma_tau:g} N·m")
 
-    # ---- 整个程序运行期间只构造一次环境；重力由环境构造时随机确定、只读 ----
-    env = SimEnv(zero_gravity=args.zero_gravity, noise=args.noise,
-                 sigma_pos=args.sigma_pos, sigma_vel=args.sigma_vel,
-                 sigma_tau=args.sigma_tau, seed=args.gravity_seed)
+    # ---- 整个程序运行期间只构造一次环境 ----
+    if args.real:
+        env = RealEnv(
+            dt=cfg.DT,
+            imu_location=(ImuLocation.ON_HEAD if args.imu_location == "head"
+                          else ImuLocation.ON_BIG_YAW),
+            tau_b_max=args.tau_b_max, tau_s_max=args.tau_s_max,
+            spin_us=args.spin_us, gravity_settle_s=args.gravity_settle_s,
+            ready_timeout_s=args.ready_timeout_s)
+    else:
+        env = SimEnv(zero_gravity=args.zero_gravity, noise=args.noise,
+                     sigma_pos=args.sigma_pos, sigma_vel=args.sigma_vel,
+                     sigma_tau=args.sigma_tau, seed=args.gravity_seed)
     gx, gy = env.gravity
     alpha = env.gravity_alpha_deg
-    print(f"等效重力（环境构造时随机确定，不可设置）: 倾角 α={alpha:.3f}°  "
-          f"(gx,gy)=({gx:.4f},{gy:.4f})  |g_inplane|={np.hypot(gx, gy):.4f} m/s²"
+    print(f"等效重力（{'反解得到' if args.real else '环境构造时随机确定'}，不可设置）: "
+          f"倾角 α={alpha:.3f}°  (gx,gy)=({gx:.4f},{gy:.4f})  "
+          f"|g_inplane|={np.hypot(gx, gy):.4f} m/s²"
           f"  （上界 9.81·sin20° = {cfg.G_INPLANE_MAX:.3f}）")
 
     idx = 0
@@ -253,7 +299,7 @@ def main() -> int:
             case_no = args.start_index + idx
             case_rng = np.random.default_rng(args.seed + 7919 * (case_no + 1))
             tb_target = float(case_rng.uniform(-np.pi, np.pi))
-            ok, nrep, _ = reposition(env, tb_target)
+            ok, nrep, _ = reposition(env, tb_target, args.max_repos_steps)
             if not ok:
                 consec_fail += 1
                 print(f"  case {case_no}: 控回初值未收敛（{nrep} 步），跳过"
@@ -280,7 +326,7 @@ def main() -> int:
                     break
                 if ts_deg <= cfg.THETA_S_LIMIT_DEG and best is None:
                     best = (rec, ts_deg)
-                reposition(env, tb_target)      # 未达标：控回初值再试
+                reposition(env, tb_target, args.max_repos_steps)      # 未达标：控回初值再试
             if best is None:
                 rejected += 1
                 continue
@@ -311,10 +357,12 @@ def main() -> int:
                 weights=np.array([cfg.W_PSI_B, cfg.W_PSI_S,
                                   cfg.W_DPSI_B, cfg.W_DPSI_S], dtype=np.float64),
                 # 关掉噪声时写 0，避免误以为数据带噪
-                noise_enabled=np.int64(1 if args.noise else 0),
+                noise_enabled=np.int64(1 if (args.noise and not args.real) else 0),
                 noise_sigma=np.array([args.sigma_pos, args.sigma_vel, args.sigma_tau],
-                                     dtype=np.float64) if args.noise
+                                     dtype=np.float64) if (args.noise and not args.real)
                 else np.zeros(3, dtype=np.float64),
+                # 数据来源：0 = 仿真，1 = 真实硬件（RealEnv）
+                real=np.int64(1 if args.real else 0),
                 gx=np.float64(gx), gy=np.float64(gy),
                 gravity_alpha_deg=np.float64(alpha),
                 theta_s_max_deg=np.float64(ts_deg),
@@ -335,6 +383,10 @@ def main() -> int:
                       f"|Tb|max={np.abs(tau_b).max():.2f} |Ts|max={np.abs(tau_s).max():.2f}")
             idx += 1
 
+    if args.real:
+        print(f"\n帧统计: frames={env.frame_count}  late={env.late_count}（落后重对齐的帧）  "
+              f"平均周期={env.mean_period*1e3:.3f}ms  最大={env.max_period*1e3:.3f}ms  "
+              f"(目标 {cfg.DT*1e3:.3f}ms)")
     n_samp = max(1, idx * cfg.NUM_STEPS)
     if ts_all:
         a = np.array(ts_all)

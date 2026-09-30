@@ -128,3 +128,6 @@ FS_INT_CLAMP = 5.0               # 速度环积分限幅
 DATA_DIR_SIM = REPO / "data" / "sim"
 DATA_DIR_FRICTION = REPO / "data" / "friction"
 DATA_DIR_IDENTIFY = REPO / "data" / "identify"
+# 真实硬件采集（RealEnv）用的独立目录，避免与仿真数据混在一起
+DATA_DIR_SIM_REAL = REPO / "data" / "sim_real"
+DATA_DIR_FRICTION_REAL = REPO / "data" / "friction_real"
