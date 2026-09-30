@@ -112,7 +112,7 @@ REPOS_TOL_SIGMA = 3.0            # 收敛容差 = max(REPOS_TOL_RAD, SIGMA·滤�
 CTRL_LPF_ALPHA = 1.0            # 控制用状态的一阶低通系数（越小越平滑）
 ACCEPT_AVG = 5                   # 验收 θ_s 的短窗均值点数
 X0_AVG = 20                      # 起始状态（x0）的均值点数
-REPOS_TOL_RAD = 0.01           # 角度收敛容差 [rad]
+REPOS_TOL_RAD = 0.05           # 角度收敛容差 [rad]
 REPOS_TOL_VEL = 0.2           # 速度收敛容差 [rad/s]
 REPOS_MAX_STEPS = 3000           # 最多用多少步把状态控回去
 REPOS_INT_CLAMP = 1.0            # 积分限幅
