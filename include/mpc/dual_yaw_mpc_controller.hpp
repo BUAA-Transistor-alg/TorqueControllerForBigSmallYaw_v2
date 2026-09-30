@@ -47,12 +47,49 @@ public:
         double integral_gain_s = 0.0;  ///< 小 yaw 积分比例系数
     };
 
+    // ------------------------------------------------------------------
+    // 一次状态读取的结果（严格反解包 → 两个广义坐标 + 世界方位角）
+    //
+    // 世界方位角按 dm 模型定义由基座角与关节角合成，保证与内层 loss 的
+    // psi_b / psi_s 语义完全一致：
+    //     psi_b = theta_c + theta_b,   psi_s = psi_b + theta_s
+    //     dpsi_b = dtheta_c + dtheta_b, dpsi_s = dpsi_b + dtheta_s
+    // comm 为 nullptr 时 valid = false，其余字段为 0。
+    // ------------------------------------------------------------------
+    struct Measurement {
+        bool   valid = false;
+        // 两个广义坐标（关节系）
+        double theta_b = 0.0;
+        double dtheta_b = 0.0;
+        double theta_s = 0.0;
+        double dtheta_s = 0.0;
+        // 基座（底盘偏航）
+        double theta_c = 0.0;
+        double dtheta_c = 0.0;
+        // 世界系方位角
+        double psi_b = 0.0;
+        double psi_s = 0.0;
+        double dpsi_b = 0.0;
+        double dpsi_s = 0.0;
+    };
+
     struct Result {
         bool valid = false;  ///< 状态读取与求解是否正常
 
         double torque_b = 0.0;  ///< 待发送的大 yaw 力矩 [N·m]
         double torque_s = 0.0;  ///< 待发送的小 yaw 力矩 [N·m]
 
+        // ── 关节系（下发 MCU 用的量：θ_b 为关节角、θ_s 为相对大 yaw 的关节角）──
+        double pred_theta_b = 0.0;      ///< 一步后大 yaw 关节角 = pred_psi_b − theta_c
+        double pred_theta_s = 0.0;      ///< 一步后小 yaw 关节角 = pred_psi_s − pred_psi_b
+        double pred_dtheta_b = 0.0;     ///< 一步后大 yaw 关节角速度
+        double pred_dtheta_s = 0.0;     ///< 一步后小 yaw 关节角速度
+        double state_theta_b = 0.0;     ///< 求解时的当前关节角
+        double state_theta_s = 0.0;
+        double state_theta_c = 0.0;     ///< 求解时的基座角（关节↔世界换算基准）
+        double state_dtheta_c = 0.0;
+
+        // ── 世界系（显示 / 积分补偿用）──
         double pred_psi_b = 0.0;      ///< 一步后预测世界方位角（= 预测序列第 0 项）
         double pred_psi_s = 0.0;
         double pred_dpsi_b = 0.0;     ///< 一步后预测世界角速度
@@ -101,6 +138,12 @@ public:
     // ------------------------------------------------------------------
     // 只读访问 / 配置
     // ------------------------------------------------------------------
+
+    /// 读取一次当前状态（严格反解包 → 广义坐标 + 世界方位角）。线程安全（走
+    /// RobotCommunication 的快照）。上层（如 McuMpcController 的目标 wrap、
+    /// RobotController 的显示）可直接复用，避免各处重复写"姿态 → 状态"换算。
+    Measurement measure() const;
+
     double integralB() const { return integral_b_; }
     double integralS() const { return integral_s_; }
 

@@ -72,26 +72,54 @@ DualYawMpcController::Result DualYawMpcController::step(
     return solve(integral_enable);
 }
 
+DualYawMpcController::Measurement DualYawMpcController::measure() const {
+    Measurement m;
+    if (comm_ == nullptr) {
+        return m;
+    }
+    // 严格反解包 → 两个广义坐标 + 基座量；世界方位角按 dm 模型定义合成，
+    // 与内层 loss 的 psi_b / psi_s 语义保持一致。
+    const com::FullStrictPoseBuilder::StrictPose pose = comm_->getStrictPose();
+
+    m.valid = true;
+    m.theta_c = pose.chassis_azimuth;
+    m.dtheta_c = pose.chassis_omega;
+    m.theta_b = pose.yaw_big_angle;
+    m.dtheta_b = pose.big_motor_omega;
+    m.theta_s = pose.yaw_small_angle;
+    m.dtheta_s = pose.small_motor_omega;
+
+    m.psi_b = m.theta_c + m.theta_b;
+    m.psi_s = m.psi_b + m.theta_s;
+    m.dpsi_b = m.dtheta_c + m.dtheta_b;
+    m.dpsi_s = m.dpsi_b + m.dtheta_s;
+    return m;
+}
+
 DualYawMpcController::Result DualYawMpcController::solve(bool integral_enable) {
     Result r;
-    if (comm_ == nullptr) {
+
+    // ---- 1. 读严格反解包，按模型定义组装状态与世界方位角 ----
+    const Measurement meas = measure();
+    if (!meas.valid) {
         return r;
     }
 
-    // ---- 1. 读严格反解包，按模型定义组装状态与世界方位角 ----
-    const com::FullStrictPoseBuilder::StrictPose pose = comm_->getStrictPose();
+    const double theta_c = meas.theta_c;
+    const double dtheta_c = meas.dtheta_c;
+    const double theta_b = meas.theta_b;
+    const double dtheta_b = meas.dtheta_b;
+    const double theta_s = meas.theta_s;
+    const double dtheta_s = meas.dtheta_s;
 
-    const double theta_c = pose.chassis_azimuth;
-    const double dtheta_c = pose.chassis_omega;
-    const double theta_b = pose.yaw_big_angle;
-    const double dtheta_b = pose.big_motor_omega;
-    const double theta_s = pose.yaw_small_angle;
-    const double dtheta_s = pose.small_motor_omega;
-
-    const double psi_b = theta_c + theta_b;
-    const double psi_s = psi_b + theta_s;
+    const double psi_b = meas.psi_b;
+    const double psi_s = meas.psi_s;
     r.state_psi_b = psi_b;
     r.state_psi_s = psi_s;
+    r.state_theta_b = theta_b;
+    r.state_theta_s = theta_s;
+    r.state_theta_c = theta_c;
+    r.state_dtheta_c = dtheta_c;
 
     // 延迟缓冲被清空时（reset 后直接求解）退化为 N 个 0 目标。
     if (target_buf_b_.empty()) target_buf_b_.assign(1, 0.0);
@@ -128,6 +156,11 @@ DualYawMpcController::Result DualYawMpcController::solve(bool integral_enable) {
     r.pred_psi_s = mres.pred_psi_s;
     r.pred_dpsi_b = mres.pred_dpsi_b;
     r.pred_dpsi_s = mres.pred_dpsi_s;
+    // 世界系 → 关节系（下发 MCU 的目标角/角速度用的就是这两个）
+    r.pred_theta_b = r.pred_psi_b - theta_c;
+    r.pred_theta_s = r.pred_psi_s - r.pred_psi_b;
+    r.pred_dtheta_b = r.pred_dpsi_b - dtheta_c;
+    r.pred_dtheta_s = r.pred_dpsi_s - r.pred_dpsi_b;
     r.ref_psi_b = ref_b;
     r.ref_psi_s = ref_s;
     r.pred_psi_b_seq = mres.pred_psi_b_seq;
