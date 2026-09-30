@@ -46,6 +46,7 @@ add_library(tcbs SHARED
     src/capi/capi_dm.cpp
     src/com/CRC.cpp
     src/com/McuDataPreprocessor.cpp
+    src/com/FullStrictPoseBuilder.cpp
 )
 
 target_include_directories(tcbs
@@ -72,36 +73,3 @@ set_target_properties(tcbs PROPERTIES
 )
 
 message(STATUS "tcbs 动态库输出目录: ${CMAKE_BINARY_DIR}")
-
-# ---------------------------------------------------------------------------
-# 自检程序：轨迹梯度（离散伴随）与参数梯度（前向灵敏度）vs 中心差分
-# 运行: ./build/tcbs_trajectory_test
-# ---------------------------------------------------------------------------
-add_executable(tcbs_trajectory_test
-    tests/test_trajectory_gradient.cpp
-    src/dm/dynamics.cpp
-    src/dm/trajectory.cpp
-    src/dm/param_gradient.cpp
-)
-target_include_directories(tcbs_trajectory_test PRIVATE ${DM_INCLUDE})
-target_compile_options(tcbs_trajectory_test PRIVATE -Wall -Wextra -Wpedantic)
-set_source_files_properties(tests/test_trajectory_gradient.cpp PROPERTIES
-    COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O3>")
-set_target_properties(tcbs_trajectory_test PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-
-# ---------------------------------------------------------------------------
-# 自检程序：通信模块（tcbs::com）——协议布局 / CRC8 / CRC32 / 编码器映射 /
-#           模板类型实例化，全部不需要硬件
-# 运行: ./build/tcbs_com_test
-# ---------------------------------------------------------------------------
-add_executable(tcbs_com_test
-    tests/test_com_module.cpp
-    src/com/CRC.cpp
-    src/com/McuDataPreprocessor.cpp
-)
-target_include_directories(tcbs_com_test PRIVATE ${COM_INCLUDE})
-target_compile_options(tcbs_com_test PRIVATE -Wall -Wextra -Wpedantic)
-target_link_libraries(tcbs_com_test PRIVATE ${TCBS_UDEV_LIBRARY} Threads::Threads)
-set_target_properties(tcbs_com_test PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})

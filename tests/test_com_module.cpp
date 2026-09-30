@@ -302,8 +302,47 @@ int main() {
                   "RobotCommunication 可构造，无数据时 valid 均为 false");
             const McuDataPreprocessor::LinearParams& p = robot.preprocessor().params();
             check(p.recv_small_yaw_offset == -1.025466, "默认映射参数已注入 preprocessor");
+            check(robot.getStrictPose().yaw_big_angle == 0.0 && robot.getStrictPose().gx == 0.0,
+                  "RobotCommunication::getStrictPose() 可调用（无样本时字段为 0）");
             robot.stop();
         }
+    }
+
+    // ── 6. FullStrictPoseBuilder（骨架：样本保存 + strictPose 取用 + 加锁）──
+    std::printf("[6] FullStrictPoseBuilder\n");
+    {
+        FullStrictPoseBuilder builder;
+        const FullStrictPoseBuilder::StrictPose sp0 = builder.strictPose();
+        check(sp0.imu_euler_yaw == 0.0 && sp0.imu_euler_pitch == 0.0 &&
+                  sp0.imu_euler_roll == 0.0 && sp0.yaw_big_angle == 0.0 &&
+                  sp0.yaw_small_angle == 0.0 && sp0.pitch_angle == 0.0,
+              "从未传入样本时 StrictPose 输入快照全为 0");
+
+        FullStrictPoseBuilder::ImuSample imu;
+        imu.euler_yaw = 0.1;
+        imu.euler_pitch = 0.2;
+        imu.euler_roll = 0.3;
+        builder.onImu(imu);
+
+        FullStrictPoseBuilder::McuSample mcu;
+        mcu.yaw_big_angle = 0.5;
+        mcu.yaw_big_omega = 0.1;
+        mcu.yaw_small_angle = 0.2;
+        mcu.yaw_small_omega = 0.05;
+        mcu.pitch_angle = 0.3;
+        mcu.chassis_imu_yaw = 0.4;
+        mcu.chassis_imu_omega = 0.02;
+        builder.onMcu(mcu);
+
+        const FullStrictPoseBuilder::StrictPose sp = builder.strictPose();
+        check(sp.imu_euler_yaw == 0.1 && sp.imu_euler_pitch == 0.2 &&
+                  sp.imu_euler_roll == 0.3 && sp.yaw_big_angle == 0.5 &&
+                  sp.yaw_small_angle == 0.2 && sp.pitch_angle == 0.3,
+              "strictPose 取用已保存的 IMU / MCU 样本");
+        check(sp.chassis_euler_yaw == 0.0 && sp.chassis_euler_pitch == 0.0 &&
+                  sp.chassis_azimuth == 0.0 && sp.big_azimuth == 0.0 &&
+                  sp.small_azimuth == 0.0 && sp.gx == 0.0 && sp.gy == 0.0,
+              "反解结果 / 重力分量待实现，暂为 0");
     }
 
     std::printf("\n%s（失败 %d 项）\n", g_fail == 0 ? "全部通过" : "存在失败", g_fail);
