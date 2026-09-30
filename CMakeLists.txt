@@ -59,6 +59,7 @@ add_library(tcbs SHARED
     src/common/FrameRateCounter.cpp
     src/RobotController.cpp
     src/capi/capi_dm.cpp
+    src/capi/capi_com.cpp
     src/com/CRC.cpp
     src/com/McuDataPreprocessor.cpp
     src/com/FullStrictPoseBuilder.cpp
