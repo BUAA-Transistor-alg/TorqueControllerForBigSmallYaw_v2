@@ -571,8 +571,10 @@ class LatestData:
 class StrictPose:
     """严格反解数据包（独立输出）。没有 valid 标志，始终可读；缺失数据以 0 参与。
 
-    注意：反解算法（``chassis_euler_*`` / ``*_azimuth`` / ``gx``, ``gy``）尚未实现，
-    相关字段目前为 0；``yaw_big_angle`` / ``yaw_small_angle`` / ``pitch_angle`` 来自 MCU。
+    ``yaw_big_angle`` / ``yaw_small_angle`` / ``pitch_angle`` 来自 MCU；``chassis_euler_*``、
+    ``chassis_azimuth`` / ``big_azimuth`` / ``small_azimuth``、``gx`` / ``gy`` 与各方位角
+    速度由 FullStrictPoseBuilder 反解得到（底盘水平时 ``gx = gy = 0``，倾斜时为旋转平面内
+    的重力分量；底盘姿态未收到 IMU 样本前为 0）。
     """
 
     yaw_big_angle: float

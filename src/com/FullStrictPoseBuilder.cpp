@@ -1,9 +1,12 @@
-// FullStrictPoseBuilder.cpp — 具体处理内容暂时留空。
+// FullStrictPoseBuilder.cpp — 严格反解包实现。
 //
-// 目前只完成"数据流 + 加锁"骨架:
 //   · onImu / onMcu: 把打包好的样本存进成员变量（锁内覆盖，未传入过则保持全 0）；
-//   · strictPose() : 锁内读取两个成员，填充 StrictPose 的反解输入快照。
-// 反解算法（底盘姿态 chassis_euler_*、各环节方位角、重力分量 gx/gy）尚待实现。
+//   · strictPose() : 锁内取两个成员的一致快照，随后**在锁外**做反解，得到
+//       底盘姿态 chassis_euler_*、底盘方位角 chassis_azimuth、
+//       大/小 yaw 世界方位角 big_azimuth / small_azimuth、
+//       旋转平面内重力分量 gx / gy、以及各环节方位角速度。
+//     运动学链按 imu_location_ 分支（ON_HEAD / ON_BIG_YAW），两分支的旋转矩阵与
+//     角速度合成方式不同，见下方 strictPose() 内的注释。
 #include "FullStrictPoseBuilder.h"
 #include <cmath>
 

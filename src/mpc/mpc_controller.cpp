@@ -94,6 +94,21 @@ void MPCController::reset() {
     ref_ = Reference{};
 }
 
+void MPCController::setParams(const dm::Params& params) {
+    if (const char* err = dm::validateTrajectoryConfig(params, opt_.N, opt_.dt,
+                                                       opt_.refinement)) {
+        throw std::invalid_argument(std::string("MPCController::setParams: ") + err);
+    }
+    params_ = params;
+}
+
+void MPCController::setGravity(double gx, double gy) {
+    // 只改重力两项：gx/gy 不参与 validateTrajectoryConfig 的检查（它只看 dt/K/refinement/lambda），
+    // 因此不必重新校验。
+    params_.gx = gx;
+    params_.gy = gy;
+}
+
 // ----------------------------------------------------------------------------
 // 内部工具
 // ----------------------------------------------------------------------------

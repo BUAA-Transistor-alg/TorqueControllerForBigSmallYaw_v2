@@ -1,4 +1,4 @@
-// FullStrictPoseBuilder.h — 「全量严格反解数据包」构建器（骨架；具体处理内容待实现）
+// FullStrictPoseBuilder.h — 「全量严格反解数据包」构建器
 //
 // ── 来源与定位 ──
 //   本类的**用法**仿照 /home/huhu233/rm2027/TorqueController 中 `YawChassisFusion fusion_`
@@ -9,15 +9,20 @@
 //   数据结构则对齐 TorqueControllerForBigSmallYaw 的 `dual_yaw::StrictPose`
 //   （反解输入快照 + 底盘/各环节姿态与方位角 + 重力分量），故名「全量」。
 //
-// ── 现状（重要）──
-//   ★ **具体处理内容暂时留空**: onImu / onMcu 只把打包好的样本存进成员变量
-//     （从未传入过的样本保持全 0）；strictPose() 在锁内用这两个成员填充
-//     StrictPose 的反解输入快照。反解算法（底盘姿态、方位角、重力分量）尚未实现，
-//     相关字段暂为 0。填空时只需改本类的 .cpp，RobotCommunication 一侧无需再动。
+// ── 现状 ──
+//   onImu / onMcu 把打包好的样本存进成员变量（从未传入过的样本保持全 0）；
+//   strictPose() 在锁内取一致快照后**做完整反解**：
+//     · 按安装构型由 IMU 欧拉角与关节角反解底盘姿态 R_chassis → chassis_euler_*；
+//     · 再把它投影到纯绕 Z 的旋转（projectToZRotation）得到 chassis_azimuth，
+//       以及旋转平面内的重力分量 projX / projY → gx = projX·g、gy = projY·g
+//       （底盘水平时二者为 0，倾斜时 |(gx,gy)| = g·sin(倾角)）；
+//     · big_azimuth = chassis_azimuth + θ_b，small_azimuth = big_azimuth + θ_s；
+//     · 各环节方位角速度由 IMU 陀螺 gz/gy 与关节角速度按构型链式合成。
+//   角度由 atan2 / asin 给出，天然落在 (−π, π]（pitch ∈ [−π/2, π/2]）。
 //
 // ── 约定 ──
 //   · 与 `dual_yaw::StrictPose` 一致: **没有 valid 标志，始终可读**；
-//     所需数据缺失时以历史值或 0 参与计算，角度最终 wrap 到 (−π, π]（wrap 待实现）。
+//     所需数据缺失时以历史值或 0 参与计算。
 //   · 与 RobotTfTree 一致的 ZXY 约定: R = Rz(yaw)·Rx(pitch)·Ry(roll)。
 //   · 运动学链（IMU 安装位置可配置，语义见下方 imu_location）:
 //       ON_BIG_YAW (0): R_world_imu = R_world_chassis · Rz(θ_b) · R_A_IMU

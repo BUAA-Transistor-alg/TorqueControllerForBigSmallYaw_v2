@@ -183,8 +183,9 @@ typedef struct TcbsComLatestData {
 
 /*
  * 严格反解数据包（FullStrictPoseBuilder::StrictPose）。
- * 没有 valid 标志，始终可读；所需数据缺失时以 0 参与。
- * 注意：反解算法（chassis_euler_* / *_azimuth / gx,gy）尚未实现，相关字段目前为 0。
+ * 没有 valid 标志，始终可读；所需数据缺失时（从未收到该来源的样本）以 0 参与。
+ * chassis_euler_* / chassis_azimuth / big_azimuth / small_azimuth / gx,gy 均由
+ * 反解算法给出：底盘水平时 gx = gy = 0，倾斜时为旋转平面内的重力分量。
  */
 typedef struct TcbsComPose {
     /* 反解输入 */

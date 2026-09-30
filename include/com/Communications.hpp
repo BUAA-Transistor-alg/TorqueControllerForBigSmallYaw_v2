@@ -13,7 +13,8 @@
 //   原版 RobotCommunication 还组合了 YawStateEstimator（喂状态估计 + getEstimate()），
 //   该估计器**不在本次移植范围内**，因此这里已将其移除；其余行为（映射、原始/处理后
 //   双份缓存、mcu2_seq 透传、线程安全快照）与原版保持一致。
-//   FullStrictPoseBuilder 的具体处理内容暂时留空（见其头文件），此处只固定接法。
+//   FullStrictPoseBuilder 的反解算法已实现（底盘姿态 / 各环节方位角 / 重力分量），
+//   此处只固定接法，无需改动。
 #ifndef TCBS_COM_COMMUNICATIONS_HPP
 #define TCBS_COM_COMMUNICATIONS_HPP
 

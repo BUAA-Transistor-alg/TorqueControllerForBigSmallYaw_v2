@@ -17,8 +17,9 @@
 //   dθ_c       = chassis_omega           dθ_b      = big_motor_omega
 //   dθ_s       = small_motor_omega
 //   当前世界方位角按模型定义计算：psi_b = θ_c + θ_b，psi_s = psi_b + θ_s
-// （FullStrictPoseBuilder 的反解算法尚未实现，chassis_azimuth / *_azimuth 目前为 0；
-//  实现后本封装无需改动。基座角加速度暂用 0，可用 setBaseAngularAcceleration 覆盖。）
+// （chassis_azimuth / big_azimuth / small_azimuth / gx / gy 由 FullStrictPoseBuilder
+//  反解得到；底盘水平时 gx = gy = 0，倾斜时为旋转平面内的重力分量。
+//  基座角加速度暂用 0，可用 setBaseAngularAcceleration 覆盖。）
 //
 // 两种 step 模式（与参考工程一致）：
 //   * step(target_psi_b, target_psi_s, enable)：把单点目标压入延迟缓冲
@@ -71,6 +72,10 @@ public:
         double psi_s = 0.0;
         double dpsi_b = 0.0;
         double dpsi_s = 0.0;
+        // 旋转平面内的重力分量（严格反解得到，|(gx,gy)| = g·sin(摆平面倾角)；
+        // 底盘水平时为 0）。每步由 solve 送进 MPC，底盘俯仰/横滚变化时模型才准。
+        double gx = 0.0;
+        double gy = 0.0;
     };
 
     struct Result {
@@ -135,6 +140,15 @@ public:
                 const std::vector<double>& target_psi_s_buf,
                 bool integral_enable = false);
 
+    /// 离线 / 仿真入口：状态与两个世界系参考序列都由调用方直接给出
+    /// （参考序列即预测窗口，长度不足 N 时用最后一个值补齐；空序列按目标 0）。
+    /// **不读通信、不维护延迟目标缓冲**（因此不改变在线路径的缓冲状态），
+    /// 但积分补偿状态与在线路径共用。供仿真联调与测试复用。
+    Result step(const Measurement& measurement,
+                const std::vector<double>& ref_psi_b,
+                const std::vector<double>& ref_psi_s,
+                bool integral_enable = false);
+
     // ------------------------------------------------------------------
     // 只读访问 / 配置
     // ------------------------------------------------------------------
@@ -158,8 +172,16 @@ public:
     void reset();
 
 private:
-    /// 公共求解：读状态 + 构造参考序列 + MPC + 积分补偿。
+    /// 在线路径：读状态 + 用延迟缓冲构造参考序列 + 求解。
     Result solve(bool integral_enable);
+
+    /// 核心：给定状态与**已补齐到 N** 的参考序列求解（含重力更新与积分补偿）。
+    Result solveWith(const Measurement& measurement,
+                     const std::vector<double>& ref_psi_b,
+                     const std::vector<double>& ref_psi_s,
+                     double target_psi_b,
+                     double target_psi_s,
+                     bool integral_enable);
 
     /// 把一条目标序列写入延迟缓冲（最多 N 个，不足用最后一个值补齐到 N 个）。
     static void fillBuffer(std::vector<double>& buf,

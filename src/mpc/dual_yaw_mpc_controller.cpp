@@ -93,39 +93,24 @@ DualYawMpcController::Measurement DualYawMpcController::measure() const {
     m.psi_s = m.psi_b + m.theta_s;
     m.dpsi_b = m.dtheta_c + m.dtheta_b;
     m.dpsi_s = m.dpsi_b + m.dtheta_s;
+    // 旋转平面内重力分量：底盘俯仰/横滚变化时随样本更新，solve 会送进 MPC。
+    m.gx = pose.gx;
+    m.gy = pose.gy;
     return m;
 }
 
 DualYawMpcController::Result DualYawMpcController::solve(bool integral_enable) {
     Result r;
 
-    // ---- 1. 读严格反解包，按模型定义组装状态与世界方位角 ----
+    // ---- 1. 读严格反解包，按模型定义组装状态、世界方位角与重力 ----
     const Measurement meas = measure();
     if (!meas.valid) {
         return r;
     }
 
-    const double theta_c = meas.theta_c;
-    const double dtheta_c = meas.dtheta_c;
-    const double theta_b = meas.theta_b;
-    const double dtheta_b = meas.dtheta_b;
-    const double theta_s = meas.theta_s;
-    const double dtheta_s = meas.dtheta_s;
-
-    const double psi_b = meas.psi_b;
-    const double psi_s = meas.psi_s;
-    r.state_psi_b = psi_b;
-    r.state_psi_s = psi_s;
-    r.state_theta_b = theta_b;
-    r.state_theta_s = theta_s;
-    r.state_theta_c = theta_c;
-    r.state_dtheta_c = dtheta_c;
-
     // 延迟缓冲被清空时（reset 后直接求解）退化为 N 个 0 目标。
     if (target_buf_b_.empty()) target_buf_b_.assign(1, 0.0);
     if (target_buf_s_.empty()) target_buf_s_.assign(1, 0.0);
-    r.target_psi_b = target_buf_b_.front();
-    r.target_psi_s = target_buf_s_.front();
 
     // ---- 2. 参考序列：世界系目标直接使用 ----
     // trajectory 内部已按 theta_c / dtheta_c / ddtheta_c 外推基座，
@@ -135,17 +120,67 @@ DualYawMpcController::Result DualYawMpcController::solve(bool integral_enable) {
     while (static_cast<int>(ref_b.size()) < n_) ref_b.push_back(ref_b.back());
     while (static_cast<int>(ref_s.size()) < n_) ref_s.push_back(ref_s.back());
 
+    return solveWith(meas, ref_b, ref_s, target_buf_b_.front(), target_buf_s_.front(),
+                     integral_enable);
+}
+
+DualYawMpcController::Result DualYawMpcController::step(
+    const Measurement& measurement,
+    const std::vector<double>& ref_psi_b,
+    const std::vector<double>& ref_psi_s,
+    bool integral_enable) {
+    Result r;
+    if (!measurement.valid) {
+        return r;
+    }
+
+    // 空序列按目标 0；不足 N 时用最后一个值补齐。
+    std::vector<double> ref_b = ref_psi_b.empty() ? std::vector<double>(1, 0.0) : ref_psi_b;
+    std::vector<double> ref_s = ref_psi_s.empty() ? std::vector<double>(1, 0.0) : ref_psi_s;
+    while (static_cast<int>(ref_b.size()) < n_) ref_b.push_back(ref_b.back());
+    while (static_cast<int>(ref_s.size()) < n_) ref_s.push_back(ref_s.back());
+
+    return solveWith(measurement, ref_b, ref_s, ref_b.front(), ref_s.front(), integral_enable);
+}
+
+DualYawMpcController::Result DualYawMpcController::solveWith(
+    const Measurement& measurement,
+    const std::vector<double>& ref_b,
+    const std::vector<double>& ref_s,
+    double target_psi_b,
+    double target_psi_s,
+    bool integral_enable) {
+    Result r;
+
+    const double theta_c = measurement.theta_c;
+    const double dtheta_c = measurement.dtheta_c;
+    const double psi_b = measurement.psi_b;
+    const double psi_s = measurement.psi_s;
+
+    r.state_psi_b = psi_b;
+    r.state_psi_s = psi_s;
+    r.state_theta_b = measurement.theta_b;
+    r.state_theta_s = measurement.theta_s;
+    r.state_theta_c = theta_c;
+    r.state_dtheta_c = dtheta_c;
+    r.target_psi_b = target_psi_b;
+    r.target_psi_s = target_psi_s;
+
     MPCController::Reference reference;
     reference.psi_b = ref_b;
     reference.psi_s = ref_s;
 
     dm::State x0;
-    x0.theta_b = theta_b;
-    x0.dtheta_b = dtheta_b;
-    x0.theta_s = theta_s;
-    x0.dtheta_s = dtheta_s;
+    x0.theta_b = measurement.theta_b;
+    x0.dtheta_b = measurement.dtheta_b;
+    x0.theta_s = measurement.theta_s;
+    x0.dtheta_s = measurement.dtheta_s;
 
-    // ---- 3. MPC 求解（返回两轴第一步力矩与预测序列，不发送）----
+    // ---- 3. 重力更新：底盘俯仰/横滚变化 ⇒ 旋转平面内重力分量变化 ----
+    // 底盘水平时 gx = gy = 0（重力全在 z 轴、平面内无分量），与 dm 模型一致。
+    mpc_.setGravity(measurement.gx, measurement.gy);
+
+    // ---- 4. MPC 求解（返回两轴第一步力矩与预测序列，不发送）----
     const MPCController::Result mres =
         mpc_.step(x0, theta_c, dtheta_c, base_ddtheta_c_, reference);
 
@@ -166,7 +201,7 @@ DualYawMpcController::Result DualYawMpcController::solve(bool integral_enable) {
     r.pred_psi_b_seq = mres.pred_psi_b_seq;
     r.pred_psi_s_seq = mres.pred_psi_s_seq;
 
-    // ---- 4. 积分补偿（两轴各自独立）----
+    // ---- 5. 积分补偿（两轴各自独立）----
     if (integral_enable) {
         // 第一次 step 无上一步预测，不计算积分增量。
         if (has_prev_pred_) {
