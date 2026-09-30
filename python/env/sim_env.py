@@ -8,6 +8,7 @@
 只读信息（构造后固定，不能设置）
 --------------------------------
     gravity          -> (gx, gy) 本次会话的等效重力
+    noise / sigma                本次会话是否启用噪声、各自的 σ
     dt / refinement              采样周期与每主步 RK4 子步数
 
 设计约束（按需求固定）
@@ -64,9 +65,22 @@ def sample_gravity(rng: np.random.Generator | None = None,
 
 
 class SimEnv:
-    """双连杆仿真环境（基座静止、参数来自配置文件、重力随机但固定、不可重置）。"""
+    """双连杆仿真环境（基座静止、参数来自配置文件、重力随机但固定、不可重置）。
+
+    噪声模型（构造时用 noise 开关控制，默认开）：
+      * **执行器侧**：step(Tb, Ts) 内部把输入力矩叠加 σ_tau 的高斯噪声后再送进仿真，
+        也就是"实际施加的力矩 = 输入的力矩 + 噪声"；外部拿到的记录值就是那个输入，
+        等价于"记录力矩上叠了噪声"。
+      * **传感器侧**：state()/step() 返回的都是**叠加了测量噪声**的状态
+        （角 σ_pos、角速度 σ_vel），内部仿真用的是无噪声的真实状态。
+      采集脚本因此只需原样记录接口返回的状态、以及自己发出去的力矩，不自己做任何加噪。
+    """
 
     def __init__(self, zero_gravity: bool = False,
+                 noise: bool = cfg.NOISE_ENABLE,
+                 sigma_pos: float = cfg.SIGMA_POS,
+                 sigma_vel: float = cfg.SIGMA_VEL,
+                 sigma_tau: float = cfg.SIGMA_TAU,
                  dt: float = cfg.DT,
                  refinement: int = cfg.REFINEMENT,
                  seed: int | None = None):
@@ -83,24 +97,55 @@ class SimEnv:
                               lambda_=d["lambda_"])
         self._dt = float(dt)
         self._refinement = int(refinement)
+        self._noise = bool(noise)
+        self._sigma = (float(sigma_pos), float(sigma_vel), float(sigma_tau))
+        self._nrng = np.random.default_rng(seed)
         self._sim = Simulator(self._params, self._dt, self._refinement)
         # 初始状态：角度与角速度均为 0
         self._sim.set_state(State(theta_b=0.0, dtheta_b=0.0,
                                   theta_s=0.0, dtheta_s=0.0))
 
+    # ---------------- 内部：传感器加噪 ----------------
+    def _measured(self, st: State) -> State:
+        if not self._noise:
+            return st
+        sp, sv, _ = self._sigma
+        return State(theta_b=st.theta_b + self._nrng.normal(0.0, sp),
+                     dtheta_b=st.dtheta_b + self._nrng.normal(0.0, sv),
+                     theta_s=st.theta_s + self._nrng.normal(0.0, sp),
+                     dtheta_s=st.dtheta_s + self._nrng.normal(0.0, sv))
+
     # ---------------- 对外操作接口 ----------------
     def state(self) -> State:
-        """立即获取当前状态。"""
-        return self._sim.state
+        """立即获取当前状态（启用噪声时为**测量值**）。"""
+        return self._measured(self._sim.state)
 
     def step(self, Tb: float, Ts: float) -> State:
-        """输入两个控制力矩，推进一个 dt，返回推进后的状态。
+        """输入两个控制力矩，推进一个 dt，返回推进后的状态（启用噪声时为**测量值**）。
 
-        基座状态恒为 0，因此这里固定传 theta_c = dtheta_c = ddtheta_c = 0。
+        内部按 "输入力矩 + σ_tau 高斯噪声" 作为实际施加力矩推进（并受力矩限幅），
+        基座状态恒为 0（theta_c = dtheta_c = ddtheta_c = 0）。
         """
-        return self._sim.step(float(Tb), float(Ts), 0.0, 0.0, 0.0)
+        ab, as_ = float(Tb), float(Ts)
+        if self._noise:
+            st_ = self._sigma[2]
+            ab = float(np.clip(ab + self._nrng.normal(0.0, st_),
+                               -cfg.TAU_B_MAX, cfg.TAU_B_MAX))
+            as_ = float(np.clip(as_ + self._nrng.normal(0.0, st_),
+                                -cfg.TAU_S_MAX, cfg.TAU_S_MAX))
+        return self._measured(self._sim.step(ab, as_, 0.0, 0.0, 0.0))
 
     # ---------------- 只读信息（构造后不可修改） ----------------
+    @property
+    def sigma(self) -> tuple[float, float, float]:
+        """本次会话的噪声 σ (pos, vel, tau)。只读。"""
+        return self._sigma
+
+    @property
+    def noise(self) -> bool:
+        """本次会话是否启用噪声（构造时定，只读）。"""
+        return self._noise
+
     @property
     def gravity(self) -> tuple[float, float]:
         """本次会话的等效重力 (gx, gy)。只能获取，不能设置。"""

@@ -85,6 +85,7 @@ MAX_ATTEMPTS = 60                      # 单条数据最多尝试次数（收缩
 SHRINK = 0.85                          # 每次失败后参考幅值收缩系数
 SHAPE_RAMP_TIME = 0.2                  # [s] 多正弦首尾平滑时间
 
+NOISE_ENABLE = True                    # 仿真环境默认是否启用噪声（构造时可覆盖）
 SIGMA_POS = 1.0e-2                     # 状态角测量噪声 σ [rad]
 SIGMA_VEL = 5.0e-2                     # 状态角速度测量噪声 σ [rad/s]
 SIGMA_TAU = 5.0e-3                     # 力矩噪声 σ [N·m]（直接加到实际施加上）
@@ -101,6 +102,14 @@ DEFAULT_SEED = 20240607
 # ---- 无重置时的"控回初值"控制器 ----
 REPOS_KP, REPOS_KD, REPOS_KI = 6.0, 1.2, 0.8    # 位置 PI + 速度 D
 REPOS_V_MAX = 1.5                # 目标点限速斜坡 [rad/s]（避免起步力矩饱和）
+REPOS_TOL_SIGMA = 3.0            # 收敛容差 = max(REPOS_TOL_RAD, SIGMA·滤波后残余σ)
+# 注意：噪声在仿真环境里，控制/判据读到的都是**带噪测量值**。因此：
+#   * 控制回路对测量状态做一阶低通（CTRL_LPF_ALPHA），否则 D 项会把噪声放大成力矩噪声；
+#   * 收敛判据必须基于滤波后的估计，容差不能低于测量噪声（否则永远判不了收敛）；
+#   * 验收用的 θ_s 先做短窗均值（ACCEPT_AVG），x0 用较长窗口均值（X0_AVG）。
+CTRL_LPF_ALPHA = 0.10            # 控制用状态的一阶低通系数（越小越平滑）
+ACCEPT_AVG = 5                   # 验收 θ_s 的短窗均值点数
+X0_AVG = 20                      # 起始状态（x0）的均值点数
 REPOS_TOL_RAD = 5.0e-3           # 角度收敛容差 [rad]
 REPOS_TOL_VEL = 5.0e-3           # 速度收敛容差 [rad/s]
 REPOS_MAX_STEPS = 3000           # 最多用多少步把状态控回去

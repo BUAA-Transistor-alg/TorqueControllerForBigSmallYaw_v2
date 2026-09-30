@@ -34,6 +34,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import sim_config as cfg                                  # noqa: E402
+from capi import State as _State                          # noqa: E402
 from capi import State                                 # noqa: E402
 from env import SimEnv                                      # noqa: E402
 
@@ -53,12 +54,25 @@ def reposition(env: SimEnv, theta_b_target: float) -> tuple[bool, int, State]:
     θ_b 取最近的等价目标，避免绕整圈。
     返回 (是否收敛, 用了多少步, 最终状态)。
     """
-    st = env.state()
-    tgt = theta_b_target + 2.0 * np.pi * round((st.theta_b - theta_b_target) / (2.0 * np.pi))
-    ref = st.theta_b
+    st_raw = env.state()
+    tgt = theta_b_target + 2.0 * np.pi * round(
+        (st_raw.theta_b - theta_b_target) / (2.0 * np.pi))
+    ref = st_raw.theta_b
     ib = is_ = 0.0
+    # 测量带噪：控制与收敛判据都用一阶低通后的估计
+    filt = st_raw
+    # 收敛容差按环境实际噪声自适应：低通后的残余 σ = σ·sqrt(a/(2-a))
+    a0 = cfg.CTRL_LPF_ALPHA
+    eps_eff = env.sigma[0] * np.sqrt(a0 / (2.0 - a0)) if env.noise else 0.0
+    tol = max(cfg.REPOS_TOL_RAD, cfg.REPOS_TOL_SIGMA * eps_eff)
     for i in range(cfg.REPOS_MAX_STEPS):
-        st = env.state()
+        m = env.state()
+        a = cfg.CTRL_LPF_ALPHA
+        filt = _State(theta_b=filt.theta_b + a * (m.theta_b - filt.theta_b),
+                      dtheta_b=filt.dtheta_b + a * (m.dtheta_b - filt.dtheta_b),
+                      theta_s=filt.theta_s + a * (m.theta_s - filt.theta_s),
+                      dtheta_s=filt.dtheta_s + a * (m.dtheta_s - filt.dtheta_s))
+        st = filt
         # 目标点限速逼近
         ref += float(np.clip(tgt - ref, -cfg.REPOS_V_MAX * env.dt, cfg.REPOS_V_MAX * env.dt))
         e_b, e_s = ref - st.theta_b, -st.theta_s
@@ -72,12 +86,30 @@ def reposition(env: SimEnv, theta_b_target: float) -> tuple[bool, int, State]:
             ib = float(np.clip(ib + e_b * env.dt, -cfg.REPOS_INT_CLAMP, cfg.REPOS_INT_CLAMP))
         if Ts == Ts_raw:
             is_ = float(np.clip(is_ + e_s * env.dt, -cfg.REPOS_INT_CLAMP, cfg.REPOS_INT_CLAMP))
-        st1 = env.step(Tb, Ts)
-        if (abs(tgt - st1.theta_b) < cfg.REPOS_TOL_RAD and abs(st1.dtheta_b) < cfg.REPOS_TOL_VEL
-                and abs(st1.theta_s) < cfg.REPOS_TOL_RAD
-                and abs(st1.dtheta_s) < cfg.REPOS_TOL_VEL):
-            return True, i + 1, st1
-    return False, cfg.REPOS_MAX_STEPS, env.state()
+        env.step(Tb, Ts)
+        # 收敛判据基于滤波估计；起始状态 x0 另用长窗均值，避免把测量噪声当初值
+        m2 = env.state()
+        a = cfg.CTRL_LPF_ALPHA
+        filt = _State(theta_b=filt.theta_b + a * (m2.theta_b - filt.theta_b),
+                      dtheta_b=filt.dtheta_b + a * (m2.dtheta_b - filt.dtheta_b),
+                      theta_s=filt.theta_s + a * (m2.theta_s - filt.theta_s),
+                      dtheta_s=filt.dtheta_s + a * (m2.dtheta_s - filt.dtheta_s))
+        if (abs(tgt - filt.theta_b) < tol and abs(filt.dtheta_b) < cfg.REPOS_TOL_VEL
+                and abs(filt.theta_s) < tol and abs(filt.dtheta_s) < cfg.REPOS_TOL_VEL):
+            return True, i + 1, _average_state(env, cfg.X0_AVG)
+    return False, cfg.REPOS_MAX_STEPS, _average_state(env, cfg.X0_AVG)
+
+
+def _average_state(env: SimEnv, n: int) -> _State:
+    """在当前状态附近多采几次取平均，作为对真实状态的估计（用于记录 x0）。"""
+    acc = []
+    for _ in range(max(1, n)):
+        acc.append(env.state())
+    k = 1.0 / len(acc)
+    return _State(theta_b=sum(s.theta_b for s in acc) * k,
+                  dtheta_b=sum(s.dtheta_b for s in acc) * k,
+                  theta_s=sum(s.theta_s for s in acc) * k,
+                  dtheta_s=sum(s.dtheta_s for s in acc) * k)
 
 
 # ===========================================================================
@@ -138,21 +170,23 @@ def run_excitation(env: SimEnv, rng, ts_ref_deg: float, tb_ref_rad: float) -> di
     psi_b = np.zeros(K); psi_s = np.zeros(K)
     dpsi_b = np.zeros(K); dpsi_s = np.zeros(K)
 
+    fb = fs = None          # D 项用的滤波速度（测量带噪，直接微分会把噪声放大成力矩噪声）
     for k in range(K):
         st = env.state()
-        ub = cfg.KP_B * ((tb0 + yb[k]) - st.theta_b) + cfg.KD_B * (dyb[k] - st.dtheta_b)
-        us = cfg.KP_S * ((ts0 + ys[k]) - st.theta_s) + cfg.KD_S * (dys[k] - st.dtheta_s)
+        a = cfg.CTRL_LPF_ALPHA
+        fb = st.dtheta_b if fb is None else fb + a * (st.dtheta_b - fb)
+        fs = st.dtheta_s if fs is None else fs + a * (st.dtheta_s - fs)
+        ub = cfg.KP_B * ((tb0 + yb[k]) - st.theta_b) + cfg.KD_B * (dyb[k] - fb)
+        us = cfg.KP_S * ((ts0 + ys[k]) - st.theta_s) + cfg.KD_S * (dys[k] - fs)
         ub += _velocity_barrier(st.dtheta_b, cfg.V_MAX_B, cfg.V_BARRIER_GAIN * cfg.TAU_B_MAX)
         us += _velocity_barrier(st.dtheta_s, cfg.V_MAX_S, cfg.V_BARRIER_GAIN * cfg.TAU_S_MAX)
         ub = float(np.clip(ub, -cfg.TAU_B_MAX, cfg.TAU_B_MAX))
         us = float(np.clip(us, -cfg.TAU_S_MAX, cfg.TAU_S_MAX))
         tb_cmd[k], ts_cmd[k] = ub, us
-        # 力矩噪声加在【实际施加】上（真实驱动器就是这样）
-        ab = float(np.clip(ub + rng.normal(0.0, cfg.SIGMA_TAU), -cfg.TAU_B_MAX, cfg.TAU_B_MAX))
-        as_ = float(np.clip(us + rng.normal(0.0, cfg.SIGMA_TAU), -cfg.TAU_S_MAX, cfg.TAU_S_MAX))
-        tb_app[k], ts_app[k] = ab, as_
-        st1 = env.step(ab, as_)
-        # 基座恒为 0，所以 psi_b = θ_b，psi_s = θ_b + θ_s
+        # 记录"发出去的力矩"；环境内部自己叠执行器噪声
+        tb_app[k], ts_app[k] = ub, us
+        st1 = env.step(ub, us)
+        # 基座恒为 0；这里记的是 env.step **返回的测量值**（ψ_b=θ_b, ψ_s=θ_b+θ_s）
         psi_b[k] = st1.theta_b
         psi_s[k] = st1.theta_b + st1.theta_s
         dpsi_b[k] = st1.dtheta_b
@@ -175,6 +209,14 @@ def main() -> int:
                     help="把等效重力强制设为 0（水平面）；不给则在倾角范围内随机")
     ap.add_argument("--gravity-seed", type=int, default=None,
                     help="重力抽样的随机种子；不给则每次运行都不同")
+    ap.add_argument("--no-noise", dest="noise", action="store_false",
+                    help="关闭仿真环境里的噪声（执行器 + 传感器）")
+    ap.add_argument("--sigma-pos", type=float, default=cfg.SIGMA_POS,
+                    help="传给环境的传感器角度噪声 σ [rad]")
+    ap.add_argument("--sigma-vel", type=float, default=cfg.SIGMA_VEL,
+                    help="传给环境的传感器角速度噪声 σ [rad/s]")
+    ap.add_argument("--sigma-tau", type=float, default=cfg.SIGMA_TAU,
+                    help="传给环境的执行器力矩噪声 σ [N·m]")
     args = ap.parse_args()
 
     out_dir = Path(args.out)
@@ -186,9 +228,14 @@ def main() -> int:
           f"refinement={cfg.REFINEMENT}")
     print(f"约束: θ_s 目标 ≤{cfg.THETA_S_TARGET_DEG:.0f}° / 硬限 "
           f"{cfg.THETA_S_LIMIT_DEG:.0f}°；速度 ±{cfg.V_MAX_B:.1f}/±{cfg.V_MAX_S:.1f} rad/s")
+    print(f"噪声（由仿真环境在接口内施加）: {'启用' if args.noise else '关闭'}  "
+          f"σ_pos={args.sigma_pos:g} rad  σ_vel={args.sigma_vel:g} rad/s  "
+          f"σ_tau={args.sigma_tau:g} N·m")
 
     # ---- 整个程序运行期间只构造一次环境；重力由环境构造时随机确定、只读 ----
-    env = SimEnv(zero_gravity=args.zero_gravity, seed=args.gravity_seed)
+    env = SimEnv(zero_gravity=args.zero_gravity, noise=args.noise,
+                 sigma_pos=args.sigma_pos, sigma_vel=args.sigma_vel,
+                 sigma_tau=args.sigma_tau, seed=args.gravity_seed)
     gx, gy = env.gravity
     alpha = env.gravity_alpha_deg
     print(f"等效重力（环境构造时随机确定，不可设置）: 倾角 α={alpha:.3f}°  "
@@ -223,7 +270,11 @@ def main() -> int:
             for k_try in range(cfg.MAX_ATTEMPTS):
                 sc = cfg.SHRINK ** k_try
                 rec = run_excitation(env, case_rng, cfg.TS_REF_DEG * sc, cfg.TB_REF_RAD * sc)
-                ts_deg = float(np.degrees(np.abs(rec["psi_s"] - rec["psi_b"]).max()))
+                # 测量带噪：验收用短窗均值，避免把噪声尖峰当成越限
+                ths = rec["psi_s"] - rec["psi_b"]
+                w = max(1, cfg.ACCEPT_AVG)
+                ths_s = np.convolve(ths, np.ones(w) / w, mode="valid")
+                ts_deg = float(np.degrees(np.abs(ths_s).max()))
                 if ts_deg <= cfg.THETA_S_TARGET_DEG:
                     best = (rec, ts_deg)
                     break
@@ -246,12 +297,6 @@ def main() -> int:
             over_b += int((v_b > cfg.V_MAX_B).sum())
             over_s += int((v_s > cfg.V_MAX_S).sum())
 
-            # 状态曲线加测量噪声（力矩噪声已加在实际施加上）
-            psi_b_n = psi_b + case_rng.normal(0.0, cfg.SIGMA_POS, cfg.NUM_STEPS)
-            psi_s_n = psi_s + case_rng.normal(0.0, cfg.SIGMA_POS, cfg.NUM_STEPS)
-            dpsi_b_n = dpsi_b + case_rng.normal(0.0, cfg.SIGMA_VEL, cfg.NUM_STEPS)
-            dpsi_s_n = dpsi_s + case_rng.normal(0.0, cfg.SIGMA_VEL, cfg.NUM_STEPS)
-
             np.savez_compressed(
                 out_dir / f"case_{case_no:04d}.npz",
                 theta_c0=np.float64(0.0), dtheta_c=np.float64(0.0),
@@ -265,16 +310,19 @@ def main() -> int:
                 case_index=np.int64(case_no),
                 weights=np.array([cfg.W_PSI_B, cfg.W_PSI_S,
                                   cfg.W_DPSI_B, cfg.W_DPSI_S], dtype=np.float64),
-                noise_sigma=np.array([cfg.SIGMA_POS, cfg.SIGMA_VEL, cfg.SIGMA_TAU],
-                                     dtype=np.float64),
+                # 关掉噪声时写 0，避免误以为数据带噪
+                noise_enabled=np.int64(1 if args.noise else 0),
+                noise_sigma=np.array([args.sigma_pos, args.sigma_vel, args.sigma_tau],
+                                     dtype=np.float64) if args.noise
+                else np.zeros(3, dtype=np.float64),
                 gx=np.float64(gx), gy=np.float64(gy),
                 gravity_alpha_deg=np.float64(alpha),
                 theta_s_max_deg=np.float64(ts_deg),
                 v_max=np.array([cfg.V_MAX_B, cfg.V_MAX_S], dtype=np.float64),
                 max_dtheta_b=np.float64(vb_all[-1]),
                 max_dtheta_s=np.float64(vs_all[-1]),
-                # 实测（状态含测量噪声；力矩 = 实际施加，本身已含噪）
-                psi_b=psi_b_n, psi_s=psi_s_n, dpsi_b=dpsi_b_n, dpsi_s=dpsi_s_n,
+                # 实测：状态 = 接口返回的测量值；力矩 = 发出去的指令值
+                psi_b=psi_b, psi_s=psi_s, dpsi_b=dpsi_b, dpsi_s=dpsi_s,
                 tau_b=tau_b, tau_s=tau_s,
                 # 无测量噪声的参考（力矩为未加噪的指令值）
                 psi_b_clean=psi_b, psi_s_clean=psi_s,

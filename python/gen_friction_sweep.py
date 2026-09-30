@@ -46,21 +46,26 @@ def run_one(env: SimEnv, omega_ref: float) -> dict | None:
     thb = np.zeros(n); dthb = np.zeros(n); dths = np.zeros(n); ths = np.zeros(n)
     integ = 0.0
     for k in range(n):
-        st = env.state()
+        st = env.state()                # 带测量噪声
         e = omega_ref - st.dtheta_b
         integ = float(np.clip(integ + e * env.dt, -cfg.FS_INT_CLAMP, cfg.FS_INT_CLAMP))
         ub = cfg.FS_KPV * e + cfg.FS_KIV * integ
         us = -cfg.FS_KPS * st.theta_s - cfg.FS_KDS * st.dtheta_s
         ub = float(np.clip(ub, -cfg.TAU_B_MAX, cfg.TAU_B_MAX))
         us = float(np.clip(us, -cfg.TAU_S_MAX, cfg.TAU_S_MAX))
-        Tb[k] = ub; Ts[k] = us
+        Tb[k] = ub; Ts[k] = us          # 记录发出去的值（环境内部叠执行器噪声）
         thb[k] = st.theta_b; dthb[k] = st.dtheta_b
         ths[k] = st.theta_s; dths[k] = st.dtheta_s
         env.step(ub, us)
 
     m = slice(cfg.FS_N_SETTLE, n)
     omega = float(dthb[m].mean())
-    if abs(dthb[m].std()) > 0.02 * max(abs(omega_ref), 0.02):
+    # 稳态判据：测量速度本身带噪，所以比较"前半均值 vs 后半均值"与均值的标准误
+    half = cfg.FS_N_MEAS // 2
+    v1 = dthb[cfg.FS_N_SETTLE:cfg.FS_N_SETTLE + half].mean()
+    v2 = dthb[cfg.FS_N_SETTLE + half:].mean()
+    se = max(cfg.SIGMA_VEL, 1e-6) / np.sqrt(half) + 0.02 * abs(omega_ref)
+    if abs(v1 - v2) > 4.0 * se:
         return None
     if np.abs(ths[m]).max() > np.radians(cfg.THETA_S_TARGET_DEG):
         return None
@@ -94,6 +99,11 @@ def main() -> int:
                     help="把等效重力强制设为 0（水平面）；不给则在倾角范围内随机")
     ap.add_argument("--gravity-seed", type=int, default=None,
                     help="重力抽样的随机种子；不给则每次运行都不同")
+    ap.add_argument("--no-noise", dest="noise", action="store_false",
+                    help="关闭仿真环境里的噪声")
+    ap.add_argument("--sigma-pos", type=float, default=cfg.SIGMA_POS)
+    ap.add_argument("--sigma-vel", type=float, default=cfg.SIGMA_VEL)
+    ap.add_argument("--sigma-tau", type=float, default=cfg.SIGMA_TAU)
     ap.add_argument("--append", action="store_true",
                     help="把本次结果追加到已有 sweep.npz（多个重力会话拼接）")
     args = ap.parse_args()
@@ -110,7 +120,9 @@ def main() -> int:
     tried = failed = 0
     rng = np.random.default_rng(args.seed)
     # 整个程序运行期间只构造一次环境；重力由环境随机确定、只读
-    env = SimEnv(zero_gravity=args.zero_gravity, seed=args.gravity_seed)
+    env = SimEnv(zero_gravity=args.zero_gravity, noise=args.noise,
+                 sigma_pos=args.sigma_pos, sigma_vel=args.sigma_vel,
+                 sigma_tau=args.sigma_tau, seed=args.gravity_seed)
     gx, gy = env.gravity
     alpha = env.gravity_alpha_deg
     print(f"  等效重力（构造时随机确定，不可设置）: α={alpha:.3f}°  "
