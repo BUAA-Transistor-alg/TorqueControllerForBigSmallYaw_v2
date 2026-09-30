@@ -19,13 +19,24 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # ---------------------------------------------------------------------------
 # 目录约定
 #   include/dm + src/dm : 动力学模型核心，C++ 内容位于命名空间 tcbs::dm
+#   include/com + src/com : 上位机通信（串口协议 + 编码器映射），命名空间 tcbs::com
 #   include/capi + src/capi : C 语言接口（extern "C"，导出 tcbs_* 符号）
 #
 # 说明：dynamic_model/ 下的参考代码不参与编译，仅作动力学模型参考；
 #       本工程在 src/include 中重新实现了该模型。
+#
+# 依赖：com 的 SerialProtocol 用 libudev 读 USB iProduct 以筛选串口（需 libudev），
+#       并以 std::thread 做收发/重连线程（需 Threads）。
 # ---------------------------------------------------------------------------
 set(DM_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/include/dm)
+set(COM_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/include/com)
 set(CAPI_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/include/capi)
+
+find_package(Threads REQUIRED)
+find_library(TCBS_UDEV_LIBRARY udev)
+if(NOT TCBS_UDEV_LIBRARY)
+    message(FATAL_ERROR "libudev not found（com/SerialProtocol.hpp 依赖它筛选串口）")
+endif()
 
 add_library(tcbs SHARED
     src/dm/dynamics.cpp
@@ -33,11 +44,15 @@ add_library(tcbs SHARED
     src/dm/trajectory.cpp
     src/dm/param_gradient.cpp
     src/capi/capi_dm.cpp
+    src/com/CRC.cpp
+    src/com/McuDataPreprocessor.cpp
 )
 
 target_include_directories(tcbs
-    PUBLIC ${DM_INCLUDE} ${CAPI_INCLUDE}
+    PUBLIC ${DM_INCLUDE} ${COM_INCLUDE} ${CAPI_INCLUDE}
 )
+
+target_link_libraries(tcbs PUBLIC ${TCBS_UDEV_LIBRARY} Threads::Threads)
 
 target_compile_options(tcbs PRIVATE -Wall -Wextra -Wpedantic)
 
@@ -73,4 +88,20 @@ target_compile_options(tcbs_trajectory_test PRIVATE -Wall -Wextra -Wpedantic)
 set_source_files_properties(tests/test_trajectory_gradient.cpp PROPERTIES
     COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O3>")
 set_target_properties(tcbs_trajectory_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+
+# ---------------------------------------------------------------------------
+# 自检程序：通信模块（tcbs::com）——协议布局 / CRC8 / CRC32 / 编码器映射 /
+#           模板类型实例化，全部不需要硬件
+# 运行: ./build/tcbs_com_test
+# ---------------------------------------------------------------------------
+add_executable(tcbs_com_test
+    tests/test_com_module.cpp
+    src/com/CRC.cpp
+    src/com/McuDataPreprocessor.cpp
+)
+target_include_directories(tcbs_com_test PRIVATE ${COM_INCLUDE})
+target_compile_options(tcbs_com_test PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(tcbs_com_test PRIVATE ${TCBS_UDEV_LIBRARY} Threads::Threads)
+set_target_properties(tcbs_com_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
