@@ -137,7 +137,10 @@ void tcbs_step(TcbsSimulator* sim,
  *   dpsi_b = dtheta_c + dtheta_b        dpsi_s = dtheta_c + dtheta_b + dtheta_s
  *
  * 目标序列传 NULL 表示该项目标恒为 0（退化为惩罚幅值）。
- * theta_c 序列为外部给定、不参与优化的已知量，每步内按等角加速度外推。
+ * theta_c 序列为外部给定、不参与优化的已知量。theta_c0 / dtheta_c / ddtheta_c 是
+ * **整段序列起点**处的基座量，全程按等角加速度外推：主步 k 的第 s 个 RK4 子步取
+ * **绝对时间** tau = k*dt + s*h（h = dt/refinement）。正向轨迹与逐步调用
+ * tcbs_step（每步喂入按同一外推得到的 theta_c / dtheta_c）完全一致。
  */
 
 /* 轨迹求解器：创建一次，缓冲可跨多次调用复用（内部按最大 K 自动扩容）。 */

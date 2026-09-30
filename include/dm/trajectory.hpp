@@ -23,8 +23,15 @@
 //   目标序列为 nullptr 时该项退化为对 0 的偏差（即仅惩罚幅值）。
 //
 // 约定与假设：
-//   * theta_c 序列为外部给定、不参与优化的已知量；每步内基座角加速度常值，
-//     位置按 theta_c(tau) = theta_c0 + dtheta_c*tau + 0.5*ddtheta_c*tau^2 外推。
+//   * theta_c 序列为外部给定、不参与优化的已知量。theta_c0 / dtheta_c / ddtheta_c
+//     是**整段序列起点**处的基座量，全程按等角加速度外推：
+//         theta_c(tau)  = theta_c0 + dtheta_c*tau + 0.5*ddtheta_c*tau^2
+//         dtheta_c(tau) = dtheta_c + ddtheta_c*tau
+//     其中 tau 是**相对序列起点的绝对时间**，取值 [0, K*dt]；主步 k 的第 s 个子步
+//     取 tau = k*dt + s*h。于是本文件所有模式（仅正向 computeTrajectoryLoss、
+//     正向+伴随 simulateAndGradient、固定力矩模式、with_step_jacobians 与否）的
+//     正向轨迹完全一致，并且等于"每步用同一外推算出 (theta_c, dtheta_c) 后调用
+//     Simulator::step"逐步推进的结果。
 //   * 两个控制力矩在每一步内为常值（零阶保持）。
 //   * 步长 dt 相同，每步内做 refinement 个 RK4 子步（refinement 为运行期参数）。
 //   * 力矩序列按 AoS 存放：tau[i*2+0] = tau_b[i]，tau[i*2+1] = tau_s[i]。

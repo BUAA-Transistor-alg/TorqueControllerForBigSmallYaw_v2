@@ -614,9 +614,11 @@ double computeParamGradientLoss(const Params& p,
         const double Ts = tau[2 * k + 1];
         const double t_base = static_cast<double>(k) * dt;
 
+        // 基座时间用**绝对时间** t_base + s*h（与 trajectory.cpp 的正向扫描、
+        // 与 loss 的 tc_end、与逐步调用 Simulator 完全一致）。
         for (int s = 0; s < refinement; ++s) {
             substepStateOnly(p, d, x, Tb, Ts, theta_c0, dtheta_c, ddtheta_c,
-                             static_cast<double>(s) * h, h, ev);
+                             t_base + static_cast<double>(s) * h, h, ev);
         }
 
         double tc_end, dtc_end;
@@ -672,12 +674,14 @@ double computeParamGradient(const Params& p,
         const double Ts = tau[2 * k + 1];
         const double t_base = static_cast<double>(k) * dt;
 
+        // 与 computeParamGradientLoss / trajectory 一致：基座时间用绝对时间
+        // t_base + s*h（theta_c0 为序列起点值，整段等角加速度外推）。
         for (int s = 0; s < refinement; ++s) {
             double Snext[4][NP];
             State x_next;
             rk4StepWithSens(p, d, x, S, Tb, Ts, theta_c0, dtheta_c, ddtheta_c,
-                            static_cast<double>(s) * h, h, static_cast<Eval*>(ws.evbuf),
-                            x_next, Snext);
+                            t_base + static_cast<double>(s) * h, h,
+                            static_cast<Eval*>(ws.evbuf), x_next, Snext);
             x = x_next;
             for (int i = 0; i < 4; ++i)
                 for (int j = 0; j < NP; ++j) S[i][j] = Snext[i][j];

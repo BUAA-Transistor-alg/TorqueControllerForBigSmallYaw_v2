@@ -404,9 +404,12 @@ double simulateAndGradient(const Params& p,
         for (int s = 0; s < refinement; ++s) {
             TrajectoryRecord& rec = ws.records[rbase + static_cast<std::size_t>(s)];
             rec.x = x;
-            // 与 Simulator::step 一致：第 s 个子步的起点时间用 s*h（相对本主步起点）
+            // 基座时间用**绝对时间** t_base + s*h：theta_c0 / dtheta_c / ddtheta_c 是
+            // 整段序列起点处的值，全程按等角加速度外推。这样正向轨迹与 loss 的
+            // tc_end（同样是 t_base + dt）、以及逐步调用 Simulator 时喂入按同一外推
+            // 得到的 (theta_c, dtheta_c) 的结果完全一致。
             rk4Classic(p, d, x, Tb, Ts, theta_c0, dtheta_c, ddtheta_c,
-                       static_cast<double>(s) * h, h, ev);
+                       t_base + static_cast<double>(s) * h, h, ev);
             for (int st = 0; st < 4; ++st) {
                 for (int a = 0; a < 4; ++a) {
                     rec.Ju[(st * 4 + a) * 2 + 0] = ev[st].Ju[a][0];
@@ -504,9 +507,11 @@ double computeTrajectoryLoss(const Params& p,
         const double Ts = (tau != nullptr) ? tau[2 * k + 1] : tau_s_fixed;
         const double t_base = static_cast<double>(k) * dt;
 
+        // 与 simulateAndGradient 的正向扫描一致：基座时间用绝对时间 k*dt + s*h
+        // （theta_c0 为序列起点值，整段等角加速度外推）。
         for (int s = 0; s < refinement; ++s) {
             rk4Classic(p, d, x, Tb, Ts, theta_c0, dtheta_c, ddtheta_c,
-                       static_cast<double>(s) * h, h, ev);
+                       t_base + static_cast<double>(s) * h, h, ev);
         }
 
         double tc_end, dtc_end;

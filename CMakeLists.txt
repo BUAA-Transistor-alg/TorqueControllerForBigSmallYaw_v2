@@ -21,18 +21,23 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 #   include/dm + src/dm : 动力学模型核心，C++ 内容位于命名空间 tcbs::dm
 #   include/com + src/com : 上位机通信（串口协议 + 编码器映射），命名空间 tcbs::com
 #   include/capi + src/capi : C 语言接口（extern "C"，导出 tcbs_* 符号）
+#   include/mpc + src/mpc : 力矩 MPC（Ceres 梯度法 + dm 解析力矩导数），命名空间 tcbs::mpc
 #
 # 说明：dynamic_model/ 下的参考代码不参与编译，仅作动力学模型参考；
 #       本工程在 src/include 中重新实现了该模型。
 #
 # 依赖：com 的 SerialProtocol 用 libudev 读 USB iProduct 以筛选串口（需 libudev），
-#       并以 std::thread 做收发/重连线程（需 Threads）。
+#       并以 std::thread 做收发/重连线程（需 Threads）；
+#       mpc 用 Ceres 的 FirstOrderFunction + GradientProblemSolver 做无约束梯度优化
+#       （梯度来自 dm::simulateAndGradient 的解析离散伴随，不用自动求导，需 Ceres）。
 # ---------------------------------------------------------------------------
 set(DM_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/include/dm)
 set(COM_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/include/com)
 set(CAPI_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/include/capi)
+set(MPC_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/include/mpc)
 
 find_package(Threads REQUIRED)
+find_package(Ceres REQUIRED)
 find_library(TCBS_UDEV_LIBRARY udev)
 if(NOT TCBS_UDEV_LIBRARY)
     message(FATAL_ERROR "libudev not found（com/SerialProtocol.hpp 依赖它筛选串口）")
@@ -43,6 +48,8 @@ add_library(tcbs SHARED
     src/dm/simulator.cpp
     src/dm/trajectory.cpp
     src/dm/param_gradient.cpp
+    src/mpc/mpc_controller.cpp
+    src/mpc/dual_yaw_mpc_controller.cpp
     src/capi/capi_dm.cpp
     src/com/CRC.cpp
     src/com/McuDataPreprocessor.cpp
@@ -50,10 +57,10 @@ add_library(tcbs SHARED
 )
 
 target_include_directories(tcbs
-    PUBLIC ${DM_INCLUDE} ${COM_INCLUDE} ${CAPI_INCLUDE}
+    PUBLIC ${DM_INCLUDE} ${COM_INCLUDE} ${CAPI_INCLUDE} ${MPC_INCLUDE}
 )
 
-target_link_libraries(tcbs PUBLIC ${TCBS_UDEV_LIBRARY} Threads::Threads)
+target_link_libraries(tcbs PUBLIC ${TCBS_UDEV_LIBRARY} Threads::Threads Ceres::ceres)
 
 target_compile_options(tcbs PRIVATE -Wall -Wextra -Wpedantic)
 

@@ -17,6 +17,14 @@
 //   psi_b = theta_c + theta_b,  psi_s = theta_c + theta_b + theta_s
 //   dpsi_b = dtheta_c + dtheta_b, dpsi_s = dtheta_c + dtheta_b + dtheta_s
 //
+// 基座运动约定（与 include/dm/trajectory.hpp 完全一致）：theta_c0 / dtheta_c /
+// ddtheta_c 是**整段序列起点**处的基座量，全程按等角加速度外推
+//     theta_c(tau)  = theta_c0 + dtheta_c*tau + 0.5*ddtheta_c*tau^2
+//     dtheta_c(tau) = dtheta_c + ddtheta_c*tau
+// 其中 tau 是相对序列起点的**绝对时间** [0, K*dt]，主步 k 的第 s 个子步取
+// tau = k*dt + s*h。因此本文件的正向（仅损失 / 损失+灵敏度）与 trajectory、
+// 与逐步调用 Simulator::step 的结果完全相同。
+//
 // 被辨识参数（固定顺序，共 14 个）：
 //   0 mb   1 Ib   2 Pbx  3 Pby  4 ms   5 Is   6 Psx  7 Psy
 //   8 Dx   9 Dy  10 fbc 11 fbv 12 fsc 13 fsv
