@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 DT = 0.01                        # 采样周期 [s]（100 Hz）
 DURATION = 3.0                   # 单条轨迹时长 [s]
 NUM_STEPS = int(round(DURATION / DT))   # 300
-REFINEMENT = 4                   # 每个主步的经典 RK4 子步数（运行期参数）
+REFINEMENT = 16                   # 每个主步的经典 RK4 子步数（运行期参数）
 
 # 平滑摩擦常数：**已知的固定模型常数**，不是被辨识量（控制器/采集脚本可以用它）
 LAMBDA = 100.0

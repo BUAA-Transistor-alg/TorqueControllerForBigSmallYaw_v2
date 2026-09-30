@@ -144,9 +144,9 @@ def combo_error(p: dict, ref: dict) -> float:
 # 数据
 # ===========================================================================
 class Case:
-    __slots__ = ("theta_c0", "dtheta_c", "ddtheta_c", "x0", "dt", "K", "refinement",
+    __slots__ = ("theta_c0", "dtheta_c", "ddtheta_c", "x0", "dt", "K",
                  "psi_b", "psi_s", "dpsi_b", "dpsi_s", "tau", "seed", "gx", "gy",
-                 "theta_c_seq", "dtheta_c_seq")
+                 "weights", "theta_c_seq", "dtheta_c_seq")
 
     def __init__(self, path: Path):
         d = np.load(path)
@@ -157,11 +157,15 @@ class Case:
                         float(d["x0_theta_s"]), float(d["x0_dtheta_s"]))
         self.dt = float(d["dt"])
         self.K = int(d["num_steps"])
-        self.refinement = int(d["refinement"])
         self.seed = int(d["seed"])
         # 重力矢量：随数据一起保存的已知输入（不是被辨识参数）
         self.gx = float(d["gx"])
         self.gy = float(d["gy"])
+        # 辨识 loss 的四项权重 [psi_b, psi_s, dpsi_b, dpsi_s]：随数据一起记录，
+        # 采集时写的是当时的 cfg.W_PSI_*。缺该字段的老数据按全 1。
+        # 命令行可用 --w-psi-* / --w-dpsi-* 覆盖（见 main）。
+        w = d["weights"] if "weights" in d.files else (1.0, 1.0, 1.0, 1.0)
+        self.weights = tuple(float(x) for x in np.asarray(w).ravel())
         self.psi_b = np.ascontiguousarray(d["psi_b"], dtype=np.float64)
         self.psi_s = np.ascontiguousarray(d["psi_s"], dtype=np.float64)
         self.dpsi_b = np.ascontiguousarray(d["dpsi_b"], dtype=np.float64)
@@ -309,8 +313,14 @@ class ParamSpec:
 # 单条数据的 loss / 梯度（支持只取前 K 步，课程学习用）
 # ===========================================================================
 def case_spec(case: Case, K: int) -> ParamLossSpec:
-    """四项权重全 1、目标为该条实测序列的前 K 步。"""
-    return ParamLossSpec(w_psi_b=1.0, w_psi_s=1.0, w_dpsi_b=1.0, w_dpsi_s=1.0,
+    """目标为该条实测序列的前 K 步；四项权重取自 case.weights。
+
+    case.weights = [w_psi_b, w_psi_s, w_dpsi_b, w_dpsi_s]：
+    psi 是位置项、dpsi 是速度项，b/s 分别对应大/小 yaw。
+    """
+    w_psi_b, w_psi_s, w_dpsi_b, w_dpsi_s = case.weights
+    return ParamLossSpec(w_psi_b=w_psi_b, w_psi_s=w_psi_s,
+                         w_dpsi_b=w_dpsi_b, w_dpsi_s=w_dpsi_s,
                          target_psi_b=case.psi_b[:K], target_psi_s=case.psi_s[:K],
                          target_dpsi_b=case.dpsi_b[:K], target_dpsi_s=case.dpsi_s[:K])
 
@@ -583,6 +593,134 @@ def fit_friction_sweep(sweep_path, p_dyn: dict) -> tuple[float, float, dict]:
 DEFAULT_STAGES = "20:0.08,50:0.10,100:0.12,200:0.20,300:0.50"
 
 
+def report_init(init_p: dict, ref: dict, ref_ident: dict, has_truth: bool,
+                init_kind: str, out_dir: Path,
+                cases: list["Case"], plot_pick, refinement: int) -> None:
+    """梯度优化开始前：打印初值并画两张图（参数对比 + 位置曲线对比）。
+
+    ``--init algebraic``（默认）时 ``init_p`` 就是闭式最小二乘（algebraic_init）解出的初值。
+    保存到 ``out_dir``：
+      * ``init_algebraic.png``：左 = 14 个参数绝对值（symlog）初值 vs 真值/标称；
+        右 = 12 个可辨识组合的相对误差；
+      * ``init_trajectory_algebraic.png``：``plot_pick`` 指定的几条数据上，
+        用初值参数前向仿真的 ψ_b/ψ_s 位置曲线 vs 实测（有真值再叠真值曲线）。
+    随机初值时文件名里是 ``random``。
+    """
+    base = "真值" if has_truth else "标称"
+    kind = "代数最小二乘解" if init_kind == "algebraic" else "随机初值"
+    # 图里一律用英文：matplotlib 默认字体没有中文字形，中文会渲染成方框
+    base_en = "truth" if has_truth else "nominal"
+    kind_en = "algebraic LSQ" if init_kind == "algebraic" else "random"
+    print(f"\n=== 梯度优化前的初值（{kind}，基准：{base}）===")
+    if has_truth:
+        print(f"{'参数':>8} {'真值':>14} {'初值':>14} {'相对误差':>12}")
+        for n in PARAM_NAMES:
+            r = (init_p[n] - ref[n]) / max(abs(ref[n]), 1e-12)
+            print(f"{n:>8} {ref[n]:>14.6g} {init_p[n]:>14.6g} {r:>12.2e}")
+    else:
+        print(f"{'参数':>8} {'初值':>14}")
+        for n in PARAM_NAMES:
+            print(f"{n:>8} {init_p[n]:>14.6g}")
+    print(f"可辨识组合最大相对误差（基准 {base}）: {combo_error(init_p, ref_ident):.4g}")
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        names = list(PARAM_NAMES)
+        refv = np.array([ref[n] for n in names], dtype=float)
+        initv = np.array([init_p[n] for n in names], dtype=float)
+
+        fig, axes = plt.subplots(1, 2, figsize=(16, 7), constrained_layout=True)
+
+        # 左：14 个参数的绝对值（symlog 同时容纳正负与跨数量级）
+        ax = axes[0]
+        y = np.arange(len(names))
+        h = 0.38
+        ax.barh(y + h / 2, initv, height=h, color="tab:blue",
+                label=f"initial ({kind_en})")
+        ax.barh(y - h / 2, refv, height=h, color="k", alpha=0.45, label=base_en)
+        ax.set_yticks(y)
+        ax.set_yticklabels(names)
+        ax.invert_yaxis()
+        ax.set_xscale("symlog", linthresh=1e-3)
+        ax.axvline(0.0, color="k", lw=0.8)
+        ax.set_xlabel("parameter value (symlog)")
+        ax.set_title(f"14 parameters: initial vs {base_en}")
+        ax.legend(fontsize=8)
+        ax.grid(True, axis="x", alpha=0.3)
+
+        # 右：12 个可辨识组合的相对误差
+        labels = [lab for lab, _ in IDENTIFIABLE]
+        refc = np.array([fn(ref) for _, fn in IDENTIFIABLE], dtype=float)
+        initc = np.array([fn(init_p) for _, fn in IDENTIFIABLE], dtype=float)
+        relc = (initc - refc) / np.maximum(np.abs(refc), 1e-12)
+        ax = axes[1]
+        yy = np.arange(len(labels))
+        ax.barh(yy, relc,
+                color=["tab:red" if abs(v) > 0.05 else "tab:green" for v in relc])
+        ax.set_yticks(yy)
+        ax.set_yticklabels(labels, fontsize=8)
+        ax.invert_yaxis()
+        ax.axvline(0.0, color="k", lw=0.8)
+        ax.set_xlabel(f"relative error (initial - {base_en}) / |{base_en}|")
+        ax.set_title(f"12 identifiable combinations (max |rel| = {np.max(np.abs(relc)):.3g})")
+        ax.grid(True, axis="x", alpha=0.3)
+
+        fig.suptitle("Initial parameters BEFORE gradient optimization", fontsize=13)
+        p = out_dir / ("init_algebraic.png" if init_kind == "algebraic"
+                       else "init_random.png")
+        fig.savefig(p, dpi=110)
+        plt.close(fig)
+        print(f"初值图已保存: {p}")
+
+        # ---- 位置曲线对比：用初值参数前向仿真 vs 实测（有真值再叠一条真值）----
+        import contextlib
+        pick = np.atleast_1d(plot_pick)
+        fig, axes = plt.subplots(len(pick), 2, figsize=(14, 3.2 * len(pick)),
+                                 constrained_layout=True)
+        axes = np.atleast_2d(axes)
+        with contextlib.ExitStack() as stack:
+            pg_i = stack.enter_context(
+                ParamGradient(make_params(cases[0], init_p), refinement=refinement))
+            pg_t = (stack.enter_context(
+                        ParamGradient(make_params(cases[0], ref_ident),
+                                      refinement=refinement))
+                    if has_truth else None)
+            for row, ci in enumerate(pick):
+                c = cases[int(ci)]
+                # 每条曲线都必须用该条数据自己的已知重力
+                pg_i.set_params(make_params(c, init_p))
+                _, *si = pg_i.loss(c.theta_c0, c.dtheta_c, c.ddtheta_c, c.dt, c.tau,
+                                   c.x0, case_spec(c, c.K), return_sequences=True)
+                st = None
+                if pg_t is not None:
+                    pg_t.set_params(make_params(c, ref_ident))
+                    _, *st = pg_t.loss(c.theta_c0, c.dtheta_c, c.ddtheta_c, c.dt, c.tau,
+                                       c.x0, case_spec(c, c.K), return_sequences=True)
+                t = (np.arange(c.K) + 1) * c.dt
+                for col, (meas, lab) in enumerate(((c.psi_b, "psi_b"), (c.psi_s, "psi_s"))):
+                    ax = axes[row][col]
+                    ax.plot(t, meas, ".", ms=1.5, alpha=0.4, label="measured")
+                    if st is not None:
+                        ax.plot(t, st[col], lw=1.2, label=f"{base_en} params")
+                    ax.plot(t, si[col], lw=1.2, ls="--", label=f"initial ({kind_en})")
+                    ax.set_title(f"case {int(ci)}: {lab}", fontsize=10)
+                    ax.grid(True, alpha=0.3)
+                    if row == 0:
+                        ax.legend(fontsize=7)
+        fig.suptitle("Measured vs INITIAL-parameter position trajectories "
+                     "(before gradient optimization)", fontsize=13)
+        p2 = out_dir / ("init_trajectory_algebraic.png" if init_kind == "algebraic"
+                        else "init_trajectory_random.png")
+        fig.savefig(p2, dpi=110)
+        plt.close(fig)
+        print(f"初值位置曲线已保存: {p2}")
+    except ImportError:
+        print("（未安装 matplotlib，跳过初值绘图）")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--category", type=str, default=None,
@@ -597,6 +735,16 @@ def main() -> int:
                     help="Adam 学习率；theta 空间极窄的稳定区间，见文件末尾说明")
     ap.add_argument("--loss-scale", type=float, default=1.0,
                     help="对均值 loss 乘的系数（Adam 会归一化梯度，影响很小）")
+    # ---- loss 四项权重：位置(psi)与速度(dpsi) × 大/小 yaw(b/s) ----
+    # 不给就用数据里记录的 weights（采集时由 sim_config.W_PSI_* 写入）
+    ap.add_argument("--w-psi-b", type=float, default=None,
+                    help="位置项 ψ_b 权重；默认用数据里记录的 weights")
+    ap.add_argument("--w-psi-s", type=float, default=None,
+                    help="位置项 ψ_s 权重；默认用数据里记录的 weights")
+    ap.add_argument("--w-dpsi-b", type=float, default=None,
+                    help="速度项 dψ_b 权重；默认用数据里记录的 weights")
+    ap.add_argument("--w-dpsi-s", type=float, default=None,
+                    help="速度项 dψ_s 权重；默认用数据里记录的 weights")
     ap.add_argument("--no-full-batch-final", dest="full_batch_final", action="store_false",
                     help="最后一个课程阶段也只用 batch（默认改为全量，否则组合误差停在 ~3%%）")
     ap.add_argument("--stages", type=str, default=DEFAULT_STAGES,
@@ -659,22 +807,31 @@ def main() -> int:
         print(f"真值文件: 无（{truth_path} 不存在）——不画真值曲线、不做真值对比")
 
     cases = [Case(f) for f in files]
+    # loss 四项权重可用命令行覆盖；只给其中几项时，其余仍用数据里记录的值
+    w_override = (args.w_psi_b, args.w_psi_s, args.w_dpsi_b, args.w_dpsi_s)
+    if any(v is not None for v in w_override):
+        for c in cases:
+            c.weights = tuple(cur if v is None else float(v)
+                              for v, cur in zip(w_override, c.weights))
     N = len(cases)
     dt = cases[0].dt
-    # refinement 是每条数据自带的运行期参数（库构造时传入，不再是编译期常量）。
-    # 本数据集里各条一致；若不一致就需要按 refinement 分组各自建句柄。
-    refinements = {c.refinement for c in cases}
-    if len(refinements) != 1:
-        print(f"数据里的 refinement 不一致: {sorted(refinements)}；"
-              f"请先按 refinement 分组再辨识")
-        return 1
-    refinement = cases[0].refinement
+    # 拟合用的 refinement（RK4 子步数）是**拟合侧的配置**，固定取 cfg.REFINEMENT，
+    # 不读每条 npz 里记录的值（采集时写进文件的只作数据溯源，不参与拟合）。
+    refinement = int(cfg.REFINEMENT)
+    # 位置曲线对比用的固定抽样：用独立生成器，既不影响训练用的 rng（批次调度），
+    # 又让"初值图"和"最终辨识图"画的是同一批数据，方便前后对比。
+    plot_pick = np.random.default_rng(args.seed + 2024).choice(
+        N, size=min(3, N), replace=False)
     if len({c.dt for c in cases}) != 1:
         print("各条数据的 dt 不一致，暂不支持")
         return 1
     g_range = (min(min(c.gx, c.gy) for c in cases), max(max(c.gx, c.gy) for c in cases))
     print(f"数据: {N} 条   dt={dt}s ({1/dt:.0f}Hz)   K={cases[0].K}   "
-          f"refinement={refinement}（每条自带的运行期参数）")
+          f"refinement={refinement}（取自 cfg.REFINEMENT）")
+    wsrc = "命令行覆盖" if any(v is not None for v in w_override) else "取自数据"
+    print(f"loss 权重（{wsrc}）: 位置 psi_b={cases[0].weights[0]:g} "
+          f"psi_s={cases[0].weights[1]:g}   速度 dpsi_b={cases[0].weights[2]:g} "
+          f"dpsi_s={cases[0].weights[3]:g}")
     print(f"被辨识参数: {len(PARAM_NAMES)} 个（重力 gx/gy 为已知输入，取值跨度 "
           f"[{g_range[0]:.2f}, {g_range[1]:.2f}]）")
     print(f"优化: {args.steps} 步, batch={args.batch}, Adam lr={args.lr}")
@@ -733,8 +890,14 @@ def main() -> int:
         init_orders = tuple(float(v) for v in args.init_orders.split(","))
         ps = ParamSpec(ref, rng, orders=init_orders)
         print(f"随机初始化: 每个参数乘 10^(±[{init_orders[0]}, {init_orders[1]}])")
-    init_combo = combo_error(ps.seed_values(), truth_ident)
-    init_spread = max(abs(np.log10(abs(ps.seed_values()[n]) / abs(ref[n])))
+
+    # 梯度优化开始前：先把初值（algebraic 时 = 闭式最小二乘解）打印并画一遍图
+    init0 = ps.seed_values()
+    report_init(init0, ref, truth_ident, has_truth, args.init, out_dir,
+                cases, plot_pick, refinement)
+
+    init_combo = combo_error(init0, truth_ident)
+    init_spread = max(abs(np.log10(abs(init0[n]) / abs(ref[n])))
                       for n in PARAM_NAMES)
     print(f"优化: 共 {total_steps} 步, batch={args.batch}, Adam lr={args.lr}"
           + ("  + 短窗口课程学习" if args.curriculum else "  （无课程学习）"))
@@ -957,7 +1120,7 @@ def main() -> int:
         # 3) 随机 3 条数据：真实参数 vs 辨识参数，在相同控制下的轨迹
         #    没有真值文件时只画 measured vs identified（不画 truth 曲线）
         import contextlib
-        pick = rng.choice(N, size=min(3, N), replace=False)
+        pick = plot_pick
         fig, axes = plt.subplots(len(pick), 2, figsize=(14, 3.2 * len(pick)),
                                  constrained_layout=True)
         axes = np.atleast_2d(axes)
