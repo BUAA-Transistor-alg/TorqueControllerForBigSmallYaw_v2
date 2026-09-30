@@ -59,11 +59,11 @@ THETA_S_TARGET_DEG = 30.0        # 设计目标（留 5° 余量）
 THETA_S0_DEG = 5.0               # 每条轨迹初始 θ_s 抖动 [°]
 
 # ---- 两关节速度限幅 ----
-V_MAX_B = 3.0                    # 关节 b 速度限幅 [rad/s]
-V_MAX_S = 3.0                    # 关节 s 速度限幅 [rad/s]
+V_MAX_B = 10.0                    # 关节 b 速度限幅 [rad/s]
+V_MAX_S = 10.0                    # 关节 s 速度限幅 [rad/s]
 V_REF_MARGIN = 0.8               # 参考速度只用到限幅的 80%
-V_BARRIER_GAIN = 0.5             # 连续速度障碍增益 = GAIN·TAU_*_MAX/(1 rad/s 超出)
-V_BARRIER_BETA = 20.0            # 障碍的 softplus 锐度
+V_BARRIER_GAIN = 0.0             # 连续速度障碍增益 = GAIN·TAU_*_MAX/(1 rad/s 超出)
+V_BARRIER_BETA = 0.5            # 障碍的 softplus 锐度
 
 # ---- 力矩范围：两关节统一为 [-1, +1] [N·m] ----
 TAU_B_MAX = 1.0                  # 关节 b 力矩上限 [N·m]
@@ -78,8 +78,8 @@ TS_FREQ_LO, TS_FREQ_HI = 0.5, 3.0      # θ_s 参考频带 [Hz]
 TS_REF_DEG = 15.0                      # θ_s 参考幅值 [°]
 TB_REF_RAD = 0.8                       # θ_b 参考幅值 [rad]
 
-KP_B, KD_B = 36.0, 3.4                 # 关节 b 位置环 PD 增益
-KP_S, KD_S = 30.0, 2.0                 # 关节 s 位置环 PD 增益
+KP_B, KD_B = 0.5, 0.01                 # 关节 b 位置环 PD 增益
+KP_S, KD_S = 5.0, 0.1                 # 关节 s 位置环 PD 增益
 
 MAX_ATTEMPTS = 60                      # 单条数据最多尝试次数（收缩参考幅值）
 SHRINK = 0.85                          # 每次失败后参考幅值收缩系数
@@ -100,30 +100,30 @@ DEFAULT_NUM = 120                # 默认轨迹条数
 DEFAULT_SEED = 20240607
 
 # ---- 无重置时的"控回初值"控制器（两关节各自一份，便于分开整定）----
-REPOS_KP_B, REPOS_KD_B, REPOS_KI_B = 6.0, 1.2, 0.8    # 关节 b 位置 PI + 速度 D
-REPOS_KP_S, REPOS_KD_S, REPOS_KI_S = 6.0, 1.2, 0.8    # 关节 s 位置 PI + 速度 D
+REPOS_KP_B, REPOS_KD_B, REPOS_KI_B = 1.0, 0.0, 0.1    # 关节 b 位置 PI + 速度 D
+REPOS_KP_S, REPOS_KD_S, REPOS_KI_S = 1.0, 0.0, 0.1    # 关节 s 位置 PI + 速度 D
 REPOS_V_MAX = 1.5                # 目标点限速斜坡 [rad/s]（避免起步力矩饱和）
 REPOS_TOL_SIGMA = 3.0            # 收敛容差 = max(REPOS_TOL_RAD, SIGMA·滤波后残余σ)
 # 注意：噪声在仿真环境里，控制/判据读到的都是**带噪测量值**。因此：
 #   * 控制回路对测量状态做一阶低通（CTRL_LPF_ALPHA），否则 D 项会把噪声放大成力矩噪声；
 #   * 收敛判据必须基于滤波后的估计，容差不能低于测量噪声（否则永远判不了收敛）；
 #   * 验收用的 θ_s 先做短窗均值（ACCEPT_AVG），x0 用较长窗口均值（X0_AVG）。
-CTRL_LPF_ALPHA = 0.10            # 控制用状态的一阶低通系数（越小越平滑）
+CTRL_LPF_ALPHA = 1.0            # 控制用状态的一阶低通系数（越小越平滑）
 ACCEPT_AVG = 5                   # 验收 θ_s 的短窗均值点数
 X0_AVG = 20                      # 起始状态（x0）的均值点数
-REPOS_TOL_RAD = 5.0e-3           # 角度收敛容差 [rad]
-REPOS_TOL_VEL = 5.0e-3           # 速度收敛容差 [rad/s]
+REPOS_TOL_RAD = 0.01           # 角度收敛容差 [rad]
+REPOS_TOL_VEL = 0.2           # 速度收敛容差 [rad/s]
 REPOS_MAX_STEPS = 3000           # 最多用多少步把状态控回去
 REPOS_INT_CLAMP = 1.0            # 积分限幅
 
 # ---- 匀速旋转摩擦实验 ----
 OMEGA_LIST = [-3.0, -1.0, -0.3, -0.1, -0.05, -0.02, -0.01, -0.005,
               0.005, 0.01, 0.02, 0.05, 0.1, 0.3, 1.0, 3.0]
-FS_N_SETTLE = 300                # 稳定段步数
+FS_N_SETTLE = 600                # 稳定段步数
 FS_N_MEAS = 300                  # 测量段步数
-FS_KPV, FS_KIV = 2.0, 1.5        # 关节 b 速度环 PI 增益
-FS_KPS, FS_KDS = 30.0, 2.0       # 关节 s 位置环 PD 增益（把 s 牢牢按住）
-FS_INT_CLAMP = 5.0               # 速度环积分限幅
+FS_KPV, FS_KIV = 0.01, 0.1        # 关节 b 速度环 PI 增益
+FS_KPS, FS_KDS = 1.0, 0.1       # 关节 s 位置环 PD 增益（把 s 牢牢按住）
+FS_INT_CLAMP = 50.0               # 速度环积分限幅
 
 # ---- 输出目录 ----
 DATA_DIR_SIM = REPO / "data" / "sim"
