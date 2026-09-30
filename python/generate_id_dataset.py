@@ -55,7 +55,8 @@ DATA_DIR = cfg.DATA_DIR_SIM
 # 无重置时的"控回初值"控制器
 # ===========================================================================
 def reposition(env, theta_b_target: float,
-               max_steps: int = cfg.REPOS_MAX_STEPS) -> tuple[bool, int, State]:
+               max_steps: int = cfg.REPOS_MAX_STEPS,
+               gravity_ff: bool = True) -> tuple[bool, int, State]:
     """用控制力矩把状态控回 (θ_b=target, θ̇_b=0, θ_s=0, θ̇_s=0)。
 
     环境不支持重置，只能这样回去。两个关键点：
@@ -63,6 +64,9 @@ def reposition(env, theta_b_target: float,
         收敛会慢到几千步（实测 1980 步）；
       * **条件积分**抗饱和：只在力矩未饱和时累加积分。
     θ_b 取最近的等价目标，避免绕整圈。
+
+    :param gravity_ff: 是否叠加环境算出的重力前馈 (G1, G2)。False 时纯靠
+                       PI/PD 通过误差把重力扛住（可用 --no-gravity-ff 开关）。
     返回 (是否收敛, 用了多少步, 最终状态)。
     """
     st_raw = env.state()
@@ -87,7 +91,11 @@ def reposition(env, theta_b_target: float,
         # 目标点限速逼近
         ref += float(np.clip(tgt - ref, -cfg.REPOS_V_MAX * env.dt, cfg.REPOS_V_MAX * env.dt))
         e_b, e_s = ref - st.theta_b, -st.theta_s
-        g1, g2 = env.gravity_torque(st.theta_b, st.theta_s)   # 环境内部算的重力前馈
+        # 重力前馈（环境内部算的 G1/G2）；--no-gravity-ff 时置 0，做对照实验
+        if gravity_ff:
+            g1, g2 = env.gravity_torque(st.theta_b, st.theta_s)
+        else:
+            g1 = g2 = 0.0
         Tb_raw = g1 + cfg.REPOS_KP * e_b + cfg.REPOS_KI * ib - cfg.REPOS_KD * st.dtheta_b
         Ts_raw = g2 + cfg.REPOS_KP * e_s + cfg.REPOS_KI * is_ - cfg.REPOS_KD * st.dtheta_s
         Tb = float(np.clip(Tb_raw, -cfg.TAU_B_MAX, cfg.TAU_B_MAX))
@@ -249,6 +257,8 @@ def main() -> int:
                     help="[--real] 等待 MCU+IMU 首个有效样本的超时 [s]")
     ap.add_argument("--max-repos-steps", type=int, default=cfg.REPOS_MAX_STEPS,
                     help="[--real] 控回初值的最多步数（真机收敛慢时调大）")
+    ap.add_argument("--no-gravity-ff", dest="gravity_ff", action="store_false",
+                    help="关闭控回初值里的重力前馈（对照实验用；默认开启）")
     args = ap.parse_args()
 
     if args.out is None:
@@ -299,7 +309,8 @@ def main() -> int:
             case_no = args.start_index + idx
             case_rng = np.random.default_rng(args.seed + 7919 * (case_no + 1))
             tb_target = float(case_rng.uniform(-np.pi, np.pi))
-            ok, nrep, _ = reposition(env, tb_target, args.max_repos_steps)
+            ok, nrep, _ = reposition(env, tb_target, args.max_repos_steps,
+                                     gravity_ff=args.gravity_ff)
             if not ok:
                 consec_fail += 1
                 print(f"  case {case_no}: 控回初值未收敛（{nrep} 步），跳过"
@@ -326,7 +337,8 @@ def main() -> int:
                     break
                 if ts_deg <= cfg.THETA_S_LIMIT_DEG and best is None:
                     best = (rec, ts_deg)
-                reposition(env, tb_target, args.max_repos_steps)      # 未达标：控回初值再试
+                reposition(env, tb_target, args.max_repos_steps,
+                           gravity_ff=args.gravity_ff)      # 未达标：控回初值再试
             if best is None:
                 rejected += 1
                 continue
