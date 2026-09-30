@@ -96,8 +96,8 @@ def reposition(env, theta_b_target: float,
             g1, g2 = env.gravity_torque(st.theta_b, st.theta_s)
         else:
             g1 = g2 = 0.0
-        Tb_raw = g1 + cfg.REPOS_KP * e_b + cfg.REPOS_KI * ib - cfg.REPOS_KD * st.dtheta_b
-        Ts_raw = g2 + cfg.REPOS_KP * e_s + cfg.REPOS_KI * is_ - cfg.REPOS_KD * st.dtheta_s
+        Tb_raw = g1 + cfg.REPOS_KP_B * e_b + cfg.REPOS_KI_B * ib - cfg.REPOS_KD_B * st.dtheta_b
+        Ts_raw = g2 + cfg.REPOS_KP_S * e_s + cfg.REPOS_KI_S * is_ - cfg.REPOS_KD_S * st.dtheta_s
         Tb = float(np.clip(Tb_raw, -cfg.TAU_B_MAX, cfg.TAU_B_MAX))
         Ts = float(np.clip(Ts_raw, -cfg.TAU_S_MAX, cfg.TAU_S_MAX))
         # 条件积分：只在未饱和时累加
@@ -259,6 +259,11 @@ def main() -> int:
                     help="[--real] 控回初值的最多步数（真机收敛慢时调大）")
     ap.add_argument("--no-gravity-ff", dest="gravity_ff", action="store_false",
                     help="关闭控回初值里的重力前馈（对照实验用；默认开启）")
+    ap.add_argument("--hold-pitch", action="store_true",
+                    help="[--real] 保持当前实测 pitch（不扰动）；不给则把 pitch 目标压到 "
+                         "--pitch-target-deg")
+    ap.add_argument("--pitch-target-deg", type=float, default=0.0,
+                    help="[--real] 非 --hold-pitch 时下发的固定 pitch 目标角 [°]（默认 0）")
     args = ap.parse_args()
 
     if args.out is None:
@@ -280,12 +285,15 @@ def main() -> int:
 
     # ---- 整个程序运行期间只构造一次环境 ----
     if args.real:
+        print(f"pitch: {'保持当前实测角' if args.hold_pitch else f'目标 {args.pitch_target_deg:g}°'}")
         env = RealEnv(
             dt=cfg.DT,
             imu_location=(ImuLocation.ON_HEAD if args.imu_location == "head"
                           else ImuLocation.ON_BIG_YAW),
             tau_b_max=args.tau_b_max, tau_s_max=args.tau_s_max,
             spin_us=args.spin_us, gravity_settle_s=args.gravity_settle_s,
+            hold_pitch=args.hold_pitch,
+            pitch_target=float(np.radians(args.pitch_target_deg)),
             ready_timeout_s=args.ready_timeout_s)
     else:
         env = SimEnv(zero_gravity=args.zero_gravity, noise=args.noise,

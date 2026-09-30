@@ -134,6 +134,11 @@ def main() -> int:
                     help="[--real] 会话开始对反解重力取平均的时长 [s]")
     ap.add_argument("--ready-timeout-s", type=float, default=5.0,
                     help="[--real] 等待 MCU+IMU 首个有效样本的超时 [s]")
+    ap.add_argument("--hold-pitch", action="store_true",
+                    help="[--real] 保持当前实测 pitch（不扰动）；不给则把 pitch 目标压到 "
+                         "--pitch-target-deg")
+    ap.add_argument("--pitch-target-deg", type=float, default=0.0,
+                    help="[--real] 非 --hold-pitch 时下发的固定 pitch 目标角 [°]（默认 0）")
     ap.add_argument("--fs-vel-tol-frac", type=float, default=0.02,
                     help="稳态判据的相对容差（真实编码器有量化/滞后，建议放宽到 ~0.1）")
     ap.add_argument("--fs-vel-tol-abs", type=float, default=0.0,
@@ -158,12 +163,15 @@ def main() -> int:
     rng = np.random.default_rng(args.seed)
     # 整个程序运行期间只构造一次环境
     if args.real:
+        print(f"  pitch: {'保持当前实测角' if args.hold_pitch else f'目标 {args.pitch_target_deg:g}°'}")
         env = RealEnv(
             dt=cfg.DT,
             imu_location=(ImuLocation.ON_HEAD if args.imu_location == "head"
                           else ImuLocation.ON_BIG_YAW),
             tau_b_max=args.tau_b_max, tau_s_max=args.tau_s_max,
             spin_us=args.spin_us, gravity_settle_s=args.gravity_settle_s,
+            hold_pitch=args.hold_pitch,
+            pitch_target=float(np.radians(args.pitch_target_deg)),
             ready_timeout_s=args.ready_timeout_s)
     else:
         env = SimEnv(zero_gravity=args.zero_gravity, noise=args.noise,

@@ -68,6 +68,7 @@ class RealEnv:
                  auto_aim_enable: int = 1,
                  fire: int = 0,
                  hold_pitch: bool = True,
+                 pitch_target: float = 0.0,
                  ready_timeout_s: float = 5.0,
                  gravity_settle_s: float = 0.3,
                  max_data_gap_frames: int = 100,
@@ -81,6 +82,8 @@ class RealEnv:
         :param auto_aim_enable:  发送包里的自瞄总开关
         :param fire:             发送包里的火控位
         :param hold_pitch:       True 时把当前实测 pitch 角回填为 pitch 目标（不扰动 pitch）
+        :param pitch_target:     hold_pitch=False 时下发的固定 pitch 目标角 [rad]
+                                 （关节角语义，经 send_pitch 标定映射后发出；默认 0）
         :param ready_timeout_s:  等待 MCU + IMU 首个有效样本的超时 [s]
         :param gravity_settle_s: 会话开始时对反解重力取平均的时长 [s]（0 = 只用首样本）
         :param max_data_gap_frames: 连续无有效数据的容忍帧数，超过抛异常（<=0 关闭）
@@ -105,7 +108,7 @@ class RealEnv:
         # ---- 状态缓存 / 帧节拍 ----
         self._state = State(theta_b=0.0, dtheta_b=0.0, theta_s=0.0, dtheta_s=0.0)
         self._pose = None
-        self._pitch_target = 0.0
+        self._pitch_target = float(pitch_target)
         self._next_ns = time.perf_counter_ns()
         self._frame_count = 0
         self._late_count = 0
@@ -333,7 +336,8 @@ class RealEnv:
             return
         self._comm = None
         try:
-            self._pitch_target = float(self._pose.pitch_angle) if self._pose else 0.0
+            if self._hold_pitch and self._pose is not None:
+                self._pitch_target = float(self._pose.pitch_angle)
             comm.send_to_mcu(self._packet(0.0, 0.0))
         except Exception:
             pass

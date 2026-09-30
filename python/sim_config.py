@@ -99,8 +99,9 @@ W_PSI_B = W_PSI_S = W_DPSI_B = W_DPSI_S = 1.0
 DEFAULT_NUM = 120                # 默认轨迹条数
 DEFAULT_SEED = 20240607
 
-# ---- 无重置时的"控回初值"控制器 ----
-REPOS_KP, REPOS_KD, REPOS_KI = 6.0, 1.2, 0.8    # 位置 PI + 速度 D
+# ---- 无重置时的"控回初值"控制器（两关节各自一份，便于分开整定）----
+REPOS_KP_B, REPOS_KD_B, REPOS_KI_B = 6.0, 1.2, 0.8    # 关节 b 位置 PI + 速度 D
+REPOS_KP_S, REPOS_KD_S, REPOS_KI_S = 6.0, 1.2, 0.8    # 关节 s 位置 PI + 速度 D
 REPOS_V_MAX = 1.5                # 目标点限速斜坡 [rad/s]（避免起步力矩饱和）
 REPOS_TOL_SIGMA = 3.0            # 收敛容差 = max(REPOS_TOL_RAD, SIGMA·滤波后残余σ)
 # 注意：噪声在仿真环境里，控制/判据读到的都是**带噪测量值**。因此：
