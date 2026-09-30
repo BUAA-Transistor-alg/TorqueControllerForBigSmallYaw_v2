@@ -11,16 +11,17 @@
   * 全程只构造 **一个** SimEnv；
   * 环境不支持重置：每个速度开始前靠控制力矩把状态带过去（PI 速度环天然完成）；
   * 动力学参数（含等效重力）构造时固定 → 一次运行 = 一个斜坡倾角；
-    多个倾角用 --append 追加到同一个 sweep.npz。
+    每次运行写出独立的 sweep_<启动时间戳>.npz，多个倾角直接多次运行即可，
+    辨识时把同一类别目录下所有 sweep_*.npz 合并使用（不再需要 --append）。
 
 用法::
 
-    python3 python/gen_friction_sweep.py --alpha-deg 0
-    python3 python/gen_friction_sweep.py --alpha-deg 12 --append
+    python3 python/gen_friction_sweep.py --alpha-deg 0 --category friction_simA
+    python3 python/gen_friction_sweep.py --alpha-deg 12 --category friction_simA
 
     # 真实硬件（RealEnv）：状态来自通信、力矩下发给 MCU、不加噪声、忙等精确帧控制
     python3 python/gen_friction_sweep.py --real
-    python3 python/gen_friction_sweep.py --real --out data/friction_real/sweep.npz --append
+    python3 python/gen_friction_sweep.py --real --category friction_real
 """
 
 from __future__ import annotations
@@ -102,8 +103,11 @@ def run_one(env, omega_ref: float, vel_tol_frac: float = 0.02,
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=str, default=None,
-                    help="输出 npz；缺省时 --real 用 data/friction_real/sweep.npz，"
-                         "否则用 data/friction/sweep.npz")
+                    help="输出 npz 的路径；时间戳会插进文件名，如 --out data/x/sweep.npz "
+                         "-> data/x/sweep_<时间戳>.npz。缺省时按 --category / "
+                         "data/friction[_real] 解析")
+    ap.add_argument("--category", type=str, default=None,
+                    help="类别名（= 目录名）：输出到 data/<类别>/sweep_<时间戳>.npz")
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--zero-gravity", action="store_true",
                     help="把等效重力强制设为 0（水平面）；不给则在倾角范围内随机")
@@ -114,8 +118,6 @@ def main() -> int:
     ap.add_argument("--sigma-pos", type=float, default=cfg.SIGMA_POS)
     ap.add_argument("--sigma-vel", type=float, default=cfg.SIGMA_VEL)
     ap.add_argument("--sigma-tau", type=float, default=cfg.SIGMA_TAU)
-    ap.add_argument("--append", action="store_true",
-                    help="把本次结果追加到已有 sweep.npz（多个重力会话拼接）")
 
     # ---- 真实硬件环境（RealEnv）----
     ap.add_argument("--real", action="store_true",
@@ -145,10 +147,14 @@ def main() -> int:
                     help="稳态判据的绝对容差 [rad/s]（真机建议给一点，如 0.02）")
     args = ap.parse_args()
 
-    if args.out is None:
-        args.out = str((cfg.DATA_DIR_FRICTION_REAL if args.real
-                        else cfg.DATA_DIR_FRICTION) / "sweep.npz")
-    out_path = Path(args.out)
+    stamp = cfg.run_stamp()          # 本次运行的启动时间戳
+    if args.out is not None:
+        _o = Path(args.out)
+        out_path = _o.parent / f"{_o.stem}_{stamp}{_o.suffix or '.npz'}"
+    else:
+        base = (cfg.category_dir(args.category) if args.category
+                else (cfg.DATA_DIR_FRICTION_REAL if args.real else cfg.DATA_DIR_FRICTION))
+        out_path = base / f"sweep_{stamp}.npz"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"匀速旋转摩擦采集: {'真实硬件' if args.real else '仿真'} 数据 -> {out_path}")
@@ -201,28 +207,15 @@ def main() -> int:
         print("本次没有成功的实验")
         return 1
 
-    old = {}
-    if args.append and out_path.exists():
-        with np.load(out_path) as d:
-            old = {k: np.asarray(d[k]) for k in d.files}
     keys = sorted(rows[0].keys())
-    new = {k: np.array([r[k] for r in rows], dtype=np.float64) for k in keys}
-    # 旧文件可能缺少本次新增的列（例如 real）：按旧条数补 0，保证各列等长
-    n_old = int(np.asarray(old["omega"]).size) if "omega" in old else 0
-    merged = {}
-    for k in keys:
-        prev = old.get(k)
-        if prev is None:
-            prev = np.zeros(n_old, dtype=np.float64)
-        merged[k] = np.concatenate([prev, new[k]])
-    np.savez_compressed(out_path, **merged)
+    data = {k: np.array([r[k] for r in rows], dtype=np.float64) for k in keys}
+    np.savez_compressed(out_path, **data)
 
-    print(f"\n完成：本次 {len(rows)}/{tried} 条成功（失败 {failed}），"
-          f"累计 {len(merged['omega'])} 条 -> {out_path}")
-    print(f"  |ω| 范围 [{np.abs(merged['omega']).min():.4f}, "
-          f"{np.abs(merged['omega']).max():.3f}] rad/s")
-    print(f"  θ_s 峰值中位 {np.median(merged['theta_s_max_deg']):.3f}°  "
-          f"θ̇_s RMS 中位 {np.median(merged['dtheta_s_rms']):.2e} rad/s")
+    print(f"\n完成：本次 {len(rows)}/{tried} 条成功（失败 {failed}）-> {out_path}")
+    print(f"  |ω| 范围 [{np.abs(data['omega']).min():.4f}, "
+          f"{np.abs(data['omega']).max():.3f}] rad/s")
+    print(f"  θ_s 峰值中位 {np.median(data['theta_s_max_deg']):.3f}°  "
+          f"θ̇_s RMS 中位 {np.median(data['dtheta_s_rms']):.2e} rad/s")
     return 0
 
 

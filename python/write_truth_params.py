@@ -22,10 +22,14 @@ import sim_config as cfg  # noqa: E402
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", type=str, default=str(cfg.DATA_DIR_SIM))
+    ap.add_argument("--out", type=str, default=None,
+                    help="输出目录（优先于 --category）；缺省时按 --category 或 data/sim")
+    ap.add_argument("--category", type=str, default=None,
+                    help="类别名（= 目录名）：写到 data/<类别>/truth_params.txt")
     args = ap.parse_args()
 
-    out_dir = Path(args.out)
+    out_dir = (Path(args.out) if args.out
+               else (cfg.category_dir(args.category) if args.category else cfg.DATA_DIR_SIM))
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "truth_params.txt"
     with open(path, "w", encoding="utf-8") as f:

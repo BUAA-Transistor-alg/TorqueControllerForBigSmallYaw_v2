@@ -56,6 +56,7 @@ sys.path.insert(0, str(HERE))
 
 from capi import (Params, State, ParamGradient, ParamLossSpec,  # noqa: E402
                    PARAM_GRADIENT_NAMES)
+import sim_config as cfg  # noqa: E402
 
 DATA_DIR = REPO / "data" / "sim"
 
@@ -487,6 +488,54 @@ def parse_stages(spec: str) -> list[tuple[int, float]]:
     return [(k, w / total_w) for k, w in out]
 
 
+def _load_sweeps(path) -> tuple[dict, list[str]]:
+    """加载摩擦 sweep 数据（单文件或目录）。
+
+    path 是目录时，合并其中**全部** ``sweep_*.npz``（没有匹配则退回 ``*.npz``），
+    用来把同一类别下多次运行的结果拼起来。列取各文件的并集，缺失的列按该文件的
+    行数补 0（旧文件可能没有 real 等较新的列）。非数值列忽略。
+
+    返回 (列字典, 用到的文件名列表)。
+    """
+    p = Path(path)
+    if p.is_dir():
+        files = sorted(p.glob("sweep_*.npz"))
+        if not files:
+            files = sorted(p.glob("*.npz"))
+        if not files:
+            raise FileNotFoundError(f"目录里没有找到 sweep npz: {p}")
+    else:
+        files = [p]
+
+    per_file: list[dict] = []
+    for f in files:
+        with np.load(f) as z:
+            per_file.append({k: np.asarray(z[k]) for k in z.files})
+
+    keys: set[str] = set()
+    for d in per_file:
+        keys.update(d.keys())
+
+    def _n(d: dict) -> int:
+        return int(np.asarray(d["omega"]).size)
+
+    merged: dict[str, np.ndarray] = {}
+    for k in sorted(keys):
+        cols = []
+        for d in per_file:
+            v = d.get(k)
+            if v is None:
+                cols.append(np.zeros(_n(d), dtype=np.float64))
+            elif v.ndim == 0:
+                cols.append(np.full(_n(d), float(v), dtype=np.float64))
+            elif np.issubdtype(v.dtype, np.number):
+                cols.append(np.asarray(v, dtype=np.float64).ravel())
+            else:
+                cols.append(np.zeros(_n(d), dtype=np.float64))
+        merged[k] = np.concatenate(cols) if cols else np.zeros(0)
+    return merged, [f.name for f in files]
+
+
 def fit_friction_sweep(sweep_path, p_dyn: dict) -> tuple[float, float, dict]:
     """用匀速旋转实验的稳态数据拟合关节 b 的两个摩擦系数。
 
@@ -496,9 +545,12 @@ def fit_friction_sweep(sweep_path, p_dyn: dict) -> tuple[float, float, dict]:
     线性最小二乘——实测残差 ~3e-4 N·m、条件数 ~2，比主回归（cond 1e18）好十几个
     数量级，所以摩擦能真正解出来。
 
+    sweep_path 可以是单个 npz，也可以是**类别目录**（合并其中全部 sweep_*.npz，
+    即该类别下所有采集运行）。
+
     返回 (fbc, fbv, 诊断信息)。
     """
-    d = np.load(sweep_path)
+    d, sweep_files = _load_sweeps(sweep_path)
     ms, Psx, Psy = p_dyn["ms"], p_dyn["Psx"], p_dyn["Psy"]
     mb, Pbx, Pby = p_dyn["mb"], p_dyn["Pbx"], p_dyn["Pby"]
     Dx, Dy = p_dyn["Dx"], p_dyn["Dy"]
@@ -516,7 +568,8 @@ def fit_friction_sweep(sweep_path, p_dyn: dict) -> tuple[float, float, dict]:
     A = np.column_stack([d["omega"], d["tanh_omega"]])
     (fbv, fbc), *_ = np.linalg.lstsq(A, yv, rcond=None)
     resid = yv - A @ np.array([fbv, fbc])
-    info = dict(n=int(len(yv)), residual=float(np.std(resid)),
+    info = dict(n=int(len(yv)), files=len(sweep_files), names=sweep_files,
+                residual=float(np.std(resid)),
                 cond=float(np.linalg.cond(A)),
                 omega_abs_min=float(np.abs(d["omega"]).min()),
                 omega_abs_max=float(np.abs(d["omega"]).max()))
@@ -532,7 +585,11 @@ DEFAULT_STAGES = "20:0.08,50:0.10,100:0.12,200:0.20,300:0.50"
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", type=str, default=str(DATA_DIR))
+    ap.add_argument("--category", type=str, default=None,
+                    help="类别名（= 目录名）：读 data/<类别>/ 下**全部** case_*.npz"
+                         "（多次采集运行的时间戳文件会一起用上）；被 --data 覆盖")
+    ap.add_argument("--data", type=str, default=None,
+                    help="数据目录（优先于 --category）；缺省时用 --category 或 data/sim")
     ap.add_argument("--steps", type=int, default=10000,
                     help="总优化步数，按 --stages 的权重分配到各阶段")
     ap.add_argument("--batch", type=int, default=8)
@@ -554,27 +611,52 @@ def main() -> int:
     ap.add_argument("--mass-nominal", type=float, nargs=2, default=(1.0, 1.0),
                     metavar=("MB", "MS"),
                     help="代数初始化中两个不可辨识标度 mb/ms 的标称值（不影响 loss）")
-    ap.add_argument("--friction-sweep", type=str,
-                    default=str(REPO / "data" / "friction" / "sweep.npz"),
-                    help="匀速旋转摩擦实验数据；用它独立拟合 fbc/fbv，"
-                         "关节 s 取一半（fsc=fbc/2, fsv=fbv/2）")
+    ap.add_argument("--friction-category", type=str, default=None,
+                    help="摩擦类别名（= 目录名）：读 data/<名字>/ 下**全部** sweep_*.npz；"
+                         "被 --friction-sweep 覆盖")
+    ap.add_argument("--friction-sweep", type=str, default=None,
+                    help="匀速旋转摩擦实验数据：可以是单个 npz，也可以是目录"
+                         "（合并其中全部 sweep_*.npz）；缺省时用 --friction-category "
+                         "或 data/friction。用它独立拟合 fbc/fbv，关节 s 取一半")
     ap.add_argument("--no-friction-sweep", dest="use_friction_sweep",
                     action="store_false",
                     help="不用匀速旋转实验，摩擦仍由主回归给出（实测会解成负值）")
     ap.add_argument("--init-orders", type=str, default=f"{LOG10_ORDERS_MIN},{LOG10_ORDERS_MAX}",
                     help='--init random 时，初值偏离真值的数量级区间 "min,max"')
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--out", type=str, default=str(REPO / "data" / "identify"))
+    ap.add_argument("--out", type=str, default=None,
+                    help="结果目录；缺省时 --category 给定时用 data/identify_<类别>，"
+                         "否则用 data/identify")
     args = ap.parse_args()
 
-    data_dir = Path(args.data)
+    def _stamp_of(name: str) -> str:
+        """从 case_<时间戳>_<序号>.npz 里解析出时间戳（旧的无戳文件返回 unknown）。"""
+        parts = Path(name).stem.split("_")
+        return f"{parts[1]}_{parts[2]}" if len(parts) >= 4 else "unknown"
+
+    data_dir = (Path(args.data) if args.data
+                else (cfg.category_dir(args.category) if args.category else DATA_DIR))
     files = sorted(data_dir.glob("case_*.npz"))
     if not files:
         print(f"未找到数据: {data_dir}")
         return 1
-    truth = load_truth(data_dir / "truth_params.txt")
-    out_dir = Path(args.out)
+    stamps = sorted({_stamp_of(f.name) for f in files})
+    truth_path = data_dir / "truth_params.txt"
+    has_truth = truth_path.exists()
+    truth = load_truth(truth_path) if has_truth else None
+    # 没有真值文件（例如真机采集的数据）时：随机初值/组合对比需要一组数值基准，
+    # 退回配置里的标称参数。它只参与计算，不被当成"真值"画出来或打印对比。
+    ref = truth if has_truth else dict(cfg.DEFAULT_PARAMS)
+    out_dir = (Path(args.out) if args.out
+               else (cfg.category_dir(f"identify_{args.category}") if args.category
+                     else REPO / "data" / "identify"))
     out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"数据类别: {args.category or data_dir}   目录: {data_dir}   文件: {len(files)} 个"
+          f"（{len(stamps)} 次运行: {', '.join(stamps)}）")
+    if has_truth:
+        print(f"真值文件: {truth_path}")
+    else:
+        print(f"真值文件: 无（{truth_path} 不存在）——不画真值曲线、不做真值对比")
 
     cases = [Case(f) for f in files]
     N = len(cases)
@@ -611,30 +693,37 @@ def main() -> int:
         plan = [(full_K, args.steps)]
     total_steps = sum(n for _, n in plan)
 
-    truth_ident = {n: truth[n] for n in PARAM_NAMES}
+    # 组合误差/随机初值的数值基准：有真值用真值，没有就用标称（见上面 ref 的说明）
+    truth_ident = {n: ref[n] for n in PARAM_NAMES}
     rng = np.random.default_rng(args.seed)
     if args.init == "algebraic":
         # ---- 摩擦：先用匀速旋转实验独立拟合（关节 s 取一半），再连同动力学一起回代 ----
         friction = None
-        sweep_path = Path(args.friction_sweep)
+        sweep_path = (Path(args.friction_sweep) if args.friction_sweep
+                      else (cfg.category_dir(args.friction_category)
+                            if args.friction_category
+                            else REPO / "data" / "friction"))
         if args.use_friction_sweep and sweep_path.exists():
             p_dyn, _ = algebraic_init(cases, nominal=tuple(args.mass_nominal),
                                       friction=(0.0, 0.0, 0.0, 0.0))
             fbc, fbv, finfo = fit_friction_sweep(sweep_path, p_dyn)
             friction = (fbc, fbv, 0.5 * fbc, 0.5 * fbv)   # s 取其一半
-            print(f"匀速旋转实验拟合摩擦（{finfo['n']} 个速度点，"
+            print(f"匀速旋转实验拟合摩擦（{finfo['files']} 个 sweep 文件，"
+                  f"{finfo['n']} 个速度点，"
                   f"|ω| {finfo['omega_abs_min']:.4f}~{finfo['omega_abs_max']:.2f} rad/s，"
                   f"残差 {finfo['residual']:.2e} N·m，cond {finfo['cond']:.1f}）:")
-            print(f"  fbc={fbc:.5f}  fbv={fbv:.5f}   真值 {truth['fbc']:.5f} / {truth['fbv']:.5f}"
-                  f"   （相对误差 {abs(fbc-truth['fbc'])/truth['fbc']:.2%} / "
-                  f"{abs(fbv-truth['fbv'])/truth['fbv']:.2%}）")
-            print(f"  关节 s 取一半: fsc={0.5*fbc:.5f} fsv={0.5*fbv:.5f}   "
-                  f"真值 {truth['fsc']:.5f} / {truth['fsv']:.5f}")
+            print(f"  fbc={fbc:.5f}  fbv={fbv:.5f}"
+                  + (f"   真值 {truth['fbc']:.5f} / {truth['fbv']:.5f}"
+                     f"   （相对误差 {abs(fbc-truth['fbc'])/truth['fbc']:.2%} / "
+                     f"{abs(fbv-truth['fbv'])/truth['fbv']:.2%}）" if has_truth else ""))
+            print(f"  关节 s 取一半: fsc={0.5*fbc:.5f} fsv={0.5*fbv:.5f}"
+                  + (f"   真值 {truth['fsc']:.5f} / {truth['fsv']:.5f}"
+                     if has_truth else ""))
         elif args.use_friction_sweep:
             print(f"（未找到 {sweep_path}，摩擦改用主回归结果）")
         p_init, ainfo = algebraic_init(cases, nominal=tuple(args.mass_nominal),
                                       friction=friction)
-        ps = ParamSpec(truth, rng, orders=(0.0, 0.0))
+        ps = ParamSpec(ref, rng, orders=(0.0, 0.0))
         ps.theta = torch.tensor(
             ParamSpec.to_theta([p_init[n] for n in PARAM_NAMES]),
             dtype=torch.float64, requires_grad=True)
@@ -642,10 +731,10 @@ def main() -> int:
               f"不可辨识标度取 mb={ainfo['mb']:.4g} ms={ainfo['ms']:.4g}")
     else:
         init_orders = tuple(float(v) for v in args.init_orders.split(","))
-        ps = ParamSpec(truth, rng, orders=init_orders)
+        ps = ParamSpec(ref, rng, orders=init_orders)
         print(f"随机初始化: 每个参数乘 10^(±[{init_orders[0]}, {init_orders[1]}])")
     init_combo = combo_error(ps.seed_values(), truth_ident)
-    init_spread = max(abs(np.log10(abs(ps.seed_values()[n]) / abs(truth[n])))
+    init_spread = max(abs(np.log10(abs(ps.seed_values()[n]) / abs(ref[n])))
                       for n in PARAM_NAMES)
     print(f"优化: 共 {total_steps} 步, batch={args.batch}, Adam lr={args.lr}"
           + ("  + 短窗口课程学习" if args.curriculum else "  （无课程学习）"))
@@ -653,15 +742,19 @@ def main() -> int:
         print("课程表: " + " -> ".join(f"K={k}({n}步)" for k, n in plan))
     # 单参数偏差没有意义（mb/ms 两条方向严格不可辨识，参数可沿平坦谷滑很远而
     # loss 完全不变），所以初值好坏只看可辨识组合误差。
-    print(f"初值: 可辨识组合最大相对误差={init_combo:.4g}，"
+    print(f"初值: 可辨识组合最大相对误差={init_combo:.4g}（基准："
+          f"{'真值' if has_truth else '标称参数'}），"
           f"单参数最大偏离={init_spread:.2f} 个数量级（不可辨识方向，仅供参考）")
-    ref_vals = []
-    with ParamGradient(make_params(cases[0], truth_ident), refinement=refinement) as pg_ref:
-        for c in cases:
-            pg_ref.set_params(make_params(c, truth_ident))
-            ref_vals.append(case_loss(pg_ref, c, full_K))
-    ref_loss = float(np.mean(ref_vals))
-    print(f"真值参数下的全窗口平均 loss（噪声底）≈ {ref_loss:.6e}")
+    if has_truth:
+        ref_vals = []
+        with ParamGradient(make_params(cases[0], truth_ident), refinement=refinement) as pg_ref:
+            for c in cases:
+                pg_ref.set_params(make_params(c, truth_ident))
+                ref_vals.append(case_loss(pg_ref, c, full_K))
+        ref_loss = float(np.mean(ref_vals))
+        print(f"真值参数下的全窗口平均 loss（噪声底）≈ {ref_loss:.6e}")
+    else:
+        ref_loss = None      # 无真值：不画噪声底线、不打印真值对比
 
     hist_loss, hist_theta, hist_K = [], [], []
     hist_eval_step, hist_eval_loss = [], []
@@ -734,8 +827,9 @@ def main() -> int:
 
                 if gstep % 500 == 0 or gstep == total_steps:
                     cur = ps.seed_values()
+                    combo_lab = "组合误差" if has_truth else "组合偏离(标称)"
                     print(f"  step {gstep:6d}  K={K_s:>3}  batch loss={hist_loss[-1]:.4e}  "
-                          f"组合误差={combo_error(cur, truth_ident):.3e}  "
+                          f"{combo_lab}={combo_error(cur, truth_ident):.3e}  "
                           f"lr={sched.get_last_lr()[0]:.2e}")
 
     # ---------------------------------------------------------------------
@@ -761,17 +855,27 @@ def main() -> int:
     final_loss = float(np.mean(fin_vals))
 
     print("\n=== 辨识结果（注意：mb/ms 两个标度严格不可辨识，单参数数值本身无意义）===")
-    print(f"{'参数':>8} {'真值':>14} {'初值':>14} {'估计':>14} {'相对误差':>12}")
     init_params = ps.to_params_np(hist_theta[0])   # 第一次更新前的初值
-    for n in PARAM_NAMES:
-        r = (est[n] - truth[n]) / max(abs(truth[n]), 1e-12)
-        print(f"{n:>8} {truth[n]:>14.6g} {init_params[n]:>14.6g} {est[n]:>14.6g} {r:>12.2e}")
+    if has_truth:
+        print(f"{'参数':>8} {'真值':>14} {'初值':>14} {'估计':>14} {'相对误差':>12}")
+        for n in PARAM_NAMES:
+            r = (est[n] - truth[n]) / max(abs(truth[n]), 1e-12)
+            print(f"{n:>8} {truth[n]:>14.6g} {init_params[n]:>14.6g} {est[n]:>14.6g} {r:>12.2e}")
+    else:
+        print(f"{'参数':>8} {'初值':>14} {'估计':>14}")
+        for n in PARAM_NAMES:
+            print(f"{n:>8} {init_params[n]:>14.6g} {est[n]:>14.6g}")
 
     combo_init = combo_error(init_params, truth_ident)
     combo_final = combo_error(est, truth_ident)
-    print(f"\n可辨识组合最大相对误差: 初值 {combo_init:.4g} -> 终值 {combo_final:.4g}")
-    print(f"全窗口平均 loss: 初值 {hist_eval_loss[0]:.4e} -> 终值 {final_loss:.4e}"
-          f"  真值底 {ref_loss:.4e}（比值 {final_loss / ref_loss:.2f}）")
+    base = "真值" if has_truth else "标称参数"
+    print(f"\n可辨识组合最大相对误差（基准 {base}）: "
+          f"初值 {combo_init:.4g} -> 终值 {combo_final:.4g}")
+    if has_truth:
+        print(f"全窗口平均 loss: 初值 {hist_eval_loss[0]:.4e} -> 终值 {final_loss:.4e}"
+              f"  真值底 {ref_loss:.4e}（比值 {final_loss / ref_loss:.2f}）")
+    else:
+        print(f"全窗口平均 loss: 初值 {hist_eval_loss[0]:.4e} -> 终值 {final_loss:.4e}")
 
     # ---------------------------------------------------------------------
     # 绘图
@@ -789,7 +893,8 @@ def main() -> int:
             ax = axes[k // 4][k % 4]
             vals = np.array([ps.to_params_np(th)[n] for th in hist_theta])
             ax.plot(vals, lw=1.0, label="estimated")
-            ax.axhline(truth[n], color="k", ls="--", lw=1.0, label="truth")
+            if has_truth:
+                ax.axhline(truth[n], color="k", ls="--", lw=1.0, label="truth")
             # 课程阶段的窗口切换点（参数曲线在这里会有明显的斜率变化）
             for b in stage_bounds:
                 ax.axvline(b, color="tab:red", lw=0.6, alpha=0.35)
@@ -816,8 +921,9 @@ def main() -> int:
                             label="full-window (K=%d) loss, all data" % full_K)
         axes[0][0].semilogy(range(len(hist_loss)), hist_loss, lw=0.6, alpha=0.35,
                             label="batch loss (current K)")
-        axes[0][0].axhline(ref_loss, color="k", ls="--", lw=1.0,
-                           label="truth-param floor (noise)")
+        if ref_loss is not None:
+            axes[0][0].axhline(ref_loss, color="k", ls="--", lw=1.0,
+                               label="truth-param floor (noise)")
         for b, kk in zip(stage_bounds, stage_ks):
             axes[0][0].axvline(b, color="tab:red", lw=0.8, alpha=0.4)
             axes[0][0].annotate(f"K={kk}", (b, 0.0), xycoords=("data", "axes fraction"),
@@ -835,7 +941,8 @@ def main() -> int:
             for th in hist_theta:
                 hist_vals.append(fn(ps.to_params_np(th)))
             ax.plot(hist_vals, lw=1.0, label="estimated")
-            ax.axhline(fn(truth), color="k", ls="--", lw=1.0, label="truth")
+            if has_truth:
+                ax.axhline(fn(truth), color="k", ls="--", lw=1.0, label="truth")
             for b in stage_bounds:
                 ax.axvline(b, color="tab:red", lw=0.6, alpha=0.35)
             ax.set_title(label, fontsize=9)
@@ -848,39 +955,44 @@ def main() -> int:
         plt.close(fig)
 
         # 3) 随机 3 条数据：真实参数 vs 辨识参数，在相同控制下的轨迹
+        #    没有真值文件时只画 measured vs identified（不画 truth 曲线）
+        import contextlib
         pick = rng.choice(N, size=min(3, N), replace=False)
         fig, axes = plt.subplots(len(pick), 2, figsize=(14, 3.2 * len(pick)),
                                  constrained_layout=True)
         axes = np.atleast_2d(axes)
-        with ParamGradient(make_params(cases[0], truth_ident),
-                           refinement=refinement) as pg_t, \
-             ParamGradient(make_params(cases[0], est),
-                           refinement=refinement) as pg_e:
+        with contextlib.ExitStack() as stack:
+            pg_e = stack.enter_context(
+                ParamGradient(make_params(cases[0], est), refinement=refinement))
+            pg_t = (stack.enter_context(
+                        ParamGradient(make_params(cases[0], truth_ident),
+                                      refinement=refinement))
+                    if has_truth else None)
             for row, ci in enumerate(pick):
                 c = cases[int(ci)]
-                # 两条曲线必须用同一条数据的已知重力
-                pg_t.set_params(make_params(c, truth_ident))
+                # 每条曲线都必须用该条数据自己的已知重力
                 pg_e.set_params(make_params(c, est))
-                _, *st = pg_t.loss(c.theta_c0, c.dtheta_c, c.ddtheta_c, c.dt, c.tau,
-                                   c.x0, case_spec(c, full_K), return_sequences=True)
                 _, *se = pg_e.loss(c.theta_c0, c.dtheta_c, c.ddtheta_c, c.dt, c.tau,
                                    c.x0, case_spec(c, full_K), return_sequences=True)
+                st = None
+                if pg_t is not None:
+                    pg_t.set_params(make_params(c, truth_ident))
+                    _, *st = pg_t.loss(c.theta_c0, c.dtheta_c, c.ddtheta_c, c.dt, c.tau,
+                                       c.x0, case_spec(c, full_K), return_sequences=True)
                 t = (np.arange(c.K) + 1) * c.dt
-                axes[row][0].plot(t, c.psi_b, ".", ms=1.5, alpha=0.4, label="measured")
-                axes[row][0].plot(t, st[0], lw=1.2, label="truth params")
-                axes[row][0].plot(t, se[0], lw=1.2, ls="--", label="identified")
-                axes[row][0].set_title(f"case {int(ci)}: psi_b", fontsize=10)
-                axes[row][0].grid(True, alpha=0.3)
-                if row == 0:
-                    axes[row][0].legend(fontsize=7)
-                axes[row][1].plot(t, c.psi_s, ".", ms=1.5, alpha=0.4, label="measured")
-                axes[row][1].plot(t, st[1], lw=1.2, label="truth params")
-                axes[row][1].plot(t, se[1], lw=1.2, ls="--", label="identified")
-                axes[row][1].set_title(f"case {int(ci)}: psi_s", fontsize=10)
-                axes[row][1].grid(True, alpha=0.3)
-                if row == 0:
-                    axes[row][1].legend(fontsize=7)
-        fig.suptitle("Same control input: truth vs identified trajectory", fontsize=13)
+                for col, (meas, lab) in enumerate(((c.psi_b, "psi_b"), (c.psi_s, "psi_s"))):
+                    ax = axes[row][col]
+                    ax.plot(t, meas, ".", ms=1.5, alpha=0.4, label="measured")
+                    if st is not None:
+                        ax.plot(t, st[col], lw=1.2, label="truth params")
+                    ax.plot(t, se[col], lw=1.2, ls="--", label="identified")
+                    ax.set_title(f"case {int(ci)}: {lab}", fontsize=10)
+                    ax.grid(True, alpha=0.3)
+                    if row == 0:
+                        ax.legend(fontsize=7)
+        fig.suptitle("Same control input: "
+                     + ("truth vs identified trajectory" if has_truth
+                        else "measured vs identified trajectory"), fontsize=13)
         p3 = out_dir / "trajectories.png"
         fig.savefig(p3, dpi=110)
         plt.close(fig)

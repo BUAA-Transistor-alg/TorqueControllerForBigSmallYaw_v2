@@ -4,7 +4,8 @@
   * 全程只构造 **一个** SimEnv 实例，所有轨迹复用它；
   * 环境不支持重置，因此每条轨迹开始前用**控制力矩把状态控回**所需初值；
   * 动力学参数（含等效重力）在构造时固定 → **一次运行 = 一个斜坡倾角下的采集会话**，
-    不同重力靠多次运行（配 --start-index 追加）拼接成完整数据集；
+    不同重力多次运行即可；每次运行的文件名带**启动时间戳**，写进同一类别目录互不覆盖，
+    辨识时把该类别下全部 case_*.npz 一起用；
   * 力矩噪声直接加到**实际施加**的力矩上（记录力矩 = 实际施加力矩，数据自洽）。
 
 流程（对每条轨迹）：
@@ -12,23 +13,22 @@
     1. 控回初值：θ_b 控到随机目标、θ_s 控到 0、两角速度控到 0
     2. 闭环 PD 跟踪参考轨迹产生激励；θ_s 参考按 ±15° 设计，关节 b 自由激励
     3. 限位验收：max|θ_s| > 35° 丢弃，> 30° 则收缩参考幅值重试
-    4. 状态曲线加测量噪声后写出 npz
+    4. 状态曲线加测量噪声后写出 npz（case_<启动时间戳>_<编号>.npz）
 
 用法（在仓库根执行）::
 
-    # 水平面（平面内重力 = 0）
-    python3 python/generate_id_dataset.py --num 20 --alpha-deg 0 --start-index 0
-    # 倾角 12°、平面内方向 90°
-    python3 python/generate_id_dataset.py --num 20 --alpha-deg 12 --start-index 20
+    # 类别 simA，写 data/simA/case_<时间戳>_*.npz（可反复运行，不会覆盖）
+    python3 python/generate_id_dataset.py --num 20 --zero-gravity --category simA
+    python3 python/generate_id_dataset.py --num 20 --category simA        # 再跑一次
 
     # 真实硬件（RealEnv）：状态来自通信严格反解、力矩下发给 MCU、不加噪声、
-    # perf_counter_ns + 忙等精确帧控制；数据默认写到 data/sim_real
-    python3 python/generate_id_dataset.py --real --num 20 --start-index 0
+    # perf_counter_ns + 忙等精确帧控制
+    python3 python/generate_id_dataset.py --real --num 20 --category sim_real
 
-之后用同一套辨识脚本读真实数据::
+之后用同一套辨识脚本读该类别（目录下所有 case_*.npz 一起用）::
 
-    python3 python/identify_params.py --data data/sim_real \
-        --friction-sweep data/friction_real/sweep.npz
+    python3 python/identify_params.py --category simA \
+        --friction-category friction_simA
 """
 
 from __future__ import annotations
@@ -221,7 +221,11 @@ def main() -> int:
     ap.add_argument("--num", type=int, default=cfg.DEFAULT_NUM,
                     help="本次会话生成多少条轨迹")
     ap.add_argument("--out", type=str, default=None,
-                    help="输出目录；缺省时 --real 用 data/sim_real，否则用 data/sim")
+                    help="输出目录（优先于 --category）；缺省时按 --category / "
+                         "data/sim[_real] 解析。文件名自动带启动时间戳，多次运行不覆盖")
+    ap.add_argument("--category", type=str, default=None,
+                    help="类别名（= 目录名）：输出到 data/<类别>/；"
+                         "例如 --category simA -> data/simA")
     ap.add_argument("--seed", type=int, default=cfg.DEFAULT_SEED)
     ap.add_argument("--start-index", type=int, default=0,
                     help="本会话第一条的编号（多次运行拼接数据集时用）")
@@ -266,14 +270,18 @@ def main() -> int:
                     help="[--real] 非 --hold-pitch 时下发的固定 pitch 目标角 [°]（默认 0）")
     args = ap.parse_args()
 
-    if args.out is None:
-        args.out = str(cfg.DATA_DIR_SIM_REAL if args.real else DATA_DIR)
-    out_dir = Path(args.out)
+    if args.out is not None:
+        out_dir = Path(args.out)
+    elif args.category:
+        out_dir = cfg.category_dir(args.category)
+    else:
+        out_dir = cfg.DATA_DIR_SIM_REAL if args.real else DATA_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = cfg.run_stamp()          # 本次运行的启动时间戳（所有文件共用）
     rng = np.random.default_rng(args.seed)
 
-    print(f"数据目录: {out_dir}   会话轨迹数: {args.num}   起始编号: {args.start_index}   "
-          f"数据源: {'真实硬件' if args.real else '仿真'}")
+    print(f"数据目录: {out_dir}   本次时间戳: {stamp}   会话轨迹数: {args.num}   "
+          f"起始编号: {args.start_index}   数据源: {'真实硬件' if args.real else '仿真'}")
     print(f"采样: dt={cfg.DT}s ({1/cfg.DT:.0f}Hz)  K={cfg.NUM_STEPS}  "
           f"refinement={cfg.REFINEMENT}（回放用）")
     print(f"约束: θ_s 目标 ≤{cfg.THETA_S_TARGET_DEG:.0f}° / 硬限 "
@@ -364,7 +372,7 @@ def main() -> int:
             over_s += int((v_s > cfg.V_MAX_S).sum())
 
             np.savez_compressed(
-                out_dir / f"case_{case_no:04d}.npz",
+                out_dir / f"case_{stamp}_{case_no:04d}.npz",
                 theta_c0=np.float64(0.0), dtheta_c=np.float64(0.0),
                 ddtheta_c=np.float64(0.0),
                 x0_theta_b=np.float64(rec["x0"].theta_b),

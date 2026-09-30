@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -132,3 +133,20 @@ DATA_DIR_IDENTIFY = REPO / "data" / "identify"
 # 真实硬件采集（RealEnv）用的独立目录，避免与仿真数据混在一起
 DATA_DIR_SIM_REAL = REPO / "data" / "sim_real"
 DATA_DIR_FRICTION_REAL = REPO / "data" / "friction_real"
+
+
+def run_stamp() -> str:
+    """程序启动时的时间戳，用于给采集 npz 命名（多次运行互不覆盖）。
+
+    每个采集脚本在 main() 开头调用一次；同一次运行写出的所有文件共用同一个戳。
+    """
+    return time.strftime("%Y%m%d_%H%M%S")
+
+
+def category_dir(name: str) -> Path:
+    """类别名 -> 目录 ``data/<name>``。
+
+    类别即目录名，沿用现有布局：``--category simA`` → ``data/simA``，
+    ``--category friction_simA`` → ``data/friction_simA``。
+    """
+    return REPO / "data" / name
