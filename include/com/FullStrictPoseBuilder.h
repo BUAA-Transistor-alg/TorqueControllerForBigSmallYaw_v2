@@ -78,7 +78,9 @@ public:
         double chassis_imu_omega = 0.0; // 底盘 yaw 角速度
     };
 
-    FullStrictPoseBuilder() = default;
+    enum class ImuLocation { ON_BIG_YAW = 0, ON_HEAD = 1 };
+
+    FullStrictPoseBuilder(ImuLocation imu_location = ImuLocation::ON_HEAD) {imu_location_ = imu_location;}
 
     FullStrictPoseBuilder(const FullStrictPoseBuilder&) = delete;
     FullStrictPoseBuilder& operator=(const FullStrictPoseBuilder&) = delete;
@@ -93,10 +95,13 @@ public:
     // 反解输入快照取自最近缓存的样本；样本从未传入过时对应字段为 0。
     StrictPose strictPose() const;
 
+
 private:
     mutable std::mutex mtx_;   // 保护内部状态（回调线程写、主线程读）
     ImuSample imu_;            // 最近一次 IMU 样本（从未传入则全 0）
     McuSample mcu_;            // 最近一次 MCU 样本（从未传入则全 0）
+
+    ImuLocation imu_location_;
 
     double g_ = 9.81;
 };

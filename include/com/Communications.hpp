@@ -72,12 +72,12 @@ public:
         imu::ReceivePacket raw_imu_packet{};
     };
 
-    explicit RobotCommunication(
-        const McuDataPreprocessor::LinearParams& mcu_linear_params = McuDataPreprocessor::LinearParams{})
+    explicit RobotCommunication(const FullStrictPoseBuilder::ImuLocation imu_location, 
+            const McuDataPreprocessor::LinearParams& mcu_linear_params = McuDataPreprocessor::LinearParams{})
         : preprocessor_(mcu_linear_params)
         , mcu_serial_([this](const mcu::ReceivePacket& pkt) { onMcuReceive(pkt); }, false)
         , imu_serial_([this](const imu::ReceivePacket& pkt) { onImuReceive(pkt); }, false)
-        , full_strict_pose_builder_()
+        , full_strict_pose_builder_(imu_location)
     {
         mcu_serial_.startWorker();
         imu_serial_.startWorker();

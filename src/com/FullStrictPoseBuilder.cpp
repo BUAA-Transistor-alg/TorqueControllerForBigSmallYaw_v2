@@ -168,6 +168,8 @@ FullStrictPoseBuilder::StrictPose FullStrictPoseBuilder::strictPose() const {
         double imu_euler_yaw = 0.0;      // IMU 原始欧拉角（世界←IMU, ZXY）
         double imu_euler_pitch = 0.0;
         double imu_euler_roll = 0.0;
+        double imu_omega_z = 0.0;
+        double imu_omega_y = 0.0;
     } temp;
     StrictPose sp;
     {
@@ -180,15 +182,37 @@ FullStrictPoseBuilder::StrictPose FullStrictPoseBuilder::strictPose() const {
         sp.yaw_small_angle = mcu_.yaw_small_angle;
         sp.pitch_angle = mcu_.pitch_angle;
 
-        sp.small_azimuth_omega = imu_.gz;
+        temp.imu_omega_z = imu_.gz;
+        temp.imu_omega_y = imu_.gy;
         sp.small_motor_omega = mcu_.yaw_small_omega;
         sp.big_motor_omega = mcu_.yaw_big_omega;
     }
 
-    Mat3 R_head = eulerZXY(temp.imu_euler_yaw, temp.imu_euler_pitch, temp.imu_euler_roll);
-    Mat3 R_small = mul(R_head, rotX(-sp.pitch_angle));
-    Mat3 R_big = mul(R_small, rotZ(-sp.yaw_small_angle));
-    Mat3 R_chassis = mul(R_big, rotZ(-sp.yaw_big_angle));
+    Mat3 R_head;
+    Mat3 R_small;
+    Mat3 R_big;
+    Mat3 R_chassis;
+    if (imu_location_ == ImuLocation::ON_HEAD) {
+        R_head = eulerZXY(temp.imu_euler_yaw, temp.imu_euler_pitch, temp.imu_euler_roll);
+        R_small = mul(R_head, rotX(-sp.pitch_angle));
+        R_big = mul(R_small, rotZ(-sp.yaw_small_angle));
+        R_chassis = mul(R_big, rotZ(-sp.yaw_big_angle));
+
+        sp.small_azimuth_omega = 
+            temp.imu_omega_z * std::cos(sp.pitch_angle) + temp.imu_omega_y * std::sin(sp.pitch_angle)
+        ;
+        sp.big_azimuth_omega = sp.small_azimuth_omega - sp.small_motor_omega;
+        sp.chassis_omega = sp.big_azimuth_omega - sp.big_motor_omega;
+    } else {
+        R_big = eulerZXY(temp.imu_euler_yaw, temp.imu_euler_pitch, temp.imu_euler_roll);
+        R_small = mul(R_big, rotZ(sp.yaw_small_angle));
+        R_head = mul(R_small, rotX(sp.pitch_angle));
+        R_chassis = mul(R_big, rotZ(-sp.yaw_big_angle));
+
+        sp.big_azimuth_omega = temp.imu_omega_z;
+        sp.small_azimuth_omega = sp.big_azimuth_omega + sp.small_motor_omega;
+        sp.chassis_omega = sp.big_azimuth_omega - sp.big_motor_omega;
+    }
     matToEulerZXY(R_chassis, sp.chassis_euler_yaw, sp.chassis_euler_pitch, sp.chassis_euler_roll);
 
     double projX = 0.0;
@@ -203,9 +227,6 @@ FullStrictPoseBuilder::StrictPose FullStrictPoseBuilder::strictPose() const {
 
     sp.gx = projX * g_;
     sp.gy = projY * g_;
-
-    sp.big_azimuth_omega = sp.small_azimuth_omega - sp.small_motor_omega;
-    sp.chassis_omega = sp.big_azimuth_omega - sp.big_motor_omega;
 
     return sp;
 }
