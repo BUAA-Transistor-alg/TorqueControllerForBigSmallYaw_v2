@@ -1025,9 +1025,9 @@ def main() -> int:
             bs = N if (args.full_batch_final and stage_i == len(plan) - 1) else args.batch
             opt = torch.optim.Adam([ps.theta], lr=lr_s)
             sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-                opt, T_max=max(1, n_steps), eta_min=lr_s * 0.15)
+                opt, T_max=max(1, n_steps), eta_min=0.0) #lr_s * 0.15)
             print(f"\n--- 课程阶段: 拟合窗口 K={K_s} / {full_K}，"
-                  f"预算 {n_steps} 步，batch={bs}，lr {lr_s:.3g} -> {lr_s * 0.15:.3g} ---")
+                  f"预算 {n_steps} 步，batch={bs}，lr {lr_s:.3g} -> {0.0:.3g} ---")
             epoch_order = None
             batch_cursor = 0
 
