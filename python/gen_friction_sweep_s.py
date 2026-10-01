@@ -19,26 +19,25 @@ G2 只与位置有关，两趟扫过同一对称区间 ⇒ 一阶项精确抵消
 大 yaw 能整圈旋转（整圈平均掉 G1），小 yaw 只有 ±35° 硬限位，所以拿"正反行程镜像"
 换"整圈平均"——这就是本脚本对应 gen_friction_sweep.py 的设计。
 
-怎么保证"带限位也能建立匀速"（本脚本的核心）
---------------------------------------------
-建立速度是**距离**问题不是时间问题：实机反解 M22≈0.006 kg·m²、τ_max=1 N·m
-⇒ a_max≈170 rad/s²，从静止拉到 ω 只要 ω²/(2a)：ω=3 rad/s 也才 1.5°。
-吃行程的是"保持速度"，所以幅值按速度缩放：
-
-    A(ω) = clip(ω·SS_CV_TIME/2 + ω²/(2·SS_A_REF), SS_AMP_MIN_DEG, 幅值上限)
-
-即每个速度的**匀速段只占 SS_CV_TIME 秒**；高速时幅值被上限截断、匀速段变短，
-就多跑几趟（每趟仍覆盖同一段位置，差分照样成立），而不是去等它"稳"。
-规划时按 2·gate/(ω·dt) 预估单趟样本数，不足 SS_MIN_SAMPLES 就丢弃该速度并打印原因。
+采集节拍（实测：只有起步/换向那一瞬速度不稳，中间很长一段都是稳的）
+--------------------------------------------------------------------
+    * 幅值**恒为** THETA_S_TARGET_DEG（±30°），所有速度同一个幅值，不按速度缩放；
+    * 每个速度都从 **+A 静止起步**，走向 −A，再回来；
+    * 只在**中间 ±SS_MEAS_HALF_DEG（默认 10°）**里采集数据 —— 起步加速段与换向
+      减速段天然落在窗外，因此**不需要任何稳定性判据**（原先那套速度/力矩均值标准误
+      判据会误杀，已全部删除）；
+    * 每个速度至少跑 **SS_MIN_CYCLES（默认 3）个完整来回**；SS_TIME_BUDGET
+      不够就按"整来回"为单位向上取整延长；
+    * **绝不在来回中途切速度**：只在换向点结束本速度。
+      （各速度耗时差很多：ω=0.02 一个来回约 105 s，ω=6 只要 0.35 s。）
 
 安全（绝不依赖电控在 ±35° 处的保护——那里力矩会被削弱，发出的力矩≠实际力矩）
 --------------------------------------------------------------------------
-    * 参考速度**限斜坡** SS_A_REF（不是从 +ω 跳到 −ω）⇒ 反作用力矩 ≈ M12·SS_A_REF
-      有界，不会把抱死的大 yaw 顶飞；反向点 |θ_s| + ω²/(2·SS_A_REF) ≥ A 正是斜坡
-      所需距离，实际峰值 ≲ A，永远够不到 ±35°（幅值上限已经取
-      THETA_S_TARGET_DEG）；
-    * 幅值上限就是 THETA_S_TARGET_DEG（±30°，不再额外缩到 28°）：主动控制范围
-      朝 30° 控，换向峰值偶尔进到 30~35° 也没关系；
+    * 参考速度**限斜坡** SS_A_REF（标定后取 0.5×a_max，不是从 +ω 跳到 −ω）⇒
+      反作用力矩 ≈ M12·SS_A_REF 有界，不会把抱死/人工固定的大 yaw 顶飞；换向点
+      |θ_s| + ω²/(2·SS_A_REF) ≥ A 正是斜坡所需距离，实际峰值 ≲ A；
+    * 幅值上限就是 THETA_S_TARGET_DEG（±30°）：主动控制朝 30° 控，换向峰值偶尔
+      进到 30~35° 也没关系；
     * 单趟越过 THETA_S_LIMIT_DEG(±35°) 只作废**这一趟**（电控在此介入削弱力矩，
       发出的力矩≠实际力矩），该速度继续跑、其余趟照常采；
     * 每个 step 的力矩都先按 TAU_*_MAX 硬限幅。
@@ -50,28 +49,23 @@ G2 只与位置有关，两趟扫过同一对称区间 ⇒ 一阶项精确抵消
 ``--hold-big`` 则用位置环把 θ_b 抱在会话开始的角度（小 yaw 加速时反作用力矩峰值
 约 0.5 N·m，会推动松开的 θ_b；主动抱死能压住它，代价是大 yaw 电机持续出力）。
 
-"平均值"到底代不代表这一段——窗口内的波动怎么卡
-------------------------------------------------
-辨识用的是**窗口均值** ⟨ω⟩、⟨Ts⟩，所以卡的是**均值标准误** σ/√n，不是逐样本 std。
-真机上报角速度的测量噪声底实测 ~0.026 rad/s（Sentry1 数据 >20 Hz 频段），比 tanh 的
-转折尺度 1/λ=0.01 rad/s 还大：低速时逐样本 std/|ω| 看着有 490%，那全是测量噪声。
-白噪声按 1/√n 平均掉，但 tanh 是凸的，E[tanh(λ(ω̄+ε))] ≠ tanh(λω̄)，这个 Jensen 偏差
-正、反两趟同号、**差分抵消不掉** ⇒ 卡 λ·σ/√n ≤ 0.25（≈2% 库仑列偏差，折算 fsc 1~2%）。
-真机噪声下每趟窗内样本 n≳120（≈1.2 s 匀速段）即可满足，``SS_CV_TIME=3 s`` 给的就是
-这个量级；力矩侧同理卡 σ_T/√n（实测 ~1e-3 N·m）。
+诊断量（只记录、不再当判据）
+--------------------------------
+每趟仍完整记录 ``dtheta_s_std / dtheta_s_sem / ts_std / ts_sem / ddtheta_s_mean /
+ddtheta_b_mean / dtheta_b_rms / theta_b_std_deg``，但**只有三项会剔除数据**：
+窗内样本数、力矩是否饱和、以及大 yaw 到底有没有被固定住（θ̇_b RMS 与 ⟨θ̈_b⟩）。
+前者是数据有效性，后两者是"大 yaw 没抱住"这个实验前提；窗口本身的稳定性不再筛——
+位置门控已经把不稳的两头切掉了。
 
-逐样本 std（``dtheta_s_std``、``ts_std``）照样完整记录，但只作诊断——真机噪声下它本来
-就大。**相关性**波动（换向余振、大 yaw 被拖动）不随 n 下降，由另外三道判据兜住：
-前半 vs 后半均值差、⟨θ̈_b⟩、θ̇_b RMS。任何一条不达标就丢这一趟，``--debug`` 打印原因。
+一个反直觉的坑：**KPV 会把速度噪声直接搬进力矩**（KPV·σ_v）。真机 σ_v≈0.026 rad/s，
+KPV 一大就是同量级的指令抖动；但 KPV/KIV 又不是越小越好——积分太小会**冲不破静摩擦**
+（实测把仿真摩擦调到实机量级后，KIV=0.9 时 ω=0.02 一趟 3.46 s 只转 0.07°）。
+所以现在：带宽用 ``SS_VEL_WN``（默认 12 rad/s，照顾真机 1~2 帧 I/O 延迟）自动整定，
+破静摩擦交给 ``SS_FRIC_FF`` 库仑摩擦前馈，两者互不牵制。
 
-一个反直觉的坑：**KPV 会把速度噪声直接搬进力矩**（KPV·σ_v）。KPV=1.0、σ_v=0.026 就是
-0.026 N·m 的指令抖动，和摩擦本身同量级，实测真机噪声档下所有趟都被力矩判据判废；
-KPV<0.3 又让换向余振衰减不完、高转速窗被余振污染（实测 ω≥1 rad/s 全灭）。默认 0.5 是
-实测折中（真机 J 下 ζ≈1、τ≈23 ms）。换惯量后按 ζ≈1 重算：``KPV ≈ 2·√(KIV·M22)``。
-
-仿真注意：默认 ``SIGMA_POS=0.01 rad``(0.57°) 是实测真机（1.1e-3 rad）的 9 倍，会把
-``SS_AMP_MIN_DEG=0.5°`` 的幅值控制直接冲垮；``SIGMA_VEL=0.05`` 也大于真机的 0.026。
-仿真验证请用 ``--no-noise``，或按真机噪声档 ``--sigma-vel 0.026 --sigma-pos 0.0011``。
+仿真注意：默认 ``SIGMA_POS=0.01 rad``(0.57°)、``SIGMA_VEL=0.05 rad/s`` 都比真机实测
+（1.1e-3 rad / 0.026 rad/s）大 2~9 倍。仿真验证请用 ``--no-noise``，或按真机噪声档
+``--sigma-vel 0.026 --sigma-pos 0.0011``。
 
 用法::
 
@@ -296,40 +290,47 @@ class SweepLoop:
                     a_std=float(np.std(accs)),
                     a_min=float(np.min(accs)), a_max=float(np.max(accs)))
 
-    # ---------------- 等速往返：一个速度幅值下跑 SS_TIME_BUDGET 秒 ----------------
-    def shuttle(self, omega_mag: float, amp: float):
-        """在 ±amp 之间等速往返，返回 (逐趟记录列表, 测量半宽, 是否触碰限位)。
+    # ---------------- 等速往返：固定 ±THETA_S_TARGET_DEG，跑整数个完整来回 ----------------
+    def shuttle(self, omega_mag: float):
+        """从 +A 出发、在 ±A 之间跑**整数个完整来回**，只在中间 ±SS_MEAS_HALF_DEG 采集。
 
-        参考速度**限斜坡**（SS_A_REF），不是从 +ω 一步跳到 −ω：
-        反作用力矩 ≈ M12·θ̈_s，参考跳变会让小 yaw 用满 1 N·m 去换向，大 yaw
-        被顶得乱晃（实测 sim 里 θ̇_b RMS 0.6 rad/s，窗口全废）。限斜坡后反作用
-        力矩有界，抱死的大 yaw 跟得上。
+        A = THETA_S_TARGET_DEG，所有速度同一个幅值（不再按速度缩放）。
 
-        反向点：|θ_s| + ω²/(2·A_REF) ≥ amp（正好是斜坡所需距离），因此
-        匀速段 = |θ_s| ≤ amp − ω²/(2·A_REF)，测量窗再取它中间的 SS_MEAS_FRAC。
-        幅值上限就是 THETA_S_TARGET_DEG(±30°)。
+        三条刻意的约束（都来自实测）：
+          * 起步/换向那一瞬间速度不稳、中间很长一段是稳的 ⇒ 测量窗固定取中间
+            ±SS_MEAS_HALF_DEG，起步与减速段天然落在窗外，因此**不需要任何稳定性判据**；
+          * 每个速度至少 SS_MIN_CYCLES 个完整来回，SS_TIME_BUDGET 不够就按"整来回"
+            为单位向上取整延长；
+          * **绝不在来回中途切速度**：只在换向点（一趟走完）结束本速度。
+
+        参考速度仍限斜坡（SS_A_REF，标定后取 0.5×a_max）：反作用力矩 ≈ M12·θ̈_s 有界，
+        抱死/人工固定的大 yaw 才跟得上；换向点 = |θ_s| + ω²/(2·SS_A_REF) ≥ A。
+
+        返回 (逐趟记录列表, 测量半宽, 越限趟数, |θ_s| 峰值, 计划来回数)。
         """
         env = self.env
         dt = env.dt
         a_ref = cfg.SS_A_REF
+        amp = float(np.radians(cfg.THETA_S_TARGET_DEG))
         hard = np.radians(cfg.THETA_S_LIMIT_DEG)
+        gate = float(np.radians(cfg.SS_MEAS_HALF_DEG))
         ramp = omega_mag ** 2 / (2.0 * a_ref)
-        cv_half = max(0.0, amp - ramp)
-        gate = cfg.SS_MEAS_FRAC * cv_half
-        seg, direction, segs, n_over, peak = 0, +1, [], 0, 0.0
-        v_ref, target = 0.0, omega_mag
-        armed = True          # 必须先回到带内、且确实朝当前方向运动，才允许下一次反向
-        # 反向判据用的位置估计：一阶低通 + 相位补偿（滤噪声但不引入滞后）
+        # 半趟耗时 = 走 2A 的匀速段 + 换向斜坡（参考 ±ω 之间切换耗 2ω/a_ref 秒）
+        t_half = 2.0 * amp / omega_mag + 2.0 * omega_mag / a_ref
+        n_cycles = max(int(cfg.SS_MIN_CYCLES),
+                       int(np.ceil(cfg.SS_TIME_BUDGET / (2.0 * t_half))))
+        n_half_target = 2 * n_cycles
+
+        seg, direction, segs, n_over, peak = 0, -1, [], 0, 0.0
+        v_ref, target = 0.0, -omega_mag        # 从 +A 起步，朝 −A 走
+        n_half = 0
+        armed = True                           # 回带内且确实朝该方向运动，才允许下一次反向
         a_rev = cfg.SS_REV_LPF_ALPHA
         tau_lag = (1.0 - a_rev) / a_rev * dt
         th_f, dth_f = float(env.state().theta_s), float(env.state().dtheta_s)
         buf = dict(seg=[], sign=[], th_b=[], dth_b=[], th_s=[], dth_s=[], Ts=[], Tb=[],
                    v_ref=[])
-        n_budget = int(round(cfg.SS_TIME_BUDGET / dt))
-        # 当前趟是否越过 THETA_S_LIMIT_DEG：越过的**这一趟**整趟作废（电控在此介入
-        # 削弱力矩，发出的力矩≠实际力矩），但**不丢弃这个速度**——其余趟照常采，
-        # 速度继续跑（用户明确要求：超限只是一次性事件，丢那一条就行）。
-        bad = False
+        bad = False                            # 本趟越过 THETA_S_LIMIT_DEG ⇒ 只作废这一趟
 
         def _flush():
             nonlocal bad
@@ -339,29 +340,34 @@ class SweepLoop:
                 buf[k] = []
             bad = False
 
+        n_budget = int(round((n_half_target + 2) * t_half / dt)) + 100
         for _ in range(n_budget):
             st, f = self._measure()
             th_f += a_rev * (st.theta_s - th_f)
             dth_f += a_rev * (st.dtheta_s - dth_f)
-            th = th_f + dth_f * tau_lag          # 相位补偿后的位置（用于反向判据）
-            # ---- 参考速度斜坡（限加速度 ⇒ 反作用力矩有界）----
+            th = th_f + dth_f * tau_lag        # 相位补偿后的位置（只用于反向判据）
             v_prev = v_ref
             v_ref += float(np.clip(target - v_ref, -a_ref * dt, a_ref * dt))
             a_dem = (v_ref - v_prev) / dt
-            # ---- 反向：实测位置 + 斜坡刹车距离（提前 ramp 触发，峰值才停在 amp；
-            #      滞环：回带内且确实朝该方向运动才重新武装，抗位置噪声来回翻转）----
+            # ---- 换向（到换向点就结束这一趟；到达计划趟数就在换向点收工，绝不半路停）----
             if armed and direction > 0 and th + ramp >= amp:
                 _flush()
+                n_half += 1
+                if n_half >= n_half_target:
+                    break
                 direction, seg, target, armed = -1, seg + 1, -omega_mag, False
             elif armed and direction < 0 and th - ramp <= -amp:
                 _flush()
+                n_half += 1
+                if n_half >= n_half_target:
+                    break
                 direction, seg, target, armed = +1, seg + 1, omega_mag, False
             if not armed and abs(th) <= 0.4 * amp and direction * dth_f > 0.0:
                 armed = True
             peak = max(peak, abs(st.theta_s))
             if abs(st.theta_s) > hard and not bad:
-                bad = True                       # 只作废这一趟，不 break、不丢速度
-                n_over += 1                      # 按**趟**计数（bad 只在翻转时加一次）
+                bad = True                     # 只作废这一趟，不中断速度
+                n_over += 1
             Tb, Ts = self._torques(v_ref, f, a_dem)
             buf["seg"].append(seg); buf["sign"].append(direction)
             buf["th_b"].append(st.theta_b); buf["dth_b"].append(st.dtheta_b)
@@ -369,66 +375,44 @@ class SweepLoop:
             buf["Ts"].append(Ts); buf["Tb"].append(Tb); buf["v_ref"].append(v_ref)
             env.step(Tb, Ts)
         _flush()
-        return segs, gate, n_over, peak
+        # 收尾：把参考速度收到 0，别把残余速度留给下一个速度的归位
+        for _ in range(int(round(1.0 / dt))):
+            _st, f = self._measure()
+            v_prev = v_ref
+            v_ref += float(np.clip(0.0 - v_ref, -a_ref * dt, a_ref * dt))
+            if abs(f[3]) < 0.05 and abs(v_ref) < 1e-9:
+                break
+            Tb, Ts = self._torques(v_ref, f, (v_ref - v_prev) / dt)
+            env.step(Tb, Ts)
+        return segs, gate, n_over, peak, n_cycles
 
 
 # ===========================================================================
 # 逐趟验收 + 统计量
 # ===========================================================================
-def pass_row(seg: dict, gate: float, omega_mag: float, env, pair_id: int,
-             pass_index: int, amp: float, hold_big: bool, tau_s_max: float):
-    """把一段（一个方向的一趟）压缩成一行；返回 (行, 剔除原因)；合格时原因为 ""。
+def pass_row(seg: dict, gate: float, env, pair_id: int, pass_index: int,
+             amp: float, hold_big: bool, tau_s_max: float):
+    """把一趟压成一行；返回 (行, 剔除原因)，合格时原因为 ""。
 
-    验收（全部通过才留下）：
-      * 只取 |θ_s| ≤ gate 的样本（中间匀速段；以 0 为中心对称 ⇒ 重力一阶抵消）。
-        每趟都必须是从一个刹车点横穿到另一个的**完整趟**（θ_s 在窗内从 −gate
-        穿到 +gate），否则半趟会把起步加速混进均值；
-      * 稳态判据：前半均值 vs 后半均值 |v1−v2| ≤ 4·(σ_v/√n + frac·ω + abs)
-        （同 gen_friction_sweep 的判据，窗口改成位置门控）；
-      * 力矩未饱和；平均速度不能远低于目标；
-      * θ̇_b / θ̈_b RMS 不超限（大 yaw 没固定住就丢）。
+    只保留"**数据是否有效**"的检查，稳定性判据全部删除（起步/减速段已由位置门控
+    天然排除，中间是稳的，再筛只会误杀）：
+      * 窗内至少有 2 个样本（否则统计量无意义）；
+      * 力矩未饱和（饱和时发出的力矩≠实际力矩）；
+      * θ̇_b RMS、|⟨θ̈_b⟩| 不超限——这两个是"大 yaw 到底有没有被固定住"，不是窗口稳定性。
     """
     th_s, dth_s = seg["th_s"], seg["dth_s"]
-    # 必须是**完整的一趟**：θ_s 在窗内从 −gate 穿到 +gate（或反向）。
-    # 否则（会话第一趟往往从 θ_s=0 起步）窗只覆盖半侧，起步加速让该趟 ⟨θ̈_s⟩ 明显
-    # 偏离 0，混进正/反均值里把 ΔTs 带偏（实测未加此判据时 ω=1 处偏差 ~24%）。
-    if not (th_s.min() < -gate and th_s.max() > gate):
-        return None, f"非完整趟（θ_s∈[{np.degrees(th_s.min()):.2f}, {np.degrees(th_s.max()):.2f}]° 未横穿 ±{np.degrees(gate):.2f}°）"
     sel = np.abs(th_s) <= gate
     n = int(sel.sum())
-    if n < 5:
-        return None, f"窗内样本 {n} < 5"
-    v = dth_s[sel]
-    h = n // 2
-    tol = cfg.SS_VEL_TOL_FRAC * omega_mag + cfg.SS_VEL_TOL_ABS
-    se = max(env.sigma[1], 1e-6) / np.sqrt(max(h, 1)) + tol
-    if abs(v[:h].mean() - v[h:].mean()) > 4.0 * se:
-        return None, (f"非稳态 |v1-v2|={abs(v[:h].mean()-v[h:].mean()):.3f} "
-                      f"> 4·se={4*se:.3f}")
+    if n < 2:
+        return None, f"窗内样本 {n} < 2"
     Ts = seg["Ts"][sel]
     if np.abs(Ts).max() >= 0.999 * tau_s_max:
         return None, "力矩饱和"
-    omega = float(v.mean())
-    if abs(omega) < 0.2 * omega_mag:
-        return None, f"速度太低 |ω|={abs(omega):.4f} < 0.2·{omega_mag:g}"
-    # 窗口内波动：卡**均值标准误**（辨识用的是均值）；逐样本 std 只记录
-    v_sem = float(v.std()) / np.sqrt(n)
-    v_lim = max(cfg.SS_DTHETA_S_SEM_FRAC * abs(omega), cfg.SS_DTHETA_S_SEM_ABS)
-    if v_sem > v_lim:
-        return None, (f"速度均值标准误 {v_sem:.5f} > {v_lim:.5f} rad/s"
-                      f"（λ·σ/√n={cfg.LAMBDA*v_sem:.2f}，n={n}）")
-    t_sem = float(Ts.std()) / np.sqrt(n)
-    t_lim = max(cfg.SS_TS_SEM_FRAC * abs(float(Ts.mean())), cfg.SS_TS_SEM_ABS)
-    if t_sem > t_lim:
-        return None, (f"力矩均值标准误 {t_sem:.5f} > {t_lim:.5f} N·m"
-                      f"（Ts std={Ts.std():.4f}, n={n}）")
     dth_b = seg["dth_b"][sel]
     if float(np.sqrt(np.mean(dth_b ** 2))) > cfg.SS_DTHETA_B_RMS_MAX:
         return None, (f"θ̇_b RMS={np.sqrt(np.mean(dth_b**2)):.3f} "
                       f"> {cfg.SS_DTHETA_B_RMS_MAX:g}")
     dd_b = np.diff(dth_b) / env.dt if n > 1 else np.zeros(1)
-    # 卡**平均**角加速度（进 Ts 的是 M12·⟨θ̈_b⟩，且会被辨识端扣掉）；
-    # 逐样本 RMS 是带噪速度差分的噪声底，只在下面作为诊断记录。
     ddb_noise = float(np.sqrt(2.0) * max(env.sigma[1], 1e-9) / max(n - 1, 1) / env.dt)
     if abs(float(dd_b.mean())) > max(cfg.SS_DDTHETA_B_RATE_MAX, 5.0 * ddb_noise):
         return None, (f"大 yaw 平均角加速度 {abs(dd_b.mean()):.2f} "
@@ -436,12 +420,13 @@ def pass_row(seg: dict, gate: float, omega_mag: float, env, pair_id: int,
 
     th_b = seg["th_b"][sel]
     th = th_s[sel]
+    v = dth_s[sel]
+    omega = float(v.mean())
     psi_b, psi_s = th_b, th_b + th                     # 基座恒为 0
-    dd = np.diff(dth_s[sel]) / env.dt if n > 1 else np.zeros(1)
+    dd = np.diff(v) / env.dt if n > 1 else np.zeros(1)
     return dict(
-        omega_ref=float(seg["sign"][0] * omega_mag), omega=omega,
-        # 与大 yaw 脚本一致：对**窗口平均速度**取 tanh（速度测量有噪声时
-        # mean(tanh(λv)) 会被 tanh 的非线性严重压缩，甚至均值趋于 0）
+        omega_ref=float(np.mean(seg["v_ref"][sel])),   # 窗口内的参考速度
+        omega=omega,
         tanh_omega=float(np.tanh(cfg.LAMBDA * omega)),
         tanh_omega_mean=float(np.tanh(cfg.LAMBDA * v).mean()),
         ts_mean=float(Ts.mean()), ts_std=float(Ts.std()),
@@ -470,23 +455,6 @@ def pass_row(seg: dict, gate: float, omega_mag: float, env, pair_id: int,
         amp_deg=float(np.degrees(amp)), gate_deg=float(np.degrees(gate)),
         hold_big=np.float64(1.0 if hold_big else 0.0),
     ), ""
-
-
-# ===========================================================================
-# 速度 → 幅值规划
-# ===========================================================================
-def plan_amp(omega_mag: float) -> tuple[float, float, float]:
-    """给定 |ω| → (往返幅值 A, 匀速对称半宽 cv_half, 测量窗半宽 gate) [rad]。
-
-    A = clip(ω·SS_CV_TIME/2 + 斜坡距离, SS_AMP_MIN_DEG, THETA_S_TARGET_DEG−余量)
-    —— 斜坡距离 ω²/(2·SS_A_REF) 必须算进去，否则高速时幅值全被换向斜坡吃掉。
-    """
-    a_cap = np.radians(cfg.THETA_S_TARGET_DEG)      # 主动控制范围就是 ±30°，不额外缩
-    a_min = np.radians(cfg.SS_AMP_MIN_DEG)
-    ramp = omega_mag ** 2 / (2.0 * cfg.SS_A_REF)
-    amp = float(np.clip(omega_mag * cfg.SS_CV_TIME / 2.0 + ramp, a_min, a_cap))
-    cv_half = max(0.0, amp - ramp)
-    return amp, cv_half, cfg.SS_MEAS_FRAC * cv_half
 
 
 # ===========================================================================
@@ -528,20 +496,14 @@ def main() -> int:
                     help="关掉关节 s 的重力前馈 G2（做对照用；差分法本身不依赖它）")
     ap.add_argument("--ss-a-ref", type=float, default=cfg.SS_A_REF,
                     help="参考速度斜坡角加速度 [rad/s²]（越小反作用力矩越小、匀速段越短）")
-    ap.add_argument("--ss-cv-time", type=float, default=cfg.SS_CV_TIME,
-                    help="每个方向匀速段的目标时长 [s]（决定往返幅值）")
     ap.add_argument("--ss-time-budget", type=float, default=cfg.SS_TIME_BUDGET,
-                    help="每个速度的总时间预算 [s]（决定往返趟数）")
-    ap.add_argument("--ss-amp-min-deg", type=float, default=cfg.SS_AMP_MIN_DEG)
-    ap.add_argument("--ss-min-samples", type=int, default=cfg.SS_MIN_SAMPLES)
-    ap.add_argument("--ss-vel-tol-frac", type=float, default=cfg.SS_VEL_TOL_FRAC)
-    ap.add_argument("--ss-vel-tol-abs", type=float, default=cfg.SS_VEL_TOL_ABS)
+                    help="每速度期望时长 [s]；不够就按整来回为单位往上加")
+    ap.add_argument("--ss-min-cycles", type=int, default=cfg.SS_MIN_CYCLES,
+                    help="每个速度至少跑几个完整来回（默认 3）")
+    ap.add_argument("--ss-meas-half-deg", type=float, default=cfg.SS_MEAS_HALF_DEG,
+                    help="采集窗口：只在中间 ±该角度内取数据 [°]（默认 10）")
     ap.add_argument("--ss-dtheta-b-rms-max", type=float, default=cfg.SS_DTHETA_B_RMS_MAX)
     ap.add_argument("--ss-ddtheta-b-rate-max", type=float, default=cfg.SS_DDTHETA_B_RATE_MAX)
-    ap.add_argument("--ss-dtheta-s-sem-frac", type=float, default=cfg.SS_DTHETA_S_SEM_FRAC)
-    ap.add_argument("--ss-dtheta-s-sem-abs", type=float, default=cfg.SS_DTHETA_S_SEM_ABS)
-    ap.add_argument("--ss-ts-sem-frac", type=float, default=cfg.SS_TS_SEM_FRAC)
-    ap.add_argument("--ss-ts-sem-abs", type=float, default=cfg.SS_TS_SEM_ABS)
     ap.add_argument("--ss-rev-lpf-alpha", type=float, default=cfg.SS_REV_LPF_ALPHA)
     ap.add_argument("--goto-kp", type=float, default=cfg.SS_GOTO_KP,
                     help="归位位置 PID 的 Kp [N·m/rad]")
@@ -576,18 +538,11 @@ def main() -> int:
 
     # 内部统一读 cfg，命令行覆盖就直接改这里的模块级配置
     cfg.SS_A_REF = args.ss_a_ref
-    cfg.SS_CV_TIME = args.ss_cv_time
     cfg.SS_TIME_BUDGET = args.ss_time_budget
-    cfg.SS_AMP_MIN_DEG = args.ss_amp_min_deg
-    cfg.SS_MIN_SAMPLES = args.ss_min_samples
-    cfg.SS_VEL_TOL_FRAC = args.ss_vel_tol_frac
-    cfg.SS_VEL_TOL_ABS = args.ss_vel_tol_abs
     cfg.SS_DTHETA_B_RMS_MAX = args.ss_dtheta_b_rms_max
     cfg.SS_DDTHETA_B_RATE_MAX = args.ss_ddtheta_b_rate_max
-    cfg.SS_DTHETA_S_SEM_FRAC = args.ss_dtheta_s_sem_frac
-    cfg.SS_DTHETA_S_SEM_ABS = args.ss_dtheta_s_sem_abs
-    cfg.SS_TS_SEM_FRAC = args.ss_ts_sem_frac
-    cfg.SS_TS_SEM_ABS = args.ss_ts_sem_abs
+    cfg.SS_MIN_CYCLES = args.ss_min_cycles
+    cfg.SS_MEAS_HALF_DEG = args.ss_meas_half_deg
     cfg.SS_REV_LPF_ALPHA = args.ss_rev_lpf_alpha
     cfg.SS_GOTO_KP = args.goto_kp
     cfg.SS_GOTO_KI = args.goto_ki
@@ -628,11 +583,10 @@ def main() -> int:
         print("    ⚠ 全程大 yaw 力矩为 0，请先用机械/人工把大 yaw **完全固定**；"
               "θ̇_b/θ̈_b 超限的趟会被自动剔除")
     print(f"  速度表 [rad/s]: {omegas}")
-    print(f"  幅值 A(ω)=clip(ω·{cfg.SS_CV_TIME:g}/2 + ω²/(2·a_ref), "
-          f"{cfg.SS_AMP_MIN_DEG:g}°, "
-          f"{cfg.THETA_S_TARGET_DEG:g}°)"
-          f"   每速度 {cfg.SS_TIME_BUDGET:g}s  主动控制 {cfg.THETA_S_TARGET_DEG:g}°"
-          f"（单趟越过 {cfg.THETA_S_LIMIT_DEG:g}° 只作废该趟）")
+    print(f"  幅值恒为 ±{cfg.THETA_S_TARGET_DEG:g}°（每个速度都从 +A 起步）"
+          f"   采集窗 = 中间 ±{cfg.SS_MEAS_HALF_DEG:g}°")
+    print(f"  每速度至少 {cfg.SS_MIN_CYCLES} 个完整来回；期望时长 {cfg.SS_TIME_BUDGET:g}s，"
+          f"不够按整来回延长；越过 {cfg.THETA_S_LIMIT_DEG:g}° 只作废该趟")
 
     if args.real:
         env = RealEnv(
@@ -691,22 +645,26 @@ def main() -> int:
                       f"（标定失败往往意味着力矩方向/标定有问题，先查那个）")
                 cfg.SS_A_REF = safe
         for pair_id, w in enumerate(omegas):
-            amp, _cv_half, gate = plan_amp(w)
-            est = 2.0 * gate / (w * env.dt)          # 单趟预估样本数
-            if est < cfg.SS_MIN_SAMPLES:
-                print(f"  ω={w:+.4f}: 跳过——行程内匀速窗太小"
-                      f"（A={np.degrees(amp):.2f}°, 预估 {est:.1f} 样本 < {cfg.SS_MIN_SAMPLES}）")
+            amp = float(np.radians(cfg.THETA_S_TARGET_DEG))
+            gate_half = float(np.radians(cfg.SS_MEAS_HALF_DEG))
+            # 物理可行性：换向刹车距离 ω²/(2a_ref) 必须让"匀速段"还容得下采集窗，
+            # 即 ramp ≤ amp − gate。否则换向判据 |θ|+ramp ≥ amp 在整个行程内恒成立，
+            # 来回反复翻转直接把关节甩飞（实测 ω=6 冲到 3940°）。
+            a_min = w * w / (2.0 * max(amp - gate_half, 1e-9))
+            if a_min > cfg.SS_A_REF:
+                print(f"  ω={w:+.4f}: 跳过——±{cfg.THETA_S_TARGET_DEG:g}° 内做不出这个速度："
+                      f"换向刹车距离 {np.degrees(w*w/(2*cfg.SS_A_REF)):.1f}° 吃掉了 "
+                      f"±{cfg.SS_MEAS_HALF_DEG:g}° 采集窗。需要 --ss-a-ref ≥ {a_min:.1f}"
+                      f"（当前 {cfg.SS_A_REF:.1f}）")
                 continue
-            # 严格归位到 −A（不接受"带内即成功"）：否则每换一个速度，第一趟会从
-            # 上个速度留下的位置/速度出发，可能在幅值边界外继续冲，峰值白白多出
-            # ω²/(2a)（实测 ω=3 首趟冲到 35.5°）。从静止的 −A 起步，几何才一致。
-            if not loop.goto(-amp):
-                print(f"  ω={w:+.4f}: 归位未达容差（仍在 {cfg.SS_REPOS_MAX_STEPS} 步内没到位），"
-                      f"首趟可能被当作非完整趟丢掉")
-            segs, gate, n_over, peak = loop.shuttle(w, amp)
+            # 每个速度都从 +A 静止起步（严格归位），保证每趟几何一致
+            if not loop.goto(amp):
+                print(f"  ω={w:+.4f}: 归位到 +{cfg.THETA_S_TARGET_DEG:g}° 未在 "
+                      f"{cfg.SS_REPOS_MAX_STEPS} 步内到位，仍继续采")
+            segs, gate, n_over, peak, n_cyc = loop.shuttle(w)
             got = 0
             for i, seg in enumerate(segs):
-                r, why = pass_row(seg, gate, w, env, pair_id, i, amp, args.hold_big,
+                r, why = pass_row(seg, gate, env, pair_id, i, amp, args.hold_big,
                                   tau_s_max)
                 if r is None:
                     if args.debug:
@@ -714,20 +672,16 @@ def main() -> int:
                     continue
                 got += 1
                 rows.append(r)
-            tag = ""
-            if got < cfg.SS_MIN_PASS:
-                tag = f"  ← 不足 {cfg.SS_MIN_PASS} 趟，建议放宽容差/改 --hold-big/降速"
+            tag = "" if got else "  ← 这一档没留下数据" if False else ""
+            if got < 2:
                 warned.append(w)
-            print(f"  ω={w:+.4f}: A={np.degrees(amp):.2f}°  窗±{np.degrees(gate):.2f}°  "
-                  f"{got}/{len(segs)} 趟合格  |θ_s|峰 {np.degrees(peak):.1f}°{tag}")
+                tag = "  ← 合格趟不足 2"
+            print(f"  ω={w:+.4f}: {n_cyc} 个来回（{len(segs)} 趟）  窗±"
+                  f"{cfg.SS_MEAS_HALF_DEG:g}°  {got} 趟合格  "
+                  f"|θ_s|峰 {np.degrees(peak):.1f}°{tag}")
             if n_over:
                 print(f"          越过 {cfg.THETA_S_LIMIT_DEG:g}° 的 {n_over} 趟已作废"
                       f"（该速度其余趟照常保留，未中断）")
-            elif np.degrees(peak) > cfg.THETA_S_TARGET_DEG + 1.0:
-                print(f"          换向峰值 {np.degrees(peak):.1f}° 超过控制目标 "
-                      f"{cfg.THETA_S_TARGET_DEG:g}°（离 {cfg.THETA_S_LIMIT_DEG:g}° 还有 "
-                      f"{cfg.THETA_S_LIMIT_DEG - np.degrees(peak):.1f}°）：想压低就调小 "
-                      f"--ss-a-ref({cfg.SS_A_REF:g}) 或 --ss-cv-time")
         if args.real:
             print(f"  帧统计: frames={env.frame_count} late={env.late_count} "
                   f"平均周期={env.mean_period*1e3:.3f}ms 最大={env.max_period*1e3:.3f}ms")
