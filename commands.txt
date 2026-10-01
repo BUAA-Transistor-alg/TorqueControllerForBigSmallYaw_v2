@@ -2,6 +2,8 @@ python3 python/generate_id_dataset.py --real --no-gravity-ff --category Sentry1 
 
 python3 python/gen_friction_sweep.py --real --fs-vel-tol-frac 0.2 --fs-vel-tol-abs 0.2 --category friction_Sentry1
 
+python3 python/fit_friction_s.py --sweep data/friction_s_Sentry1 --category Sentry1 --drop-first 0 --drop-last 2
+
 python3 python/gen_friction_sweep_s.py --real --ss-a-ref 200 --category friction_s_Sentry1 --no-gravity-ff
 
 python3 python/identify_params.py --category Sentry1 \

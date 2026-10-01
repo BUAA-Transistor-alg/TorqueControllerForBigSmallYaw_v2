@@ -942,7 +942,11 @@ def _M12_of(p_dyn: dict, theta_s: float) -> float:
 
 
 def fit_friction_sweep_s(sweep_path, p_dyn: dict | None = None,
-                         dyn_correct: bool = True) -> tuple[float, float, dict]:
+                         dyn_correct: bool = True,
+                         drop_first: int = 0, drop_last: int = 0,
+                         vmin: float | None = None, vmax: float | None = None,
+                         verbose: bool = False,
+                         list_only: bool = False) -> tuple[float, float, dict]:
     """用小 yaw（关节 s）匀速往返数据独立拟合 (fsc, fsv)。
 
     稳态关系（θ̈_b≈0、θ̈_s≈0、θ̇_b≈0、基座静止，见 gen_friction_sweep_s.py）：
@@ -958,8 +962,14 @@ def fit_friction_sweep_s(sweep_path, p_dyn: dict | None = None,
     只靠位置环抱、M12 又大，不扣会偏 100%+（实测）。ΔC2 = −ms·h'·θ̇_b² 未扣
     （需要逐样本的 h'·θ̇_b²，采集未记录；θ̇_b 已被阈值限制在很小的范围）。
 
+    速度点的取舍（按数据里**实际存在的 |ω|** 从小到大排序后）：
+      * ``drop_first``/``drop_last``：丢掉最慢的 n 个 / 最快的 m 个速度点；
+      * ``vmin``/``vmax``：只保留 |ω| 落在 [vmin, vmax] 内的速度点；
+      两者可叠加。``verbose=True`` 会先把数据里全部 |ω| 和实际使用的 |ω| 打出来。
+
     sweep_path 可以是单个 npz 也可以是类别目录（合并其中全部 sweep_*.npz）。
-    返回 (fsc, fsv, 诊断信息)；诊断里带"纯差分（完全不依赖已辨识参数）"的结果。
+    返回 (fsc, fsv, 诊断信息)；诊断里带"纯差分（完全不依赖已辨识参数）"的结果，
+    以及 ``all_omega`` / ``used_omega`` / ``dropped_omega`` 三个列表。
     """
     d, sweep_files = _load_sweeps(sweep_path)
     _select_joint(d, want_s=True)
@@ -990,6 +1000,47 @@ def fit_friction_sweep_s(sweep_path, p_dyn: dict | None = None,
                     d_b=mp(pp, "theta_b_mean_deg") - mp(pm, "theta_b_mean_deg"),
                     omega=0.5 * abs(d_om), n_p=len(pp), n_m=len(pm))
 
+    def _fmt(vs):
+        return "  ".join(f"{x:.4g}" for x in vs) if len(vs) else "（无）"
+
+    def select_speeds(pairs_in: list[dict]) -> tuple[list[dict], dict]:
+        """按 |ω| 从小到大排序后做范围/首尾剔除，并返回打印用的信息。"""
+        ordered = sorted(pairs_in, key=lambda q: q["omega"])
+        all_w = [q["omega"] for q in ordered]
+        keep = np.ones(len(ordered), dtype=bool)
+        if drop_first > 0:
+            keep[:int(drop_first)] = False
+        if drop_last > 0:
+            keep[len(ordered) - int(drop_last):] = False
+        if vmin is not None:
+            keep &= np.array([q["omega"] >= vmin for q in ordered])
+        if vmax is not None:
+            keep &= np.array([q["omega"] <= vmax for q in ordered])
+        used = [q for q, k in zip(ordered, keep) if k]
+        sel = dict(all_omega=all_w, used_omega=[q["omega"] for q in used],
+                   dropped_omega=[q["omega"] for q, k in zip(ordered, keep) if not k],
+                   keep=[int(k) for k in keep])
+        if verbose:
+            how = []
+            if drop_first:
+                how.append(f"丢最慢 {drop_first} 个")
+            if drop_last:
+                how.append(f"丢最快 {drop_last} 个")
+            if vmin is not None:
+                how.append(f"|ω| ≥ {vmin:g}")
+            if vmax is not None:
+                how.append(f"|ω| ≤ {vmax:g}")
+            print(f"  数据里的全部 |ω|（{len(all_w)} 个）: {_fmt(all_w)}")
+            print(f"  取舍规则: {' + '.join(how) if how else '不筛，全用'}")
+            print(f"  实际使用（{len(sel['used_omega'])} 个）: {_fmt(sel['used_omega'])}")
+            if sel["dropped_omega"]:
+                print(f"  剔除（{len(sel['dropped_omega'])} 个）: {_fmt(sel['dropped_omega'])}")
+        if len(used) < 2:
+            raise ValueError(
+                f"筛选后只剩 {len(used)} 个速度点（全部 {len(all_w)} 个：{_fmt(all_w)}），"
+                f"至少需要 2 个才能拟合 fsc/fsv")
+        return used, sel
+
     dirn = np.sign(np.asarray(d["direction"])) if "direction" in d else np.zeros(n)
     pid = np.asarray(d["pair_id"]).astype(int) if "pair_id" in d else np.zeros(n, dtype=int)
     has_pair = bool((dirn > 0).any() and (dirn < 0).any())
@@ -1001,6 +1052,16 @@ def fit_friction_sweep_s(sweep_path, p_dyn: dict | None = None,
             pm = [rows[i] for i in idx if dirn[i] < 0]
             if pp and pm:
                 pairs.append(pair_delta(pp, pm))
+
+    sel_info = dict(all_omega=[], used_omega=[], dropped_omega=[], keep=[])
+    if pairs:
+        pairs, sel_info = select_speeds(pairs)
+
+    if pairs and list_only:                    # 只列速度点、不拟合（--list）
+        return float("nan"), float("nan"), dict(
+            n=n, pairs=len(pairs), files=len(sweep_files), names=sweep_files,
+            mode="list", fsc_raw=float("nan"), fsv_raw=float("nan"),
+            residual=float("nan"), **sel_info)
 
     if not pairs:
         # 没有配对信息（旧数据）：退回"直接用 p_dyn 扣 G2"的单趟拟合
@@ -1016,7 +1077,8 @@ def fit_friction_sweep_s(sweep_path, p_dyn: dict | None = None,
                     mode="single", fsc_raw=float(fsc), fsv_raw=float(fsv),
                     omega_abs_min=float(np.abs(A[:, 0]).min()),
                     omega_abs_max=float(np.abs(A[:, 0]).max()),
-                    residual=float(np.std(y - A @ np.array([fsv, fsc]))))
+                    residual=float(np.std(y - A @ np.array([fsv, fsc]))),
+                    **sel_info)
         return float(fsc), float(fsv), info
 
     A = np.array([[q["d_omega"], q["d_tanh"]] for q in pairs])
@@ -1042,7 +1104,7 @@ def fit_friction_sweep_s(sweep_path, p_dyn: dict | None = None,
     resid = y - A @ np.array([fsv, fsc])
     info = dict(n=n, pairs=len(pairs), files=len(sweep_files), names=sweep_files,
                 mode="diff", fsc_raw=float(fsc_raw), fsv_raw=float(fsv_raw),
-                dropped=dropped, kept=int(len(y)),
+                dropped=dropped, kept=int(len(y)), **sel_info,
                 residual=float(np.std(resid)),
                 cond=float(np.linalg.cond(A)),
                 omega_abs_min=float(min(q["omega"] for q in pairs)),
@@ -1367,6 +1429,14 @@ def main() -> int:
     ap.add_argument("--no-friction-sweep-s", dest="use_friction_sweep_s",
                     action="store_false",
                     help="不用小 yaw 数据，fsc/fsv 直接取大 yaw 的一半（旧行为）")
+    ap.add_argument("--fs-s-vmin", type=float, default=None,
+                    help="小 yaw 独立拟合时，只用 |ω| ≥ 该值的数据点 [rad/s]")
+    ap.add_argument("--fs-s-vmax", type=float, default=None,
+                    help="小 yaw 独立拟合时，只用 |ω| ≤ 该值的数据点 [rad/s]")
+    ap.add_argument("--fs-s-drop-first", type=int, default=0,
+                    help="小 yaw 独立拟合时丢掉最慢的 n 个速度点（按数据里实际存在的 |ω| 排序）")
+    ap.add_argument("--fs-s-drop-last", type=int, default=0,
+                    help="小 yaw 独立拟合时丢掉最快的 m 个速度点")
     ap.add_argument("--fs-s-no-dyn", dest="fs_s_dyn", action="store_false",
                     help="小 yaw 差分拟合**不扣** M22·Δθ̈_s + M12·Δθ̈_b + ΔG2，"
                          "完全不依赖已辨识参数（纯差分；大 yaw 被机械抱死时两者几乎无差）")
@@ -1532,8 +1602,10 @@ def main() -> int:
                     p_dyn, _ = algebraic_init(cases, nominal=tuple(args.mass_nominal),
                                               friction=(0.0, 0.0, 0.0, 0.0), known=known)
                 try:
-                    fsc2, fsv2, sinfo = fit_friction_sweep_s(s_path, p_dyn,
-                                                             dyn_correct=args.fs_s_dyn)
+                    fsc2, fsv2, sinfo = fit_friction_sweep_s(
+                        s_path, p_dyn, dyn_correct=args.fs_s_dyn,
+                        drop_first=args.fs_s_drop_first, drop_last=args.fs_s_drop_last,
+                        vmin=args.fs_s_vmin, vmax=args.fs_s_vmax, verbose=True)
                 except ValueError as e:
                     print(f"（小 yaw 数据 {s_path} 不可用：{e}）")
                 else:
