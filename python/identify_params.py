@@ -64,12 +64,33 @@ batch 调度（按需求实现）：
     * (Pbx,Pby)、(Psx,Psy)、(Dx,Dy) 在 theta 里是 (log r, phi)，可以**只冻结其中
       一个**：写回时用"冻结分量的固定值 + 另一分量的当前值"重建 theta。
 
+外部已知参数（--known-params）：
+    * ``--known-params "Dx=0.05,Dy=0.30"`` 把量得到的机械尺寸当已知量：代数最小二乘
+      里 A+B = Dx·P + Dy·Q2、C−D = Dy·P − Dx·Q2 被解析折进 P、Q2 两列，
+      设计矩阵 12 列 → 10 列（cond 79.6 → 58.7，P/Q2 的相对标准误改善 2~5 倍），
+      训练时默认**全程冻结**在给定值上。
+    * 也可给 ``mb``/``ms``（两个不可辨识标度）：跳过 (mb,ms) 网格搜索，把平坦谷
+      彻底固定；``Dx,Dy`` 与 ``mb,ms`` 都固定后问题是 10 维、满秩、无零空间。
+    * 摩擦 ``fbc/fbv/fsc/fsv`` 同样可以给：该列搬到右端丢掉，已知值优先于
+      ``--friction-sweep`` 的结果。
+    * ``Pbx/Pby/Psx/Psy/Ib/Is`` **不能**单独给定（它们只以 mb·Pbx、ms·Dx、
+      Is+ms·Ps² 这类聚合形式进入方程），给了解析器会直接报错并说明原因。
+    * 已知参数默认全程冻结；想让某个值只当初值、训练时放开，写
+      ``--freeze-params "Dx:0"``（不冻结）或 ``"Dx:2000"``（先冻后放）。
+    * **注意精度**：固定后拟合无法再纠正它，测量误差直接变成不可消除的偏差。
+      本仓库数据实测（噪声底 2.6e-3）：Dx/Dy 偏差 0.1mm → loss 1.00×底；
+      0.3mm → ~1.1×；1mm → 1.4~2.2×；3mm → 3.7~11.7×。亚毫米级固定才划算。
+
 用法（在仓库根执行）::
 
     python3 python/identify_params.py                       # 代数初值 + 课程 + 10000 步
     python3 python/identify_params.py --init random --init-orders 2,3   # 随机初值对照
     python3 python/identify_params.py \
         --freeze-params "fbc:3000,fbv:3000,Dx"              # 逐参数冻结（Dx 全程冻结）
+    python3 python/identify_params.py \
+        --known-params "Dx=0.05,Dy=0.30"                    # 机械尺寸已知，10 列回归
+    python3 python/identify_params.py \
+        --known-params "Dx=0.05,Dy=0.30,mb=1.5,ms=0.4"      # 连同质量标度一起固定
 """
 
 from __future__ import annotations
@@ -379,6 +400,10 @@ def parse_freeze_params(spec: str) -> dict[str, float]:
     * ``name:n``：前 n 个**全局** Adam step 内冻结，第 n 步起参与优化。
       为了能在长命令里临时关掉某一项，``n<=0`` 视为不冻结。
     * ``name``（省略步数）：整个训练全程冻结，从不解冻（记作 inf）。
+
+    ``n<=0`` 的条目会以 0 保留在返回值里（``frozen_now`` 自然永不命中它）：
+    ``--known-params`` 需要区分"表里没提到这个参数"（known 参数默认全程冻结）
+    与"明确写了 0 = 不冻结"（此时只借用的已知值当初值，训练时放开）。
     """
     out: dict[str, float] = {}
     for part in spec.replace(";", ",").split(","):
@@ -388,9 +413,7 @@ def parse_freeze_params(spec: str) -> dict[str, float]:
         if ":" in part:
             name, n_s = (s.strip() for s in part.split(":", 1))
             n = int(float(n_s))
-            if n <= 0:              # 0 / 负数 = 不冻结
-                continue
-            out[name] = n
+            out[name] = float(max(0, n))    # 0 / 负数 = 不冻结（保留条目，见 docstring）
         else:
             out[part] = math.inf    # 省略步数 = 全程冻结
     for name in out:
@@ -399,6 +422,61 @@ def parse_freeze_params(spec: str) -> dict[str, float]:
                              f"可选: {', '.join(PARAM_NAMES)}")
     # 按 PARAM_NAMES 的顺序返回，打印/绘图稳定
     return {n: out[n] for n in PARAM_NAMES if n in out}
+
+
+# ===========================================================================
+# 外部已知参数（--known-params）：把量得到的物理量当已知量喂进去
+#
+# 不是所有参数都能"单独"给定。12 列回归里能被解析消掉的只有下面这几种：
+#   * Dx, Dy       —— 机械尺寸（关节 s 相对关节 b 的偏移）。两者必须同时给：
+#                     A+B = Dx·P + Dy·Q2、C−D = Dy·P − Dx·Q2，只有 Dx、Dy 都已知
+#                     才能把这两列折进 P、Q2（这也是 12 列 → 10 列的关键）。
+#   * fbc..fsv     —— 摩擦，直接把该列搬到右端并丢掉。
+#   * mb, ms       —— 两个不可辨识标度。它们不出现在任何一列里，给定时只用来
+#                     跳过 (mb, ms) 的网格搜索，从而把 2 维平坦谷彻底固定。
+# Pbx/Pby/Psx/Psy/Ib/Is 不能单独给定：它们只以 mb·Pbx、ms·Dx、Is+ms·Ps² 这类
+# 聚合形式进入方程，单独固定某一个而不知道质量标度时方程无法自洽。
+# ===========================================================================
+KNOWN_OK = {"Dx", "Dy", "mb", "ms", "fbc", "fbv", "fsc", "fsv"}
+KNOWN_UNSUPPORTED = {"Pbx", "Pby", "Psx", "Psy", "Ib", "Is"}
+
+
+def parse_known_params(spec: str) -> dict[str, float]:
+    """解析 ``--known-params`` 的 "参数=值,..." 表。
+
+    例: ``--known-params "Dx=0.05,Dy=0.30"``（两个机械尺寸）。
+    语义见上面 KNOWN_OK 的说明；给不支持的参数会直接抛 ValueError。
+    """
+    out: dict[str, float] = {}
+    for part in spec.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(f"--known-params 的 {part!r} 缺少 '='；应为 参数=值")
+        name, val_s = (s.strip() for s in part.split("=", 1))
+        if name not in _PARAM_INDEX:
+            raise ValueError(f"--known-params 里的未知参数 {name!r}；"
+                             f"可选: {', '.join(sorted(KNOWN_OK))}")
+        if name in KNOWN_UNSUPPORTED:
+            raise ValueError(
+                f"{name!r} 不能单独作为已知量：它只以 mb·Pbx / ms·Dx / Is+ms·Ps² "
+                f"这类聚合形式进入方程，单独固定而不给出质量标度时方程无法自洽。"
+                f"可用的已知参数: {', '.join(sorted(KNOWN_OK))}")
+        try:
+            v = float(val_s)
+        except ValueError:
+            raise ValueError(f"--known-params 里 {name} 的值 {val_s!r} 不是数") from None
+        if not math.isfinite(v):
+            raise ValueError(f"--known-params 里 {name} 的值 {val_s!r} 不是有限数")
+        if name in POSITIVE and v <= 0.0:
+            raise ValueError(f"--known-params 里 {name} 必须为正（重参数化用 log），"
+                             f"收到 {v:g}")
+        out[name] = v
+    if ("Dx" in out) != ("Dy" in out):
+        raise ValueError("Dx 与 Dy 必须同时给出：12 列回归中 A+B / C−D 只有 "
+                         "Dx、Dy 都已知时才能解析折进 P、Q2（否则无法单独消去）")
+    return out
 
 
 class FreezeSchedule:
@@ -491,6 +569,8 @@ class FreezeSchedule:
 
     def label(self, n: str) -> str:
         u = self.until[n]
+        if u <= 0:
+            return "不冻结"
         return f"前 {int(u)} 步冻结" if np.isfinite(u) else "全程冻结"
 
 
@@ -713,17 +793,46 @@ def _regression_block(c: Case) -> tuple[np.ndarray, np.ndarray]:
 
 
 def algebraic_init(cases: list[Case], nominal=(1.0, 1.0),
-                   friction: tuple[float, float, float, float] | None = None
+                   friction: tuple[float, float, float, float] | None = None,
+                   known: dict[str, float] | None = None
                    ) -> tuple[dict, dict]:
-    """在测量数据上做闭式最小二乘，解出 12 个可辨识组合，再回代成物理参数。
+    """在测量数据上做闭式最小二乘，解出可辨识组合，再回代成物理参数。
 
     friction 若给出 (fbc, fbv, fsc, fsv) 则**直接采用**（来自匀速旋转实验），
     否则用回归自己的结果。注意 (mb, ms) 的可行性判据只看 Ib/Is，与摩擦无关——
     因此摩擦解坏掉也不会像以前那样让整个初始化抛异常。
+
+    known 是外部已知参数（``--known-params``，见 parse_known_params）：
+      * ``Dx``/``Dy``：把 A+B = Dx·P + Dy·Q2、C−D = Dy·P − Dx·Q2 折进 P、Q2 两列，
+        设计矩阵 12 列 → 10 列（这是固定精确机械尺寸时唯一正确的降维方式）；
+      * ``fbc``..``fsv``：该列搬到右端并丢掉，其余组合由"扣除已知摩擦后的力矩"估计；
+      * ``mb``/``ms``：跳过对应方向的网格搜索，直接用给定值（2 个都给 = 平坦谷消失）。
+    known 里的摩擦优先于 ``friction`` 参数。
     """
+    known = dict(known or {})
+    unknown = [n for n in known if n not in KNOWN_OK]
+    if unknown:
+        raise ValueError(f"algebraic_init 收到不支持的已知参数: {', '.join(unknown)}")
+
     R = np.vstack([_regression_block(c)[0] for c in cases])
     y = np.concatenate([_regression_block(c)[1] for c in cases])
-    xs, *_ = np.linalg.lstsq(R, y, rcond=None)
+
+    keep = np.ones(R.shape[1], dtype=bool)
+    if "Dx" in known:
+        # A+B 与 C−D 都是 P=ms·Psx、Q2=ms·Psy 的已知系数线性组合：折进去并丢掉这两列
+        R[:, 4] = R[:, 4] + known["Dx"] * R[:, 2] + known["Dy"] * R[:, 3]
+        R[:, 5] = R[:, 5] + known["Dy"] * R[:, 2] - known["Dx"] * R[:, 3]
+        keep[2] = keep[3] = False
+    for j, n in ((8, "fbc"), (9, "fbv"), (10, "fsc"), (11, "fsv")):
+        if n in known:
+            y = y - R[:, j] * known[n]      # 已知摩擦搬到右端
+            keep[j] = False
+
+    xs = np.zeros(R.shape[1])
+    xs[keep], *_ = np.linalg.lstsq(R[:, keep], y, rcond=None)
+    for j, n in ((8, "fbc"), (9, "fbv"), (10, "fsc"), (11, "fsv")):
+        if n in known:                      # 折掉的那几列回填已知值，便于下面统一取用
+            xs[j] = known[n]
 
     I_BD, I_S = xs[0], xs[1]
     AB, CmD = xs[2], xs[3]
@@ -731,13 +840,19 @@ def algebraic_init(cases: list[Case], nominal=(1.0, 1.0),
     RU, SV = xs[6], xs[7]
     if friction is None:
         friction = (xs[8], xs[9], xs[10], xs[11])
+    else:
+        # known 优先于 sweep 给出的摩擦
+        friction = tuple(known.get(n, friction[i])
+                         for i, n in enumerate(("fbc", "fbv", "fsc", "fsv")))
     fbc, fbv, fsc, fsv = friction
-    det = P * P + Q2 * Q2
+    if "Dx" in known:
+        Dx, Dy = known["Dx"], known["Dy"]       # 直接采用测量值，不再从 P/Q2 回解
+    else:
+        det = P * P + Q2 * Q2
+        Dx = (P * AB - Q2 * CmD) / det           # Dx、Dy 由聚合量非线性组合解出
+        Dy = (Q2 * AB + P * CmD) / det
 
     def back(mb: float, ms: float) -> dict:
-        # Dx、Dy 可由聚合量非线性组合解出（所以它们其实可辨识）
-        Dx = (P * AB - Q2 * CmD) / det
-        Dy = (Q2 * AB + P * CmD) / det
         I_D = ms * (Dx * Dx + Dy * Dy)
         I_B = I_BD - I_D
         Pbx = (RU - ms * Dx) / mb
@@ -753,9 +868,13 @@ def algebraic_init(cases: list[Case], nominal=(1.0, 1.0),
         return bool(np.isfinite(v).all() and p["mb"] > 0 and p["ms"] > 0
                     and p["Ib"] > 1e-6 and p["Is"] > 1e-6)
 
+    mb_grid = ([known["mb"]] if "mb" in known
+               else np.geomspace(0.02, 100.0, 140))
+    ms_grid = ([known["ms"]] if "ms" in known
+               else np.geomspace(0.02, 100.0, 140))
     best, best_cost = None, np.inf
-    for mb in np.geomspace(0.02, 100.0, 140):
-        for ms in np.geomspace(0.02, 100.0, 140):
+    for mb in mb_grid:
+        for ms in ms_grid:
             p = back(mb, ms)
             if not feasible(p):
                 continue
@@ -763,8 +882,15 @@ def algebraic_init(cases: list[Case], nominal=(1.0, 1.0),
             if cost < best_cost:
                 best, best_cost = p, cost
     if best is None:
+        if "mb" in known or "ms" in known:
+            raise RuntimeError(
+                f"代数初始化在给定 mb={known.get('mb', '自由')} ms={known.get('ms', '自由')} "
+                f"下不可行（Ib 或 Is ≤ 0）。请检查 --known-params 的数值，或不要固定质量标度")
         raise RuntimeError("代数初始化找不到可行的 (mb, ms)，数据可能异常")
-    info = dict(mb=best["mb"], ms=best["ms"], combo_err=None)
+
+    for n, v in known.items():                  # 已知量按给定值精确回填（免去往返误差）
+        best[n] = float(v)
+    info = dict(mb=best["mb"], ms=best["ms"], combo_err=None, known=dict(known))
     return best, info
 
 
@@ -1059,7 +1185,8 @@ def main() -> int:
                          "random=用随机初值（用于对照）")
     ap.add_argument("--mass-nominal", type=float, nargs=2, default=(1.0, 1.0),
                     metavar=("MB", "MS"),
-                    help="代数初始化中两个不可辨识标度 mb/ms 的标称值（不影响 loss）")
+                    help="代数初始化中两个不可辨识标度 mb/ms 的标称值（不影响 loss）；"
+                         "若 --known-params 给了 mb/ms，则该项被覆盖")
     ap.add_argument("--friction-category", type=str, default=None,
                     help="摩擦类别名（= 目录名）：读 data/<名字>/ 下**全部** sweep_*.npz；"
                          "被 --friction-sweep 覆盖")
@@ -1078,16 +1205,28 @@ def main() -> int:
                          'n 每个参数单独配置。省略步数 = 全程冻结，步数给 0 = 不冻结。'
                          '例: --freeze-params "fbc:3000,fbv:3000,Dx" 。'
                          f"可选参数: {', '.join(PARAM_NAMES)}")
+    ap.add_argument("--known-params", type=str, default="",
+                    help='外部已知参数表 "参数=值,..."：代数初始化时当已知量用'
+                         '（Dx,Dy 解析折掉 A+B/C−D 两列；摩擦搬到右端；mb,ms 直接'
+                         '固定标度、跳过网格搜索），并默认全程冻结在给定值上。'
+                         '例: --known-params "Dx=0.05,Dy=0.30"。'
+                         '若想让某个已知值只当初值、训练时放开，'
+                         '用 --freeze-params "Dx:0"（或给个有限步数先冻后放）。'
+                         f"可用的已知参数: {', '.join(sorted(KNOWN_OK))}")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--out", type=str, default=None,
                     help="结果目录；缺省时 --category 给定时用 data/identify_<类别>，"
                          "否则用 data/identify")
     args = ap.parse_args()
-    # 冻结表尽早校验，参数写错时给干净的报错而不是后面的 traceback
+    # 冻结表 / 已知参数表尽早校验，参数写错时给干净的报错而不是后面的 traceback
     try:
         freeze_until = parse_freeze_params(args.freeze_params)
+        known = parse_known_params(args.known_params)
     except ValueError as e:
         ap.error(str(e))
+    # 已知参数默认全程冻结；表里明确写了 0（= 不冻结）或有限步数时按表来
+    for n in known:
+        freeze_until.setdefault(n, math.inf)
 
     def _stamp_of(name: str) -> str:
         """从 case_<时间戳>_<序号>.npz 里解析出时间戳（旧的无戳文件返回 unknown）。"""
@@ -1194,7 +1333,7 @@ def main() -> int:
                             else REPO / "data" / "friction"))
         if args.use_friction_sweep and sweep_path.exists():
             p_dyn, _ = algebraic_init(cases, nominal=tuple(args.mass_nominal),
-                                      friction=(0.0, 0.0, 0.0, 0.0))
+                                      friction=(0.0, 0.0, 0.0, 0.0), known=known)
             fbc, fbv, finfo = fit_friction_sweep(sweep_path, p_dyn)
             friction = (fbc, fbv, 0.5 * fbc, 0.5 * fbv)   # s 取其一半
             print(f"匀速旋转实验拟合摩擦（{finfo['files']} 个 sweep 文件，"
@@ -1211,30 +1350,44 @@ def main() -> int:
         elif args.use_friction_sweep:
             print(f"（未找到 {sweep_path}，摩擦改用主回归结果）")
         p_init, ainfo = algebraic_init(cases, nominal=tuple(args.mass_nominal),
-                                      friction=friction)
+                                      friction=friction, known=known)
         ps = ParamSpec(ref, rng, orders=(0.0, 0.0))
         ps.theta = torch.tensor(
             ParamSpec.to_theta([p_init[n] for n in PARAM_NAMES]),
             dtype=torch.float64, requires_grad=True)
-        print(f"代数初始化（闭式最小二乘，与初值无关）: "
-              f"不可辨识标度取 mb={ainfo['mb']:.4g} ms={ainfo['ms']:.4g}")
+        n_col = 12 - (2 if "Dx" in known else 0) - sum(
+            1 for n in ("fbc", "fbv", "fsc", "fsv") if n in known)
+        scale = ("mb/ms 为已知值（跳过网格搜索）" if "mb" in known and "ms" in known
+                 else f"不可辨识标度取 mb={ainfo['mb']:.4g} ms={ainfo['ms']:.4g}")
+        print(f"代数初始化（闭式最小二乘，与初值无关，设计矩阵 {n_col} 列）: {scale}")
     else:
         init_orders = tuple(float(v) for v in args.init_orders.split(","))
         ps = ParamSpec(ref, rng, orders=init_orders)
+        if known:       # 随机初值也要把已知量写进去（随后按冻结表固定）
+            p_rand = ps.seed_values()
+            p_rand.update(known)
+            with torch.no_grad():
+                ps.theta.copy_(torch.tensor(
+                    ParamSpec.to_theta([p_rand[n] for n in PARAM_NAMES]),
+                    dtype=torch.float64))
         print(f"随机初始化: 每个参数乘 10^(±[{init_orders[0]}, {init_orders[1]}])")
+    if known:
+        print("已知参数（外部给定，初始化时当已知量、训练中按冻结表固定）: "
+              + "，".join(f"{n}={known[n]:.6g}" for n in PARAM_NAMES if n in known))
 
     # 梯度优化开始前：先把初值（algebraic 时 = 闭式最小二乘解）打印并画一遍图
     init0 = ps.seed_values()
     report_init(init0, ref, truth_ident, has_truth, args.init, out_dir,
                 cases, plot_pick, refinement)
 
-    # 逐参数冻结：冻结值就是**初始化（最小二乘）解出的值**，第一次更新前抓取
+    # 逐参数冻结：冻结值就是**初始化（最小二乘 / 已知量注入）之后的值**，第一次更新前抓取
     freeze = FreezeSchedule(freeze_until)
     if freeze:
         freeze.capture(ps)
-        print("\n冻结计划（初始化之后生效，每个参数单独配置解冻步；冻结期间数值完全不动）:")
-        for n in PARAM_NAMES:
-            if n in freeze.until:
+        active = [n for n in PARAM_NAMES if freeze.until.get(n, 0.0) != 0.0]
+        if active:
+            print("\n冻结计划（初始化之后生效，每个参数单独配置解冻步；冻结期间数值完全不动）:")
+            for n in active:
                 print(f"  {n:>5}: {freeze.label(n)}，冻结值 {freeze.values[n]:.6g}")
 
     init_combo = combo_error(init0, truth_ident)
