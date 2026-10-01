@@ -3,4 +3,4 @@ python3 python/gen_friction_sweep.py --real --fs-vel-tol-frac 0.2 --fs-vel-tol-a
 
 python3 python/identify_params.py --category Sentry1 --friction-category friction_Sentry1 \
     --w-psi-b 1.0 --w-psi-s 1.0 --w-dpsi-b 0.0 --w-dpsi-s 0.0 --grad-mode batch --batch-threads 18\
-    --steps 100000 --batch 120
+    --steps 100000 --batch 120 --freeze-params "fbc:90000,fbv:90000,fsc:90000,fsv:90000"

@@ -52,15 +52,30 @@ batch 调度（按需求实现）：
       这只是把积分起点平移，动力学方程、损失形式、每条样本的长度都不变；
       s-1 不在本窗口的 target 里，其测量噪声与本窗口残差独立，故不引入系统偏差。
 
+逐参数冻结（--freeze-params，按需求实现）：
+    * 在**代数最小二乘初始化之后**固定被选参数的值，前 n 个**全局** Adam step 内
+      不优化，第 n 步起解冻；n 每个参数单独配置：
+      ``--freeze-params "fbc:3000,fbv:3000,Dx:2000"``。
+    * 省略步数 = 整个训练全程冻结（``"Dx"``）；步数给 0（或负数）= 不冻结，
+      方便在长命令里临时关掉某一项。
+    * 冻结值 = 初始化最小二乘解出的值；冻结期间该参数在数值上**完全不动**
+      （opt.step() 之后精确写回），同时它的梯度分量被扣掉，Adam 的动量/二阶矩
+      不会被它污染。
+    * (Pbx,Pby)、(Psx,Psy)、(Dx,Dy) 在 theta 里是 (log r, phi)，可以**只冻结其中
+      一个**：写回时用"冻结分量的固定值 + 另一分量的当前值"重建 theta。
+
 用法（在仓库根执行）::
 
     python3 python/identify_params.py                       # 代数初值 + 课程 + 10000 步
     python3 python/identify_params.py --init random --init-orders 2,3   # 随机初值对照
+    python3 python/identify_params.py \
+        --freeze-params "fbc:3000,fbv:3000,Dx"              # 逐参数冻结（Dx 全程冻结）
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -353,6 +368,130 @@ class ParamSpec:
 
     def seed_values(self) -> dict:
         return self.params_from_tensor()
+
+
+# ===========================================================================
+# 逐参数冻结："初始化最小二乘后先冻结，第 n 个 step 起才优化"，n 每个参数单独配
+# ===========================================================================
+def parse_freeze_params(spec: str) -> dict[str, float]:
+    """解析 ``--freeze-params`` 的 "参数:步数,..." 表。
+
+    * ``name:n``：前 n 个**全局** Adam step 内冻结，第 n 步起参与优化。
+      为了能在长命令里临时关掉某一项，``n<=0`` 视为不冻结。
+    * ``name``（省略步数）：整个训练全程冻结，从不解冻（记作 inf）。
+    """
+    out: dict[str, float] = {}
+    for part in spec.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            name, n_s = (s.strip() for s in part.split(":", 1))
+            n = int(float(n_s))
+            if n <= 0:              # 0 / 负数 = 不冻结
+                continue
+            out[name] = n
+        else:
+            out[part] = math.inf    # 省略步数 = 全程冻结
+    for name in out:
+        if name not in _PARAM_INDEX:
+            raise ValueError(f"--freeze-params 里的未知参数 {name!r}；"
+                             f"可选: {', '.join(PARAM_NAMES)}")
+    # 按 PARAM_NAMES 的顺序返回，打印/绘图稳定
+    return {n: out[n] for n in PARAM_NAMES if n in out}
+
+
+class FreezeSchedule:
+    """逐参数"先冻结、第 n 步起解冻"的调度（每个参数的 n 单独配置）。
+
+    在**代数最小二乘初始化之后**捕获冻结值（``capture``），随后每个 Adam step：
+      1) ``apply_grad``：把 dL/dtheta 里会改变"当前仍冻结"参数的分量扣掉
+         （标量直接清零；参数对 (Pbx,Pby)/(Psx,Psy)/(Dx,Dy) 的 theta 是
+         (log r, phi)，只冻结其中一个时按约束方向做正交投影），
+         这样 Adam 的动量/二阶矩不会被冻结参数污染；
+      2) ``restore``：``opt.step()`` 之后把冻结参数**精确写回**初始化值
+         （成对参数用"冻结分量的固定值 + 另一分量的当前值"重建 theta），
+         保证冻结期间该参数数值上完全不动。
+    """
+
+    def __init__(self, until: dict[str, float]):
+        self.until = dict(until)
+        self.values: dict[str, float] = {}
+        self.theta0: np.ndarray | None = None
+
+    def __bool__(self) -> bool:
+        return bool(self.until)
+
+    def capture(self, ps: "ParamSpec") -> None:
+        """固定冻结值：必须在最小二乘初始化之后、第一次更新之前调用。
+
+        同时记下 theta 本身：标量参数与"整对冻结"的参数对在写回时可以做到
+        **位级精确**（直接还原 theta 分量），不必经过 exp/log 往返。
+        """
+        self.theta0 = ps.theta_np()
+        p = ps.seed_values()
+        self.values = {n: float(p[n]) for n in self.until}
+
+    def frozen_now(self, gstep: int) -> set[str]:
+        """第 gstep 个全局 step（0-based）开始时仍处于冻结的参数。"""
+        return {n for n, u in self.until.items() if gstep < u}
+
+    def apply_grad(self, dtheta: np.ndarray, theta_np: np.ndarray,
+                   gstep: int) -> np.ndarray:
+        frozen = self.frozen_now(gstep)
+        if not frozen:
+            return dtheta
+        g = np.array(dtheta, dtype=np.float64, copy=True)
+        # 标量参数：对应的 theta 分量直接清零（Adam 更新恒为 0）
+        for i, n in SCALAR_AT.items():
+            if n in frozen:
+                g[i] = 0.0
+        # 参数对：如果只冻结其中一个，把梯度投影到"该分量不变"的方向上
+        p = None
+        for i, (nx, ny) in PAIR_AT.items():
+            fx, fy = nx in frozen, ny in frozen
+            if fx and fy:
+                g[i] = g[i + 1] = 0.0
+            elif fx or fy:
+                if p is None:
+                    p = ParamSpec.to_params(theta_np)
+                nm, other = (nx, ny) if fx else (ny, nx)
+                # c(theta) = p_nm；∂p_nx/∂φ = -p_ny、∂p_ny/∂φ = +p_nx
+                sgn = 1.0 if nm == nx else -1.0
+                gc = np.array([p[nm], -sgn * p[other]])
+                nrm = float(gc @ gc)
+                if nrm > 0.0:
+                    g[i:i + 2] -= (float(g[i:i + 2] @ gc) / nrm) * gc
+        return g
+
+    def restore(self, ps: "ParamSpec", gstep: int) -> None:
+        """opt.step() 之后调用：把仍冻结的参数写回初始化值。"""
+        frozen = self.frozen_now(gstep)
+        if not frozen:
+            return
+        th = ps.theta_np()
+        p = None
+        for i, n in SCALAR_AT.items():
+            if n in frozen:
+                th[i] = self.theta0[i]          # 位级精确
+        for i, (nx, ny) in PAIR_AT.items():
+            fx, fy = nx in frozen, ny in frozen
+            if fx and fy:
+                th[i], th[i + 1] = self.theta0[i], self.theta0[i + 1]   # 位级精确
+            elif fx or fy:
+                # 只冻结其中一个：用它固定的物理值 + 另一个的当前值重建 theta
+                if p is None:
+                    p = ps.params_from_tensor()
+                px = self.values[nx] if fx else p[nx]
+                py = self.values[ny] if fy else p[ny]
+                th[i] = 0.5 * np.log(px * px + py * py)
+                th[i + 1] = np.arctan2(py, px)
+        with torch.no_grad():
+            ps.theta.copy_(torch.tensor(th, dtype=torch.float64))
+
+    def label(self, n: str) -> str:
+        u = self.until[n]
+        return f"前 {int(u)} 步冻结" if np.isfinite(u) else "全程冻结"
 
 
 # ===========================================================================
@@ -933,11 +1072,22 @@ def main() -> int:
                     help="不用匀速旋转实验，摩擦仍由主回归给出（实测会解成负值）")
     ap.add_argument("--init-orders", type=str, default=f"{LOG10_ORDERS_MIN},{LOG10_ORDERS_MAX}",
                     help='--init random 时，初值偏离真值的数量级区间 "min,max"')
+    ap.add_argument("--freeze-params", type=str, default="",
+                    help='逐参数冻结表 "参数:步数,..."：在代数最小二乘初始化之后固定'
+                         '这些参数，前 n 个全局 Adam step 内不优化，第 n 步起解冻；'
+                         'n 每个参数单独配置。省略步数 = 全程冻结，步数给 0 = 不冻结。'
+                         '例: --freeze-params "fbc:3000,fbv:3000,Dx" 。'
+                         f"可选参数: {', '.join(PARAM_NAMES)}")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--out", type=str, default=None,
                     help="结果目录；缺省时 --category 给定时用 data/identify_<类别>，"
                          "否则用 data/identify")
     args = ap.parse_args()
+    # 冻结表尽早校验，参数写错时给干净的报错而不是后面的 traceback
+    try:
+        freeze_until = parse_freeze_params(args.freeze_params)
+    except ValueError as e:
+        ap.error(str(e))
 
     def _stamp_of(name: str) -> str:
         """从 case_<时间戳>_<序号>.npz 里解析出时间戳（旧的无戳文件返回 unknown）。"""
@@ -1078,6 +1228,15 @@ def main() -> int:
     report_init(init0, ref, truth_ident, has_truth, args.init, out_dir,
                 cases, plot_pick, refinement)
 
+    # 逐参数冻结：冻结值就是**初始化（最小二乘）解出的值**，第一次更新前抓取
+    freeze = FreezeSchedule(freeze_until)
+    if freeze:
+        freeze.capture(ps)
+        print("\n冻结计划（初始化之后生效，每个参数单独配置解冻步；冻结期间数值完全不动）:")
+        for n in PARAM_NAMES:
+            if n in freeze.until:
+                print(f"  {n:>5}: {freeze.label(n)}，冻结值 {freeze.values[n]:.6g}")
+
     init_combo = combo_error(init0, truth_ident)
     init_spread = max(abs(np.log10(abs(init0[n]) / abs(ref[n])))
                       for n in PARAM_NAMES)
@@ -1194,12 +1353,18 @@ def main() -> int:
                 # 物理参数梯度 -> theta 梯度（重参数化的链式法则）
                 theta_np = ps.theta_np()
                 dtheta = ParamSpec.dtheta_from_dp(grad_sum, theta_np)
+                # 仍处于冻结期的参数：先扣掉会改变它的梯度分量（不污染 Adam 动量），
+                # 再在 opt.step() 后精确写回冻结值（见 FreezeSchedule）。
+                if freeze:
+                    dtheta = freeze.apply_grad(dtheta, theta_np, gstep)
                 hist_loss.append(loss_sum / len(sel))
                 hist_theta.append(theta_np)
                 hist_K.append(K_s)
 
                 ps.theta.grad = torch.tensor(dtheta, dtype=torch.float64)
                 opt.step()
+                if freeze:
+                    freeze.restore(ps, gstep)
                 sched.step()
                 opt.zero_grad(set_to_none=True)
                 gstep += 1
@@ -1207,9 +1372,14 @@ def main() -> int:
                 if gstep % 500 == 0 or gstep == total_steps:
                     cur = ps.seed_values()
                     combo_lab = "组合误差" if has_truth else "组合偏离(标称)"
+                    frozen_lab = ""
+                    if freeze:
+                        fz = freeze.frozen_now(gstep)
+                        frozen_lab = ("  冻结=" + ",".join(n for n in PARAM_NAMES if n in fz)
+                                      if fz else "  冻结=无")
                     print(f"  step {gstep:6d}  K={K_s:>3}  batch loss={hist_loss[-1]:.4e}  "
                           f"{combo_lab}={combo_error(cur, truth_ident):.3e}  "
-                          f"lr={sched.get_last_lr()[0]:.2e}")
+                          f"lr={sched.get_last_lr()[0]:.2e}{frozen_lab}")
 
         if pgb is not None:
             pgb.close()
@@ -1277,11 +1447,24 @@ def main() -> int:
             ax.plot(vals, lw=1.0, label="estimated")
             if has_truth:
                 ax.axhline(truth[n], color="k", ls="--", lw=1.0, label="truth")
+            # 冻结区间（橙色阴影）：这段时间该参数不参与优化，曲线应为直线
+            if freeze and n in freeze.until:
+                u = freeze.until[n]
+                end = min(u, total_steps) if np.isfinite(u) else total_steps
+                ax.axvspan(0, end, color="tab:orange", alpha=0.10,
+                           label="frozen (no update)")
+                if np.isfinite(u):
+                    ax.axvline(u, color="tab:orange", lw=0.9, ls=":")
             # 课程阶段的窗口切换点（参数曲线在这里会有明显的斜率变化）
             for b in stage_bounds:
                 ax.axvline(b, color="tab:red", lw=0.6, alpha=0.35)
             ax.set_yscale("symlog", linthresh=1e-3)   # 跨多个数量级且可能为负
-            ax.set_title(n, fontsize=10)
+            if freeze and n in freeze.until:
+                u = freeze.until[n]
+                ax.set_title(f"{n}  [frozen < {int(u)}]" if np.isfinite(u)
+                             else f"{n}  [frozen]", fontsize=10)
+            else:
+                ax.set_title(n, fontsize=10)
             ax.grid(True, alpha=0.3)
             if k == 0:
                 ax.legend(fontsize=7)
@@ -1311,6 +1494,15 @@ def main() -> int:
             axes[0][0].annotate(f"K={kk}", (b, 0.0), xycoords=("data", "axes fraction"),
                                 xytext=(2, 2), textcoords="offset points",
                                 fontsize=6, color="tab:red")
+        # 各参数的解冻步（橙色点线）：与左侧参数曲线上的阴影一致
+        if freeze:
+            for j, u in enumerate(sorted({u for u in freeze.until.values()
+                                          if np.isfinite(u) and u > 0})):
+                axes[0][0].axvline(u, color="tab:orange", lw=0.9, ls=":", alpha=0.9)
+                axes[0][0].annotate("unfreeze", (u, 1.0),
+                                    xycoords=("data", "axes fraction"),
+                                    xytext=(2, -9 - 8 * (j % 3)), textcoords="offset points",
+                                    fontsize=6, color="tab:orange")
         axes[0][0].legend(fontsize=6)
         axes[0][0].set_xlabel("Adam step")
         axes[0][0].set_title("loss")
