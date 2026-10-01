@@ -35,6 +35,23 @@ batch 调度（按需求实现）：
     * 若 n 超过前面的 batch 数，多出的部分在"尽可能平均、且尽量靠后"的前提下均摊
     * 若 batch_size > 数据总数，则直接全量计算
 
+短窗口滑窗（K < full_K 的课程阶段，按需求实现）：
+    * 拟合窗口长度为 K 时，不再固定只取每条数据开头的 K 步，而是以 K/2 为步长
+      在整条数据上滑动长度为 K 的窗口：起点 s = 0, K/2, K, …（要求 s+K <= full_K），
+      若最后一个窗口没贴到序列末尾再补一个贴尾窗口 s = full_K-K，
+      于是一条数据取出多个样本；
+    * 所有 (数据, 窗口) 样本汇总成一个**样本池**，每个 step 从池子里取 batch 个
+      样本（上面的打乱/分批规则作用在池子上，池子走完算一个 epoch）；
+    * s = 0 的样本就是"数据开头的 K 步"，与旧行为完全一致；K == full_K 的阶段
+      （整段数据）只有 s=0 一个窗口，自然不做滑窗。
+    * 窗口初值：窗口从**全局时刻 s*dt 的状态**出发。s=0 用 npz 里记录的 x0；
+      s>0 用该时刻的实测状态反解（θ_b = psi_b[s-1] − θ_c(s·dt)，
+      θ̇_b = dpsi_b[s-1] − θ̇_c(s·dt)，θ_s = psi_s[s-1] − psi_b[s-1]，θ̇_s 同理；
+      psi_b[i] 是第 i 步**末**（时刻 (i+1)dt）的测量，故时刻 s*dt 对应下标 s-1）。
+      基座量按等角加速度外推到 s*dt，因此窗口内的基座运动与原序列完全一致。
+      这只是把积分起点平移，动力学方程、损失形式、每条样本的长度都不变；
+      s-1 不在本窗口的 target 里，其测量噪声与本窗口残差独立，故不引入系统偏差。
+
 用法（在仓库根执行）::
 
     python3 python/identify_params.py                       # 代数初值 + 课程 + 10000 步
@@ -146,7 +163,8 @@ def combo_error(p: dict, ref: dict) -> float:
 class Case:
     __slots__ = ("theta_c0", "dtheta_c", "ddtheta_c", "x0", "dt", "K",
                  "psi_b", "psi_s", "dpsi_b", "dpsi_s", "tau", "seed", "gx", "gy",
-                 "weights", "theta_c_seq", "dtheta_c_seq")
+                 "weights", "theta_c_seq", "dtheta_c_seq",
+                 "xstate", "base_seq")
 
     def __init__(self, path: Path):
         d = np.load(path)
@@ -173,6 +191,34 @@ class Case:
         self.tau = np.ascontiguousarray(np.column_stack([d["tau_b"], d["tau_s"]]),
                                         dtype=np.float64)
         self.theta_c_seq, self.dtheta_c_seq = theta_c_trajectory(self)
+        # ---- 滑窗样本用的整段边界量（下标 j = 全局时刻 j*dt，j = 0..K）----
+        # xstate[j]：时刻 j*dt 的状态 (θ_b, θ̇_b, θ_s, θ̇_s)。
+        #   j=0 用数据里记录的 x0；j>=1 用实测下标 j-1 的测量反解
+        #   （ψ_b = θ_c + θ_b，ψ_s = θ_c + θ_b + θ_s）。
+        self.xstate = np.empty((self.K + 1, 4), dtype=np.float64)
+        self.xstate[0] = (self.x0.theta_b, self.x0.dtheta_b,
+                          self.x0.theta_s, self.x0.dtheta_s)
+        self.xstate[1:, 0] = self.psi_b - self.theta_c_seq
+        self.xstate[1:, 1] = self.dpsi_b - self.dtheta_c_seq
+        self.xstate[1:, 2] = self.psi_s - self.psi_b
+        self.xstate[1:, 3] = self.dpsi_s - self.dpsi_b
+        # base_seq[j]：时刻 j*dt 的基座 (θ_c, θ̇_c, θ̈_c)，等角加速度外推。
+        # 把窗口起点平移到 s 后，C 侧就以 base_seq[s] 为"序列起点"的基座量。
+        t = np.arange(self.K + 1) * self.dt
+        self.base_seq = np.column_stack([
+            self.theta_c0 + self.dtheta_c * t + 0.5 * self.ddtheta_c * t * t,
+            self.dtheta_c + self.ddtheta_c * t,
+            np.full(self.K + 1, self.ddtheta_c, dtype=np.float64)])
+
+    def state_at(self, s: int) -> State:
+        """全局时刻 s*dt 的（实测反解）状态，作为滑窗样本的初值 x0。"""
+        return State(float(self.xstate[s, 0]), float(self.xstate[s, 1]),
+                     float(self.xstate[s, 2]), float(self.xstate[s, 3]))
+
+    def base_at(self, s: int) -> tuple[float, float, float]:
+        """全局时刻 s*dt 的基座 (θ_c, θ̇_c, θ̈_c)。"""
+        return (float(self.base_seq[s, 0]), float(self.base_seq[s, 1]),
+                float(self.base_seq[s, 2]))
 
 
 def theta_c_trajectory(c: Case) -> tuple[np.ndarray, np.ndarray]:
@@ -310,39 +356,45 @@ class ParamSpec:
 
 
 # ===========================================================================
-# 单条数据的 loss / 梯度（支持只取前 K 步，课程学习用）
+# 单条数据的 loss / 梯度（支持只取 [s, s+K) 这段窗口，课程学习 + 滑窗用）
 # ===========================================================================
-def case_spec(case: Case, K: int) -> ParamLossSpec:
-    """目标为该条实测序列的前 K 步；四项权重取自 case.weights。
+def case_spec(case: Case, K: int, s: int = 0) -> ParamLossSpec:
+    """目标为该条实测序列的 [s, s+K) 段；四项权重取自 case.weights。
 
     case.weights = [w_psi_b, w_psi_s, w_dpsi_b, w_dpsi_s]：
     psi 是位置项、dpsi 是速度项，b/s 分别对应大/小 yaw。
+    s 是窗口起点（主步下标）；s=0 即"数据开头的 K 步"（旧行为）。
     """
     w_psi_b, w_psi_s, w_dpsi_b, w_dpsi_s = case.weights
+    sl = slice(s, s + K)
     return ParamLossSpec(w_psi_b=w_psi_b, w_psi_s=w_psi_s,
                          w_dpsi_b=w_dpsi_b, w_dpsi_s=w_dpsi_s,
-                         target_psi_b=case.psi_b[:K], target_psi_s=case.psi_s[:K],
-                         target_dpsi_b=case.dpsi_b[:K], target_dpsi_s=case.dpsi_s[:K])
+                         target_psi_b=case.psi_b[sl], target_psi_s=case.psi_s[sl],
+                         target_dpsi_b=case.dpsi_b[sl], target_dpsi_s=case.dpsi_s[sl])
 
 
 def case_loss_and_grad(pg: ParamGradient, case: Case,
-                       K: int) -> tuple[float, np.ndarray]:
-    """返回前 K 步上的 (loss, dL/dp)（对物理参数，不是 theta）。
+                       K: int, s: int = 0) -> tuple[float, np.ndarray]:
+    """返回 [s, s+K) 这段窗口上的 (loss, dL/dp)（对物理参数，不是 theta）。
 
     求导点必须已经由调用方通过 ``pg.set_params(...)`` 设好——句柄里存着参数，
     这里不接收 params，以免出现"传了参数但句柄没更新"的静默错配。
 
-    tau 必须和 target 一起截断到 K：C++ 侧的步数取自 tau 的行数。
+    tau 必须和 target 一起截断到窗口：C++ 侧的步数取自 tau 的行数。
+    窗口起点 s>0 时，积分从该时刻的实测状态（case.xstate[s]）出发，基座量也
+    平移到该时刻（case.base_seq[s]）——等价于把整段序列的 [s, s+K) 段单独拎出来。
     """
-    loss, grad = pg.gradient(case.theta_c0, case.dtheta_c, case.ddtheta_c, case.dt,
-                             case.tau[:K], case.x0, case_spec(case, K))
+    tc0, dtc, ddtc = case.base_at(s)
+    loss, grad = pg.gradient(tc0, dtc, ddtc, case.dt,
+                             case.tau[s:s + K], case.state_at(s), case_spec(case, K, s))
     return float(loss), np.asarray(grad, dtype=np.float64)
 
 
-def case_loss(pg: ParamGradient, case: Case, K: int) -> float:
-    """只要 loss（前 K 步）。同样要求句柄参数已经设好。"""
-    return float(pg.loss(case.theta_c0, case.dtheta_c, case.ddtheta_c, case.dt,
-                         case.tau[:K], case.x0, case_spec(case, K)))
+def case_loss(pg: ParamGradient, case: Case, K: int, s: int = 0) -> float:
+    """只要 [s, s+K) 窗口上的 loss。同样要求句柄参数已经设好。"""
+    tc0, dtc, ddtc = case.base_at(s)
+    return float(pg.loss(tc0, dtc, ddtc, case.dt,
+                         case.tau[s:s + K], case.state_at(s), case_spec(case, K, s)))
 
 
 # ===========================================================================
@@ -352,10 +404,12 @@ def case_loss(pg: ParamGradient, case: Case, K: int) -> float:
 # 但底层是 SoA + SIMD + 多线程，所以同样的 batch 只用一次 C 调用。
 # ===========================================================================
 def pack_batch_data(cases: list["Case"], lam: float) -> dict:
-    """把各条数据的 AoS 数组拼成整块（按样本取子集时只做一次 fancy indexing）。
+    """把各条数据的（整段）数组拼成整块（按样本取窗口时只做一次 fancy indexing）。
 
     * x0      (N, 4)
     * base    (N, 3)   theta_c0 / dtheta_c / ddtheta_c
+    * xstate  (N, K+1, 4)  各主步边界时刻 j*dt 的状态（滑窗样本的初值）
+    * base_seq(N, K+1, 3)  各主步边界时刻 j*dt 的基座量（滑窗样本的序列起点基座）
     * tau     (N, K, 2)
     * tgt     长度 4，各 (N, K)
     * gx/gy   (N,)
@@ -369,6 +423,8 @@ def pack_batch_data(cases: list["Case"], lam: float) -> dict:
                         for c in cases], dtype=np.float64),
         "base": np.array([[c.theta_c0, c.dtheta_c, c.ddtheta_c] for c in cases],
                          dtype=np.float64),
+        "xstate": np.stack([c.xstate for c in cases]).astype(np.float64, copy=False),
+        "base_seq": np.stack([c.base_seq for c in cases]).astype(np.float64, copy=False),
         "tau": np.stack([c.tau for c in cases]).astype(np.float64, copy=False),
         "tgt": [np.stack([c.psi_b for c in cases]).astype(np.float64, copy=False),
                 np.stack([c.psi_s for c in cases]).astype(np.float64, copy=False),
@@ -380,34 +436,59 @@ def pack_batch_data(cases: list["Case"], lam: float) -> dict:
     }
 
 
-def batch_loss_and_grad(pgb: ParamGradientBatch, idxs, K: int, params_now: dict,
-                        data: dict, loss_scale: float) -> tuple[float, np.ndarray]:
+def batch_loss_and_grad(pgb: ParamGradientBatch, win_case, win_start, K: int,
+                        params_now: dict, data: dict,
+                        loss_scale: float) -> tuple[float, np.ndarray]:
     """一个 batch 的 (loss 之和, dL/dp 之和 × loss_scale)，grad 形状 (14,)。
 
+    ``win_case`` / ``win_start`` 是这个 batch 里各样本的（数据下标, 窗口起点 s）：
+    样本覆盖该条数据的 [s, s+K) 段，初值取该时刻的实测状态 ``xstate[:, s]``，
+    基座起点取 ``base_seq[:, s]``（等价于把整段序列的窗口段单独拎出来）。
+
     ``params_now`` 是 14 个被辨识参数（同一批共享）；每条数据的 gx/gy 不同，
-    按样本从 ``data`` 里取。窗口取各序列的前 K 步。
+    按样本从 ``data`` 里取。
     """
-    idx = np.asarray(idxs, dtype=np.intp)
-    B = idx.size
+    ci = np.asarray(win_case, dtype=np.intp)
+    st = np.asarray(win_start, dtype=np.intp)
+    B = ci.size
+    cols = st[:, None] + np.arange(K, dtype=np.intp)[None, :]        # (B, K)
     # params: (17, B)，顺序同 Params 字段（mb..Dy | gx gy | fbc..fsv | lambda）
     pr = np.empty((17, B), dtype=np.float64)
     pr[:10, :] = np.array([params_now[n] for n in PARAM_NAMES[:10]],
                           dtype=np.float64)[:, None]
-    pr[10, :] = data["gx"][idx]
-    pr[11, :] = data["gy"][idx]
+    pr[10, :] = data["gx"][ci]
+    pr[11, :] = data["gy"][ci]
     pr[12:16, :] = np.array([params_now[n] for n in PARAM_NAMES[10:]],
                             dtype=np.float64)[:, None]
     pr[16, :] = data["lambda"]
     loss, grad = pgb.run(
         pr,
-        data["x0"][idx].T,                       # (4, B)
-        data["base"][idx].T,                     # (3, B)
-        data["tau"][idx, :K, :].transpose(1, 2, 0),   # (K, 2, B)
-        [t[idx, :K].T for t in data["tgt"]],     # 各 (K, B)
-        data["weights"][idx].T,                  # (4, B)
+        data["xstate"][ci, st].T,                     # (4, B)
+        data["base_seq"][ci, st].T,                   # (3, B)
+        data["tau"][ci[:, None], cols].transpose(1, 2, 0),   # (K, 2, B)
+        [t[ci[:, None], cols].T for t in data["tgt"]],  # 各 (K, B)
+        data["weights"][ci].T,                        # (4, B)
         data["dt"],
     )
     return float(loss.sum()), grad.sum(axis=1) * loss_scale
+
+
+# ===========================================================================
+# 短窗口滑窗：长度为 K 的窗口在长度 full_K 的数据上的所有起点
+# ===========================================================================
+def window_starts(full_K: int, K: int, stride: int) -> np.ndarray:
+    """返回长度 K 的窗口在长度 full_K 序列上的全部起点（升序、互不重复）。
+
+    起点 0, stride, 2*stride, …（要求 s + K <= full_K）；若最后一个窗口没有贴到
+    序列末尾（s + K < full_K），再补一个贴尾窗口 full_K - K，保证尾部数据也被用到。
+    stride = K//2（K/2 的滑窗步长）时，full_K 被 K 整除的情况下一般不触发补齐。
+    """
+    stride = max(1, int(stride))
+    starts = list(range(0, full_K - K + 1, stride))
+    tail = full_K - K
+    if starts[-1] != tail:
+        starts.append(tail)
+    return np.asarray(starts, dtype=np.intp)
 
 
 # ===========================================================================
@@ -825,6 +906,13 @@ def main() -> int:
                     help='短窗口课程表 "K:权重,..."，窗口逐步拉长到全窗口')
     ap.add_argument("--no-curriculum", dest="curriculum", action="store_false",
                     help="关闭课程学习：只用全窗口 K 从头训到底")
+    ap.add_argument("--window-stride", type=float, default=0.5,
+                    help="短窗口阶段的滑窗步长，以该阶段的 K 为单位（默认 0.5 = K/2）；"
+                         "只在 K < full_K 的阶段生效")
+    ap.add_argument("--no-sliding-windows", dest="sliding_windows",
+                    action="store_false",
+                    help="关闭短窗口滑窗：K < full_K 的阶段仍只用每条数据开头的 K 步"
+                         "（旧行为，用于对照）")
     ap.add_argument("--eval-every", type=int, default=100,
                     help="每隔多少步在全窗口全量数据上评估一次 loss")
     ap.add_argument("--init", choices=("algebraic", "random"), default="algebraic",
@@ -916,6 +1004,24 @@ def main() -> int:
     full_K = cases[0].K
     # 批量梯度的整块数据：预先拼一次，训练时只按 batch 取子集
     batch_data = pack_batch_data(cases, LAMBDA) if args.grad_mode == "batch" else None
+
+    # ------------------------------------------------------------------
+    # 短窗口样本池：K < full_K 的阶段把每条数据的滑窗都取出来当样本
+    # ------------------------------------------------------------------
+    def stage_pool(K_s: int) -> tuple[np.ndarray, np.ndarray, int]:
+        """该阶段的样本池，返回 (数据下标, 窗口起点, 每条数据的窗口数)。
+
+        * K_s == full_K（整段数据）或 --no-sliding-windows：每条数据只有
+          起点 0 的一个样本，等价于旧行为；
+        * 否则以 round(K_s * --window-stride)（默认 K_s/2）为步长滑窗。
+        """
+        if not args.sliding_windows or K_s >= full_K:
+            return (np.arange(N, dtype=np.intp), np.zeros(N, dtype=np.intp), 1)
+        stride = max(1, int(round(K_s * args.window_stride)))
+        st = window_starts(full_K, K_s, stride)
+        ci = np.repeat(np.arange(N, dtype=np.intp), st.size)
+        return ci, np.tile(st, N), int(st.size)
+
     # 课程表：(拟合窗口 K, 该阶段步数)。K 按权重分摊总步数，并逐步拉长到 full_K。
     if args.curriculum:
         plan = [(min(k, full_K), max(1, int(round(args.steps * w))))
@@ -979,6 +1085,14 @@ def main() -> int:
           + ("  + 短窗口课程学习" if args.curriculum else "  （无课程学习）"))
     if args.curriculum:
         print("课程表: " + " -> ".join(f"K={k}({n}步)" for k, n in plan))
+        if args.sliding_windows:
+            slide = [f"K={k}: {N * window_starts(full_K, k, max(1, int(round(k * args.window_stride)))).size} 个样本"
+                     for k, _ in plan if k < full_K]
+            if slide:
+                print("短窗口滑窗（步长 = %.2f×K，每个阶段的样本池）: " % args.window_stride
+                      + "，".join(slide))
+        else:
+            print("短窗口滑窗: 已关闭（--no-sliding-windows），只用每条数据开头的 K 步")
     # 单参数偏差没有意义（mb/ms 两条方向严格不可辨识，参数可沿平坦谷滑很远而
     # loss 完全不变），所以初值好坏只看可辨识组合误差。
     print(f"初值: 可辨识组合最大相对误差={init_combo:.4g}（基准："
@@ -1010,7 +1124,7 @@ def main() -> int:
                        refinement=refinement) as pg:
         pgb = None
         if batch_data is not None:
-            pgb = ParamGradientBatch(refinement=refinement, max_batch=N,
+            pgb = ParamGradientBatch(refinement=refinement, max_batch=max(args.batch*2, N),
                                      max_num_steps=full_K,
                                      num_threads=args.batch_threads,
                                      lanes=args.batch_lanes)
@@ -1023,20 +1137,30 @@ def main() -> int:
             # 最后一个阶段用全量数据：batch=8 的梯度噪声会让组合误差停在 ~3%
             # （实测末段 5000 步完全不再改善），全量后能到 ~0.1%。
             bs = N if (args.full_batch_final and stage_i == len(plan) - 1) else args.batch
+            # 样本池：K_s < full_K 时用滑窗把一条数据摊成多个样本
+            pool_case, pool_start, n_win = stage_pool(K_s)
+            W = int(pool_case.size)
             opt = torch.optim.Adam([ps.theta], lr=lr_s)
             sched = torch.optim.lr_scheduler.CosineAnnealingLR(
                 opt, T_max=max(1, n_steps), eta_min=0.0) #lr_s * 0.15)
-            print(f"\n--- 课程阶段: 拟合窗口 K={K_s} / {full_K}，"
-                  f"预算 {n_steps} 步，batch={bs}，lr {lr_s:.3g} -> {0.0:.3g} ---")
+            win_lab = (f"滑窗 {n_win} 个/条 × {N} 条 = {W} 个样本，"
+                       f"步长 {max(1, int(round(K_s * args.window_stride)))} 步"
+                       if n_win > 1 else f"每条数据 1 段（数据开头 {K_s} 步）")
+            print(f"\n--- 课程阶段: 拟合窗口 K={K_s} / {full_K}，{win_lab}，"
+                  f"预算 {n_steps} 步，batch={bs}，"
+                  f"每 epoch {max(1, W // min(bs, W))} 个 batch，"
+                  f"lr {lr_s:.3g} -> {0.0:.3g} ---")
             epoch_order = None
             batch_cursor = 0
 
             for _ in range(n_steps):
                 if epoch_order is None or batch_cursor >= len(epoch_order):
-                    epoch_order = distribute_batches(N, bs, rng)
+                    epoch_order = distribute_batches(W, bs, rng)
                     batch_cursor = 0
-                idxs = epoch_order[batch_cursor]
+                sel = epoch_order[batch_cursor]
                 batch_cursor += 1
+                bcase = pool_case[sel]
+                bstart = pool_start[sel]
 
                 params_now = ps.params_from_tensor()
 
@@ -1052,24 +1176,25 @@ def main() -> int:
                 if pgb is not None:
                     # 批量 SoA：一个 C 调用算完整个 batch 的 loss 与 dL/dp
                     loss_sum, grad_sum = batch_loss_and_grad(
-                        pgb, idxs, K_s, params_now, batch_data, args.loss_scale)
+                        pgb, bcase, bstart, K_s, params_now, batch_data,
+                        args.loss_scale)
                 else:
                     loss_sum = 0.0
                     grad_sum = np.zeros(len(PARAM_NAMES))
-                    for i in idxs:
+                    for i, s_i in zip(bcase, bstart):
                         c = cases[int(i)]
                         # 重力是每条数据自带的已知量：连同当前被辨识参数一起写给句柄。
                         # 不调用 set_params 的话 loss/梯度会一直停在创建时的参数点上，
                         # 表现为 loss 不下降且与学习率无关。
                         pg.set_params(make_params(c, params_now))
-                        loss, g = case_loss_and_grad(pg, c, K_s)
+                        loss, g = case_loss_and_grad(pg, c, K_s, int(s_i))
                         loss_sum += loss
                         grad_sum += g * args.loss_scale
 
                 # 物理参数梯度 -> theta 梯度（重参数化的链式法则）
                 theta_np = ps.theta_np()
                 dtheta = ParamSpec.dtheta_from_dp(grad_sum, theta_np)
-                hist_loss.append(loss_sum / len(idxs))
+                hist_loss.append(loss_sum / len(sel))
                 hist_theta.append(theta_np)
                 hist_K.append(K_s)
 
@@ -1177,7 +1302,7 @@ def main() -> int:
         axes[0][0].semilogy(hist_eval_step, hist_eval_loss, "-o", ms=3, lw=1.4,
                             label="full-window (K=%d) loss, all data" % full_K)
         axes[0][0].semilogy(range(len(hist_loss)), hist_loss, lw=0.6, alpha=0.35,
-                            label="batch loss (current K)")
+                            label="batch loss (current stage windows)")
         if ref_loss is not None:
             axes[0][0].axhline(ref_loss, color="k", ls="--", lw=1.0,
                                label="truth-param floor (noise)")

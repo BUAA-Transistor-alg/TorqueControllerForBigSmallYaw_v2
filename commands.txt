@@ -3,4 +3,4 @@ python3 python/gen_friction_sweep.py --real --fs-vel-tol-frac 0.2 --fs-vel-tol-a
 
 python3 python/identify_params.py --category Sentry1 --friction-category friction_Sentry1 \
     --w-psi-b 1.0 --w-psi-s 1.0 --w-dpsi-b 0.0 --w-dpsi-s 0.0 --grad-mode batch --batch-threads 18\
-    --steps 10000 --batch 120 --no-curriculum
+    --steps 100000 --batch 120
