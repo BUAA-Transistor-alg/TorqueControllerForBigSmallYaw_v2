@@ -113,3 +113,30 @@ set_target_properties(tcbs PROPERTIES
 )
 
 message(STATUS "tcbs 动态库输出目录: ${CMAKE_BINARY_DIR}")
+
+# ---------------------------------------------------------------------------
+# 工具 / 示例程序（tools/）
+#
+#   tcbs_test_serial       : MCU 串口链路自检（打印双级 yaw 反馈 + 实际选中端口）
+#   tcbs_pitch_calibration : pitch 轴两段线性标定（前提: IMU 在头上 ON_HEAD）
+#   tcbs_control_demo      : RobotController 一体化封装演示（双级 yaw + pitch）
+#
+# 三者都只链接 tcbs：通信/MPC/RobotController 的实现实体都在该库里，
+# 头文件搜索路径（PUBLIC）与 udev / Threads / Ceres 依赖随之传递，无需重复声明。
+# 可执行文件默认输出到 ${CMAKE_BINARY_DIR}，即可用 ./build/tcbs_xxx 直接运行
+# （include/com/McuDataPreprocessor.h 与 python/env/real_env.py 的注释即按此约定书写）。
+# ---------------------------------------------------------------------------
+# 串口链路自检（MCU 双级 yaw 反馈 + 实际选中端口）
+add_executable(tcbs_test_serial tools/test_serial.cpp)
+target_link_libraries(tcbs_test_serial PRIVATE tcbs)
+target_compile_options(tcbs_test_serial PRIVATE -Wall -Wextra -Wpedantic)
+
+# Pitch 轴两段线性标定（前提: IMU 在头上 ON_HEAD）
+add_executable(tcbs_pitch_calibration tools/pitch_calibration.cpp)
+target_link_libraries(tcbs_pitch_calibration PRIVATE tcbs)
+target_compile_options(tcbs_pitch_calibration PRIVATE -Wall -Wextra -Wpedantic)
+
+# 控制演示程序（RobotController 一体化封装，双级 yaw + pitch）
+add_executable(tcbs_control_demo tools/control_demo.cpp)
+target_link_libraries(tcbs_control_demo PRIVATE tcbs)
+target_compile_options(tcbs_control_demo PRIVATE -Wall -Wextra -Wpedantic)
