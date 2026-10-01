@@ -24,7 +24,9 @@
 //   pitch(t) = (5° + 15°·sin(ωt − 90°))          −10° ~ +20° 关节角
 //
 // ── 运行 ──
-//   ./build/tcbs_control_demo，Ctrl+C 退出
+//   ./build/tcbs_control_demo              # 默认：不使用重力（模型无重力项）
+//   ./build/tcbs_control_demo --gravity    # 使用重力：实测 gx/gy 每步送进 MPC
+//   Ctrl+C 退出
 
 #include "RobotController.hpp"
 
@@ -33,6 +35,7 @@
 #include <cmath>
 #include <csignal>
 #include <cstdio>
+#include <cstring>
 #include <thread>
 
 namespace tcbs {
@@ -70,9 +73,14 @@ constexpr double INTEGRAL_GAIN_B = 0.01;      // 大 yaw 积分补偿比例系�
 constexpr double INTEGRAL_GAIN_S = 0.01;      // 小 yaw 积分补偿比例系数
 
 // ===========================================================================
-//   gx / gy 是"摆平面内的等效重力分量"，运行期由 FullStrictPoseBuilder 反解得到
-//   并每步送进 MPC（见 DualYawMpcController::solve），因此这里的初值只在
-//   通信尚未就绪时有影响，底盘水平时可填 0。
+//   gx / gy 是"摆平面内的等效重力分量"，运行期由 FullStrictPoseBuilder 反解得到。
+//   **是否真的进模型**由 MPCController::Options::use_gravity 决定（本文件里经
+//   makeMpcOptions(use_gravity) 设置，命令行开关见 main）：
+//     * 默认（不加命令行参数）= 不使用重力 ⇒ 模型里没有重力项，setGravity 收到的
+//       实测值会被求解器按 0 存，重力矩完全靠反馈扛（做对照实验用）；
+//     * 加 --gravity / --use-gravity 才让实测 gx/gy 真正参与求解。
+//   因此这里的初值只在通信尚未就绪时有影响，底盘水平时可填 0；
+//   实测值仍然照常从 rc.getState().strict 读出，不受开关影响。
 //   lambda 是摩擦平滑常数，是**已知固定模型常数**而非辨识量。
 // ===========================================================================
 dm::Params makeDynamicsParams() {
@@ -86,7 +94,7 @@ dm::Params makeDynamicsParams() {
         /*lambda=*/100.0);
 }
 
-mpc::MPCController::Options makeMpcOptions() {
+mpc::MPCController::Options makeMpcOptions(bool use_gravity) {
     mpc::MPCController::Options opt;
     opt.dt           = DT_CTRL;
     opt.refinement   = MPC_REFINE;
@@ -102,6 +110,7 @@ mpc::MPCController::Options makeMpcOptions() {
     opt.w_x          = W_X;
     opt.w_dx         = W_DX;
     opt.max_iter     = MAX_ITER;
+    opt.use_gravity  = use_gravity;   // false（默认）= 模型里没有重力项
     return opt;
 }
 
@@ -134,13 +143,35 @@ inline double targetPitch(double t) {
 // 下面把 namespace tcbs 内的名字引入作用域，便于 main() 直接使用。
 using namespace tcbs;
 
-int main() {
+int main(int argc, char** argv) {
     std::signal(SIGINT, signalHandler);
     std::signal(SIGTERM, signalHandler);
+
+    // 重力开关：直接写进 MPCController::Options::use_gravity（不再单独传参）。
+    // 默认**不使用**重力（模型里没有重力项）：
+    //   --gravity / --use-gravity 打开（实测 gx/gy 真正参与求解）
+    //   --no-gravity 显式关闭（= 默认，便于脚本里写清楚）
+    bool use_gravity = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--gravity") == 0
+            || std::strcmp(argv[i], "--use-gravity") == 0) {
+            use_gravity = true;
+        } else if (std::strcmp(argv[i], "--no-gravity") == 0) {
+            use_gravity = false;
+        } else {
+            printf("未知参数: %s（可用: --gravity / --use-gravity / --no-gravity）\n",
+                   argv[i]);
+            return 2;
+        }
+    }
 
     printf("=== tcbs_control_demo (RobotController, 双级 yaw) ===\n");
     printf("正弦周期 %.1fs: psi_b ±30°, psi_s = psi_b (θ_s≡0), pitch -10°~+20°, 相位差 90°\n",
            PERIOD_S);
+    printf("重力: %s（%s）\n",
+           use_gravity ? "使用" : "不使用",
+           use_gravity ? "实测 gx/gy 每步送进 MPC 模型"
+                       : "use_gravity=false，求解器内部恒按 (0,0) 处理");
 
     // 一体化控制封装：通信 + 严格反解 + 双级 yaw MPC + 后台发送线程
     // imu_location:     IMU 安装构型（决定严格反解的运动学链）
@@ -148,7 +179,7 @@ int main() {
     // mcu_linear_params 用当前默认标定值（LinearParams{} 与默认构造等价）
     RobotController rc(com::FullStrictPoseBuilder::ImuLocation::ON_HEAD,
                        makeDynamicsParams(),
-                       makeMpcOptions(),
+                       makeMpcOptions(use_gravity),
                        makeWrapperOptions(),
                        /*mpc_loop_period=*/0.01,
                        com::McuDataPreprocessor::LinearParams{},

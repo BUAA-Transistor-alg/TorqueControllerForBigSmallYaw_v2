@@ -13,4 +13,5 @@ python3 python/identify_params.py --category Sentry1 \
     --steps 100000 --batch 120 \
     --freeze-params "fbc,fbv,fsc,fsv,Dx,Dy" \
     --known-params "Dx=0.0,Dy=0.07" \
-    --out "./data/identify_Sentry1"
+    --out "./data/identify_Sentry1_ignore_gravity "\
+    --ignore-gravity 

@@ -94,7 +94,9 @@ public:
 
     /// @param imu_location     IMU 安装位置（构型，决定严格反解的运动学链）
     /// @param params           动力学参数
-    /// @param mpc_options      MPC 求解器配置（dt / N / 限幅 / 权重 / refinement）
+    /// @param mpc_options      MPC 求解器配置（dt / N / 限幅 / 权重 / refinement，
+    ///                         以及 use_gravity：默认 false = 模型里没有重力项，
+    ///                         实测 gx/gy 照常出现在 getState().strict 里但不进模型）
     /// @param wrapper_options  积分补偿配置（两轴各自增益）
     /// @param mpc_loop_period  McuMpcController 后台 loop 周期 [s]（无默认值）
     /// @param mcu_linear_params MCU 数据线性映射标定参数

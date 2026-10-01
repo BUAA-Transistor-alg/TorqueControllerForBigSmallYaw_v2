@@ -19,6 +19,9 @@
 //   当前世界方位角按模型定义计算：psi_b = θ_c + θ_b，psi_s = psi_b + θ_s
 // （chassis_azimuth / big_azimuth / small_azimuth / gx / gy 由 FullStrictPoseBuilder
 //  反解得到；底盘水平时 gx = gy = 0，倾斜时为旋转平面内的重力分量。
+//  每步 setGravity() 把实测值交给 MPC；**是否真的进模型**由
+//  MPCController::Options::use_gravity 决定（默认 false ⇒ 求解器内部恒按 0 处理，
+//  模型里没有重力项，做"不用重力"的对照实验用）。
 //  基座角加速度暂用 0，可用 setBaseAngularAcceleration 覆盖。）
 //
 // 两种 step 模式（与参考工程一致）：
@@ -73,7 +76,8 @@ public:
         double dpsi_b = 0.0;
         double dpsi_s = 0.0;
         // 旋转平面内的重力分量（严格反解得到，|(gx,gy)| = g·sin(摆平面倾角)；
-        // 底盘水平时为 0）。每步由 solve 送进 MPC，底盘俯仰/横滚变化时模型才准。
+        // 底盘水平时为 0）。每步由 solve 送进 MPC，底盘俯仰/横滚变化时模型才准；
+        // 是否真的进模型由 MPCController::Options::use_gravity 决定（默认 false）。
         double gx = 0.0;
         double gy = 0.0;
     };

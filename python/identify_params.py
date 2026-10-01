@@ -14,7 +14,12 @@
     mb, Ib, Pbx, Pby, ms, Is, Psx, Psy, Dx, Dy, fbc, fbv, fsc, fsv
 已知量（不辨识，随数据给出）：
     gx, gy —— 重力矢量，**每条数据各自在半径 9.81 的圆内随机采样**并存在该条
-              npz 里（见 generate_id_dataset.py）；求导时按条设置
+              npz 里（见 generate_id_dataset.py）；求导时按条设置。
+              命令行 ``--ignore-gravity`` 时**完全忽略重力**：主辨识与摩擦扫频
+              拟合里的一切 gx/gy 都按 0 处理（模型里不再有重力项），
+              数据里记录的取值只用于打印对照。注意 g=0 时重力列恒为 0，
+              代数初始化要靠 ``--known-params "Dx=…,Dy=…"`` 才能分离
+              Dx/Dy/Psx/Psy（否则只能 ``--init random``）。
     lambda_ —— 固定的平滑摩擦常数
 
 重要：**并非 14 个参数都能辨识**。动力学只通过这些聚合量依赖参数：
@@ -202,7 +207,7 @@ class Case:
                  "weights", "theta_c_seq", "dtheta_c_seq",
                  "xstate", "base_seq")
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, ignore_gravity: bool = False):
         d = np.load(path)
         self.theta_c0 = float(d["theta_c0"])
         self.dtheta_c = float(d["dtheta_c"])
@@ -213,8 +218,9 @@ class Case:
         self.K = int(d["num_steps"])
         self.seed = int(d["seed"])
         # 重力矢量：随数据一起保存的已知输入（不是被辨识参数）
-        self.gx = float(d["gx"])
-        self.gy = float(d["gy"])
+        # --ignore-gravity 时一律按 0 处理（模型里完全没有重力项）
+        self.gx = 0.0 if ignore_gravity else float(d["gx"])
+        self.gy = 0.0 if ignore_gravity else float(d["gy"])
         # 辨识 loss 的四项权重 [psi_b, psi_s, dpsi_b, dpsi_s]：随数据一起记录，
         # 采集时写的是当时的 cfg.W_PSI_*。缺该字段的老数据按全 1。
         # 命令行可用 --w-psi-* / --w-dpsi-* 覆盖（见 main）。
@@ -917,6 +923,17 @@ def _select_joint(d: dict, want_s: bool) -> None:
         d[k] = np.asarray(d[k])[mask]
 
 
+def _zero_gravity(d: dict) -> None:
+    """把 sweep 列字典里的重力列置 0（``--ignore-gravity`` 用）。
+
+    摩擦扫频拟合要先用已辨识动力学把重力矩 G1/G2 扣掉；忽略重力时这一项按 0 算，
+    即认为模型里根本没有重力（代价是实测力矩里的重力矩会落进 fbc/fbv 的残差）。
+    """
+    for k in ("gx", "gy"):
+        if k in d:
+            d[k] = np.zeros_like(np.asarray(d[k], dtype=np.float64))
+
+
 def _G2_of(row: dict, p_dyn: dict, key_sin: str = "mean_sin_psi_s",
            key_cos: str = "mean_cos_psi_s") -> float:
     """按已辨识参数算某个窗口的平均重力矩 G2（关节 s 方程里那一项）。"""
@@ -946,7 +963,8 @@ def fit_friction_sweep_s(sweep_path, p_dyn: dict | None = None,
                          drop_first: int = 0, drop_last: int = 0,
                          vmin: float | None = None, vmax: float | None = None,
                          verbose: bool = False,
-                         list_only: bool = False) -> tuple[float, float, dict]:
+                         list_only: bool = False,
+                         ignore_gravity: bool = False) -> tuple[float, float, dict]:
     """用小 yaw（关节 s）匀速往返数据独立拟合 (fsc, fsv)。
 
     稳态关系（θ̈_b≈0、θ̈_s≈0、θ̇_b≈0、基座静止，见 gen_friction_sweep_s.py）：
@@ -968,11 +986,14 @@ def fit_friction_sweep_s(sweep_path, p_dyn: dict | None = None,
       两者可叠加。``verbose=True`` 会先把数据里全部 |ω| 和实际使用的 |ω| 打出来。
 
     sweep_path 可以是单个 npz 也可以是类别目录（合并其中全部 sweep_*.npz）。
+    ``ignore_gravity=True`` 时把 sweep 里的 gx/gy 一律按 0 处理（不扣重力矩）。
     返回 (fsc, fsv, 诊断信息)；诊断里带"纯差分（完全不依赖已辨识参数）"的结果，
     以及 ``all_omega`` / ``used_omega`` / ``dropped_omega`` 三个列表。
     """
     d, sweep_files = _load_sweeps(sweep_path)
     _select_joint(d, want_s=True)
+    if ignore_gravity:
+        _zero_gravity(d)
     n = int(np.asarray(d["omega"]).size)
     if n == 0:
         raise ValueError(f"{sweep_path} 里没有小 yaw 数据行")
@@ -1176,7 +1197,8 @@ def _load_sweeps(path) -> tuple[dict, list[str]]:
     return merged, [f.name for f in files]
 
 
-def fit_friction_sweep(sweep_path, p_dyn: dict) -> tuple[float, float, dict]:
+def fit_friction_sweep(sweep_path, p_dyn: dict,
+                       ignore_gravity: bool = False) -> tuple[float, float, dict]:
     """用匀速旋转实验的稳态数据拟合关节 b 的两个摩擦系数。
 
     稳态关系（θ̈_b=θ̈_s=0、θ̇_s≈0、基座静止，见 gen_friction_sweep.py 的推导）：
@@ -1187,11 +1209,14 @@ def fit_friction_sweep(sweep_path, p_dyn: dict) -> tuple[float, float, dict]:
 
     sweep_path 可以是单个 npz，也可以是**类别目录**（合并其中全部 sweep_*.npz，
     即该类别下所有采集运行）。
+    ``ignore_gravity=True`` 时把 sweep 里的 gx/gy 一律按 0 处理（G1 按 0 算）。
 
     返回 (fbc, fbv, 诊断信息)。
     """
     d, sweep_files = _load_sweeps(sweep_path)
     _select_joint(d, want_s=False)
+    if ignore_gravity:
+        _zero_gravity(d)
     ms, Psx, Psy = p_dyn["ms"], p_dyn["Psx"], p_dyn["Psy"]
     mb, Pbx, Pby = p_dyn["mb"], p_dyn["Pbx"], p_dyn["Pby"]
     Dx, Dy = p_dyn["Dx"], p_dyn["Dy"]
@@ -1456,6 +1481,12 @@ def main() -> int:
                          '若想让某个已知值只当初值、训练时放开，'
                          '用 --freeze-params "Dx:0"（或给个有限步数先冻后放）。'
                          f"可用的已知参数: {', '.join(sorted(KNOWN_OK))}")
+    ap.add_argument("--ignore-gravity", action="store_true",
+                    help="完全忽略重力：主辨识（loss / 代数初始化 / 画图）与摩擦扫频"
+                         "拟合里扣的 G1/G2，所有 gx/gy 一律按 0 处理，而不是用数据里"
+                         "记录的重力（默认关闭 = 用数据里的重力）。"
+                         "注意 g=0 时重力列恒为 0，代数初始化无法分离 Dx/Dy/Psx/Psy，"
+                         "需同时给 --known-params \"Dx=值,Dy=值\"（或改用 --init random）")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--out", type=str, default=None,
                     help="结果目录；缺省时 --category 给定时用 data/identify_<类别>，"
@@ -1470,6 +1501,14 @@ def main() -> int:
     # 已知参数默认全程冻结；表里明确写了 0（= 不冻结）或有限步数时按表来
     for n in known:
         freeze_until.setdefault(n, math.inf)
+
+    # --ignore-gravity 下 _regression_block 里的 4 个重力列（P/Q2/R+U/S+V）恒为 0，
+    # det = P²+Q² = 0 ⇒ 代数初始化必然退化（Dx = 0/0 = nan），最后只会得到
+    # "找不到可行的 (mb, ms)"这种误导性报错。这里提前拦下并给出可操作的做法。
+    if args.ignore_gravity and args.init == "algebraic" and not {"Dx", "Dy"} <= set(known):
+        ap.error("--ignore-gravity 时重力项全为 0（P/Q2/R+U/S+V 四列恒为 0），"
+                 "代数初始化无法分离 Dx/Dy/Psx/Psy；"
+                 "请配 --known-params \"Dx=<值>,Dy=<值>\"，或改用 --init random")
 
     def _stamp_of(name: str) -> str:
         """从 case_<时间戳>_<序号>.npz 里解析出时间戳（旧的无戳文件返回 unknown）。"""
@@ -1500,7 +1539,7 @@ def main() -> int:
     else:
         print(f"真值文件: 无（{truth_path} 不存在）——不画真值曲线、不做真值对比")
 
-    cases = [Case(f) for f in files]
+    cases = [Case(f, ignore_gravity=args.ignore_gravity) for f in files]
     # loss 四项权重可用命令行覆盖；只给其中几项时，其余仍用数据里记录的值
     w_override = (args.w_psi_b, args.w_psi_s, args.w_dpsi_b, args.w_dpsi_s)
     if any(v is not None for v in w_override):
@@ -1526,8 +1565,12 @@ def main() -> int:
     print(f"loss 权重（{wsrc}）: 位置 psi_b={cases[0].weights[0]:g} "
           f"psi_s={cases[0].weights[1]:g}   速度 dpsi_b={cases[0].weights[2]:g} "
           f"dpsi_s={cases[0].weights[3]:g}")
-    print(f"被辨识参数: {len(PARAM_NAMES)} 个（重力 gx/gy 为已知输入，取值跨度 "
-          f"[{g_range[0]:.2f}, {g_range[1]:.2f}]）")
+    if args.ignore_gravity:
+        print(f"被辨识参数: {len(PARAM_NAMES)} 个（--ignore-gravity：重力 gx/gy 一律按 0 "
+              f"处理，数据里记录的重力被忽略；摩擦扫频拟合同样不扣 G1/G2）")
+    else:
+        print(f"被辨识参数: {len(PARAM_NAMES)} 个（重力 gx/gy 为已知输入，取值跨度 "
+              f"[{g_range[0]:.2f}, {g_range[1]:.2f}]）")
     print(f"优化: {args.steps} 步, batch={args.batch}, Adam lr={args.lr}")
     effective_bs = min(args.batch, N)
     print(f"每 epoch batch 数 ≈ {max(1, N // effective_bs)}   "
@@ -1578,7 +1621,8 @@ def main() -> int:
         if args.use_friction_sweep and sweep_path.exists():
             p_dyn, _ = algebraic_init(cases, nominal=tuple(args.mass_nominal),
                                       friction=(0.0, 0.0, 0.0, 0.0), known=known)
-            fbc, fbv, finfo = fit_friction_sweep(sweep_path, p_dyn)
+            fbc, fbv, finfo = fit_friction_sweep(
+                sweep_path, p_dyn, ignore_gravity=args.ignore_gravity)
             print(f"匀速旋转实验拟合大 yaw 摩擦（{finfo['files']} 个 sweep 文件，"
                   f"{finfo['n']} 个速度点，"
                   f"|ω| {finfo['omega_abs_min']:.4f}~{finfo['omega_abs_max']:.2f} rad/s，"
@@ -1605,7 +1649,8 @@ def main() -> int:
                     fsc2, fsv2, sinfo = fit_friction_sweep_s(
                         s_path, p_dyn, dyn_correct=args.fs_s_dyn,
                         drop_first=args.fs_s_drop_first, drop_last=args.fs_s_drop_last,
-                        vmin=args.fs_s_vmin, vmax=args.fs_s_vmax, verbose=True)
+                        vmin=args.fs_s_vmin, vmax=args.fs_s_vmax, verbose=True,
+                        ignore_gravity=args.ignore_gravity)
                 except ValueError as e:
                     print(f"（小 yaw 数据 {s_path} 不可用：{e}）")
                 else:
