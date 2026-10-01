@@ -558,10 +558,17 @@ def main() -> int:
                     help="角加速度标定的往返次数（正反各一段/次，取平均）")
     ap.add_argument("--ss-a-ref-frac", type=float, default=cfg.SS_A_REF_FRAC,
                     help="换向斜坡取实测 a_max 的比例（默认 0.5，留一半力矩做余量）")
-    ap.add_argument("--ss-kpv", type=float, default=cfg.SS_KPV,
-                    help="θ_s 速度环比例增益")
-    ap.add_argument("--ss-kiv", type=float, default=cfg.SS_KIV,
-                    help="θ_s 速度环积分增益（低速能否破静摩擦主要看它）")
+    ap.add_argument("--ss-kpv", type=float, default=None,
+                    help="θ_s 速度环比例增益（显式给值就关闭自动整定）")
+    ap.add_argument("--ss-kiv", type=float, default=None,
+                    help="θ_s 速度环积分增益（显式给值就关闭自动整定）")
+    ap.add_argument("--ss-vel-wn", type=float, default=cfg.SS_VEL_WN,
+                    help="自动整定的目标速度环带宽 [rad/s]（真机 I/O 延迟下建议 ≤15）")
+    ap.add_argument("--ss-vel-zeta", type=float, default=cfg.SS_VEL_ZETA,
+                    help="自动整定的目标阻尼比")
+    ap.add_argument("--no-vel-autotune", dest="vel_autotune", action="store_false",
+                    default=cfg.SS_VEL_AUTOTUNE,
+                    help="关闭按标定 a_max 反解速度环增益，改用 --ss-kpv/--ss-kiv")
     ap.add_argument("--ss-lpf-alpha", type=float, default=cfg.SS_CTRL_LPF_ALPHA,
                     help="控制用状态的一阶低通系数（1=不滤波）")
     ap.add_argument("--debug", action="store_true", help="打印每趟被剔除的原因")
@@ -589,8 +596,13 @@ def main() -> int:
     cfg.SS_AMAX_CAL = args.amax_cal
     cfg.SS_AMAX_CYCLES = args.amax_cycles
     cfg.SS_A_REF_FRAC = args.ss_a_ref_frac
-    cfg.SS_KPV = args.ss_kpv
-    cfg.SS_KIV = args.ss_kiv
+    if args.ss_kpv is not None:
+        cfg.SS_KPV = args.ss_kpv
+    if args.ss_kiv is not None:
+        cfg.SS_KIV = args.ss_kiv
+    cfg.SS_VEL_AUTOTUNE = args.vel_autotune and args.ss_kpv is None and args.ss_kiv is None
+    cfg.SS_VEL_WN = args.ss_vel_wn
+    cfg.SS_VEL_ZETA = args.ss_vel_zeta
     cfg.SS_CTRL_LPF_ALPHA = args.ss_lpf_alpha
     tau_s_max = args.tau_s_max if args.real else cfg.TAU_S_MAX
 
@@ -659,6 +671,19 @@ def main() -> int:
                       f"{cfg.SS_A_REF_FRAC:g}×{amax_meas:.1f}) = {used:.1f} rad/s²"
                       f"   （≈ τ/M22，反向峰值因此停在 ±{cfg.THETA_S_TARGET_DEG:g}° 内）")
                 cfg.SS_A_REF = used
+                # ---- 速度环自动整定：M_eff = τ_max/a_max ⇒ 由目标带宽反解 KPV/KIV ----
+                if cfg.SS_VEL_AUTOTUNE:
+                    m_eff = tau_s_max / amax_meas
+                    wn, zeta = cfg.SS_VEL_WN, cfg.SS_VEL_ZETA
+                    cfg.SS_KIV = wn * wn * m_eff
+                    cfg.SS_KPV = 2.0 * zeta * wn * m_eff
+                    print(f"    速度环自动整定: M_eff=τ_max/a_max={m_eff:.5f} kg·m² ⇒ "
+                          f"目标 ω_n={wn:g} rad/s ζ={zeta:g}")
+                    print(f"      KPV={cfg.SS_KPV:.4f}  KIV={cfg.SS_KIV:.4f}"
+                          f"（回退值 {args.ss_kpv if args.ss_kpv else '—'}；想手动就用 "
+                          f"--ss-kpv/--ss-kiv 显式给值）")
+                else:
+                    print(f"    速度环用显式/回退增益: KPV={cfg.SS_KPV:g} KIV={cfg.SS_KIV:g}")
             else:
                 safe = min(cfg.SS_A_REF, cfg.SS_A_REF_SAFE)
                 print(f"  最大角加速度标定失败（只拿到 {cal['n']} 段，需 ≥3）！"
