@@ -53,6 +53,7 @@ add_library(tcbs SHARED
     src/dm/simulator.cpp
     src/dm/trajectory.cpp
     src/dm/param_gradient.cpp
+    src/dm/param_gradient_batch.cpp
     src/mpc/mpc_controller.cpp
     src/mpc/dual_yaw_mpc_controller.cpp
     src/mpc/mcu_mpc_controller.cpp
@@ -81,6 +82,28 @@ target_compile_options(tcbs PRIVATE -Wall -Wextra -Wpedantic)
 set_source_files_properties(
     src/dm/trajectory.cpp src/dm/param_gradient.cpp PROPERTIES
     COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O3;-funroll-loops;-fno-math-errno>")
+
+# ---------------------------------------------------------------------------
+# 批量参数梯度（param_gradient_batch）额外开启 SIMD pragma；可选 -march=native。
+#
+# 只作用于这一个翻译单元：其他模式（trajectory 力矩梯度 / 单序列参数梯度 /
+# Simulator）的编译选项与数值行为完全不变。
+#
+# TCBS_NATIVE_ARCH=ON（默认）时用 -march=native，向量宽度跟随本机（AVX2/AVX512）；
+# 需要在别的机器上运行同一个 .so 时用 -DTCBS_NATIVE_ARCH=OFF 重新配置。
+# ---------------------------------------------------------------------------
+option(TCBS_NATIVE_ARCH "为批量参数梯度开启 -march=native（本机编译本机运行）" ON)
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-march=native" TCBS_HAS_MARCH_NATIVE)
+set(TCBS_PGB_FLAGS "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O3;-funroll-loops;-fno-math-errno;-fopenmp-simd>")
+if(TCBS_NATIVE_ARCH AND TCBS_HAS_MARCH_NATIVE)
+    list(APPEND TCBS_PGB_FLAGS "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-march=native>")
+    message(STATUS "批量参数梯度: 开启 -march=native")
+else()
+    message(STATUS "批量参数梯度: 不开启 -march=native（可移植构建）")
+endif()
+set_source_files_properties(src/dm/param_gradient_batch.cpp PROPERTIES
+    COMPILE_OPTIONS "${TCBS_PGB_FLAGS}")
 
 # 产物统一放到 build/ 根目录，方便 python/ 下按相对路径加载。
 set_target_properties(tcbs PROPERTIES

@@ -54,8 +54,8 @@ HERE = Path(__file__).resolve().parent          # 本文件所在目录：python
 REPO = HERE.parent                              # 仓库根
 sys.path.insert(0, str(HERE))
 
-from capi import (Params, State, ParamGradient, ParamLossSpec,  # noqa: E402
-                   PARAM_GRADIENT_NAMES)
+from capi import (Params, State, ParamGradient, ParamGradientBatch,  # noqa: E402
+                   ParamLossSpec, PARAM_GRADIENT_NAMES)
 import sim_config as cfg  # noqa: E402
 
 DATA_DIR = REPO / "data" / "sim"
@@ -346,6 +346,71 @@ def case_loss(pg: ParamGradient, case: Case, K: int) -> float:
 
 
 # ===========================================================================
+# 批量（SoA）参数梯度：一次算完一个 batch 的 loss 之和与 dL/dp 之和
+#
+# 与上面逐条调用 case_loss_and_grad 完全等价（数值一致到 1e-13 量级），
+# 但底层是 SoA + SIMD + 多线程，所以同样的 batch 只用一次 C 调用。
+# ===========================================================================
+def pack_batch_data(cases: list["Case"], lam: float) -> dict:
+    """把各条数据的 AoS 数组拼成整块（按样本取子集时只做一次 fancy indexing）。
+
+    * x0      (N, 4)
+    * base    (N, 3)   theta_c0 / dtheta_c / ddtheta_c
+    * tau     (N, K, 2)
+    * tgt     长度 4，各 (N, K)
+    * gx/gy   (N,)
+    * weights (N, 4)
+    * dt / lambda 标量
+    """
+    return {
+        "dt": cases[0].dt,
+        "lambda": float(lam),
+        "x0": np.array([[c.x0.theta_b, c.x0.dtheta_b, c.x0.theta_s, c.x0.dtheta_s]
+                        for c in cases], dtype=np.float64),
+        "base": np.array([[c.theta_c0, c.dtheta_c, c.ddtheta_c] for c in cases],
+                         dtype=np.float64),
+        "tau": np.stack([c.tau for c in cases]).astype(np.float64, copy=False),
+        "tgt": [np.stack([c.psi_b for c in cases]).astype(np.float64, copy=False),
+                np.stack([c.psi_s for c in cases]).astype(np.float64, copy=False),
+                np.stack([c.dpsi_b for c in cases]).astype(np.float64, copy=False),
+                np.stack([c.dpsi_s for c in cases]).astype(np.float64, copy=False)],
+        "gx": np.array([c.gx for c in cases], dtype=np.float64),
+        "gy": np.array([c.gy for c in cases], dtype=np.float64),
+        "weights": np.array([c.weights for c in cases], dtype=np.float64),
+    }
+
+
+def batch_loss_and_grad(pgb: ParamGradientBatch, idxs, K: int, params_now: dict,
+                        data: dict, loss_scale: float) -> tuple[float, np.ndarray]:
+    """一个 batch 的 (loss 之和, dL/dp 之和 × loss_scale)，grad 形状 (14,)。
+
+    ``params_now`` 是 14 个被辨识参数（同一批共享）；每条数据的 gx/gy 不同，
+    按样本从 ``data`` 里取。窗口取各序列的前 K 步。
+    """
+    idx = np.asarray(idxs, dtype=np.intp)
+    B = idx.size
+    # params: (17, B)，顺序同 Params 字段（mb..Dy | gx gy | fbc..fsv | lambda）
+    pr = np.empty((17, B), dtype=np.float64)
+    pr[:10, :] = np.array([params_now[n] for n in PARAM_NAMES[:10]],
+                          dtype=np.float64)[:, None]
+    pr[10, :] = data["gx"][idx]
+    pr[11, :] = data["gy"][idx]
+    pr[12:16, :] = np.array([params_now[n] for n in PARAM_NAMES[10:]],
+                            dtype=np.float64)[:, None]
+    pr[16, :] = data["lambda"]
+    loss, grad = pgb.run(
+        pr,
+        data["x0"][idx].T,                       # (4, B)
+        data["base"][idx].T,                     # (3, B)
+        data["tau"][idx, :K, :].transpose(1, 2, 0),   # (K, 2, B)
+        [t[idx, :K].T for t in data["tgt"]],     # 各 (K, B)
+        data["weights"][idx].T,                  # (4, B)
+        data["dt"],
+    )
+    return float(loss.sum()), grad.sum(axis=1) * loss_scale
+
+
+# ===========================================================================
 # 代数初始化：把运动方程对"聚合量"线性化后做闭式最小二乘
 #
 # 运动方程（见 src/dm/param_gradient.cpp 的 evaluate）：
@@ -590,7 +655,8 @@ def fit_friction_sweep(sweep_path, p_dyn: dict) -> tuple[float, float, dict]:
 # 有了代数初值（--init algebraic，默认）之后，K=5/10 这类极小窗口已无必要——
 # 它们信息量不足、只会让参数在平坦谷里漂；K=20 起就够（加速度已可观测）。
 # 若改用随机初值（--init random），可自行加回小窗口，但实测那样也救不了 2 个数量级。
-DEFAULT_STAGES = "20:0.08,50:0.10,100:0.12,200:0.20,300:0.50"
+# DEFAULT_STAGES = "20:0.08,50:0.10,100:0.12,200:0.20,300:0.50"
+DEFAULT_STAGES = "20:0.2,50:0.2,100:0.2,200:0.2,300:0.2"
 
 
 def report_init(init_p: dict, ref: dict, ref_ident: dict, has_truth: bool,
@@ -731,7 +797,15 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=10000,
                     help="总优化步数，按 --stages 的权重分配到各阶段")
     ap.add_argument("--batch", type=int, default=8)
-    ap.add_argument("--lr", type=float, default=5.0e-4,
+    ap.add_argument("--grad-mode", choices=("batch", "loop"), default="batch",
+                    help="梯度精修用哪种参数梯度接口：batch=批量 SoA（默认，"
+                         "样本维 SIMD + 多线程）；loop=逐条调用单序列接口（原实现，"
+                         "用于对照/调试）")
+    ap.add_argument("--batch-threads", type=int, default=0,
+                    help="批量梯度的线程数；0 = 用硬件并发")
+    ap.add_argument("--batch-lanes", type=int, default=16,
+                    help="批量梯度每个 SIMD 分块处理的样本数上限")
+    ap.add_argument("--lr", type=float, default=0.0075,
                     help="Adam 学习率；theta 空间极窄的稳定区间，见文件末尾说明")
     ap.add_argument("--loss-scale", type=float, default=1.0,
                     help="对均值 loss 乘的系数（Adam 会归一化梯度，影响很小）")
@@ -840,6 +914,8 @@ def main() -> int:
           f"(数据 {N} 条 / batch {effective_bs})")
 
     full_K = cases[0].K
+    # 批量梯度的整块数据：预先拼一次，训练时只按 batch 取子集
+    batch_data = pack_batch_data(cases, LAMBDA) if args.grad_mode == "batch" else None
     # 课程表：(拟合窗口 K, 该阶段步数)。K 按权重分摊总步数，并逐步拉长到 full_K。
     if args.curriculum:
         plan = [(min(k, full_K), max(1, int(round(args.steps * w))))
@@ -928,10 +1004,20 @@ def main() -> int:
     # 短窗口阶段的大步长才可能把它拉回来。这里按 lr ∝ 1/K 给每个阶段定步长，
     # 并在阶段内做余弦衰减（warm restart）：阶段开始时步子大、结束时落定。
     def stage_lr_for(K_s: int) -> float:
-        return args.lr * (full_K / max(1, K_s))
+        return args.lr * 1 # (full_K / max(1, K_s))
 
     with ParamGradient(make_params(cases[0], ps.seed_values()),
                        refinement=refinement) as pg:
+        pgb = None
+        if batch_data is not None:
+            pgb = ParamGradientBatch(refinement=refinement, max_batch=N,
+                                     max_num_steps=full_K,
+                                     num_threads=args.batch_threads,
+                                     lanes=args.batch_lanes)
+            print(f"参数梯度接口: 批量 SoA（threads={pgb.num_threads} lanes={pgb.lanes}，"
+                  f"B≤{N}，K≤{full_K}）")
+        else:
+            print("参数梯度接口: 逐条单序列（--grad-mode loop）")
         for stage_i, (K_s, n_steps) in enumerate(plan):
             lr_s = stage_lr_for(K_s)
             # 最后一个阶段用全量数据：batch=8 的梯度噪声会让组合误差停在 ~3%
@@ -963,17 +1049,22 @@ def main() -> int:
                     hist_eval_step.append(gstep)
                     hist_eval_loss.append(tot / N)
 
-                loss_sum = 0.0
-                grad_sum = np.zeros(len(PARAM_NAMES))
-                for i in idxs:
-                    c = cases[int(i)]
-                    # 重力是每条数据自带的已知量：连同当前被辨识参数一起写给句柄。
-                    # 不调用 set_params 的话 loss/梯度会一直停在创建时的参数点上，
-                    # 表现为 loss 不下降且与学习率无关。
-                    pg.set_params(make_params(c, params_now))
-                    loss, g = case_loss_and_grad(pg, c, K_s)
-                    loss_sum += loss
-                    grad_sum += g * args.loss_scale
+                if pgb is not None:
+                    # 批量 SoA：一个 C 调用算完整个 batch 的 loss 与 dL/dp
+                    loss_sum, grad_sum = batch_loss_and_grad(
+                        pgb, idxs, K_s, params_now, batch_data, args.loss_scale)
+                else:
+                    loss_sum = 0.0
+                    grad_sum = np.zeros(len(PARAM_NAMES))
+                    for i in idxs:
+                        c = cases[int(i)]
+                        # 重力是每条数据自带的已知量：连同当前被辨识参数一起写给句柄。
+                        # 不调用 set_params 的话 loss/梯度会一直停在创建时的参数点上，
+                        # 表现为 loss 不下降且与学习率无关。
+                        pg.set_params(make_params(c, params_now))
+                        loss, g = case_loss_and_grad(pg, c, K_s)
+                        loss_sum += loss
+                        grad_sum += g * args.loss_scale
 
                 # 物理参数梯度 -> theta 梯度（重参数化的链式法则）
                 theta_np = ps.theta_np()
@@ -994,6 +1085,9 @@ def main() -> int:
                     print(f"  step {gstep:6d}  K={K_s:>3}  batch loss={hist_loss[-1]:.4e}  "
                           f"{combo_lab}={combo_error(cur, truth_ident):.3e}  "
                           f"lr={sched.get_last_lr()[0]:.2e}")
+
+        if pgb is not None:
+            pgb.close()
 
     # ---------------------------------------------------------------------
     # 结果

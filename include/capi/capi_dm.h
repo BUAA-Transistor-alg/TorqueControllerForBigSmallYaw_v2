@@ -308,6 +308,74 @@ double tcbs_param_gradient_run(TcbsTrajectory* t,
                                 double* grad_p,
                                 TcbsState* out_final_state);
 
+/* ==================================================================== */
+/* 系统参数辨识模式（批量 / SoA）：一次对一批序列求 dL/dp                */
+/* ==================================================================== */
+/*
+ * 与单序列 tcbs_param_gradient_* 数学完全一致，只是把 B 条互相独立的序列
+ * 放在一起算：同一批内共享 dt / refinement / num_steps，但每条序列有自己的
+ * 参数（gx/gy 可不同）、初值、基座量、力矩、目标与权重。
+ *
+ * 所有数组都是 SoA：**样本维 b 最连续**（不同样本的同一个量相邻），
+ * 这样向量化与多线程都直接作用在样本维上。
+ *
+ *   params[q*B + b]      q = 0..16，顺序同 TcbsParams 字段：
+ *                        mb Ib Pbx Pby ms Is Psx Psy Dx Dy gx gy fbc fbv fsc fsv lambda_
+ *   x0[i*B + b]          i = 0..3：theta_b dtheta_b theta_s dtheta_s
+ *   base[j*B + b]        j = 0..2：theta_c0 dtheta_c ddtheta_c
+ *   tau[(2k+c)*B + b]    c = 0 力矩 b / 1 力矩 s
+ *   target_*(k*B + b)    k = 0..K-1；可为 NULL（该项目标恒为 0）
+ *   weights[q*B + b]     q = 0..3：w_psi_b w_psi_s w_dpsi_b w_dpsi_s
+ *   out_loss[b]                      长度 B
+ *   out_grad[j*B + b]    j = 0..13，顺序同 tcbs_param_gradient_name
+ */
+
+typedef struct TcbsParamGradientBatch TcbsParamGradientBatch;
+
+/*
+ * 创建批处理句柄。
+ *   refinement   每个 dt 内的 RK4 子步数
+ *   max_batch    允许的最大 B（缓冲按此分配）
+ *   max_num_steps 允许的最大 K
+ *   num_threads  <= 0 表示用 std::thread::hardware_concurrency()
+ *   lanes        每个 SIMD 分块处理的样本数上限（<=0 用默认 16）
+ * 失败返回 NULL，原因见 tcbs_last_error()。
+ */
+TcbsParamGradientBatch* tcbs_param_gradient_batch_create(int refinement,
+                                                         int max_batch,
+                                                         size_t max_num_steps,
+                                                         int num_threads,
+                                                         int lanes);
+
+/* 销毁；传入 NULL 是安全的。 */
+void tcbs_param_gradient_batch_destroy(TcbsParamGradientBatch* h);
+
+/* 实际使用的线程数。 */
+int tcbs_param_gradient_batch_threads(const TcbsParamGradientBatch* h);
+
+/* 实际使用的 SIMD 分块宽度。 */
+int tcbs_param_gradient_batch_lanes(const TcbsParamGradientBatch* h);
+
+/*
+ * 计算一批序列的损失与 dL/dp（长度必须与创建时声明的一致）。
+ * 成功返回 1；失败返回 0，原因见 tcbs_last_error()。
+ */
+int tcbs_param_gradient_batch_run(TcbsParamGradientBatch* h,
+                                  int batch,
+                                  size_t num_steps,
+                                  double dt,
+                                  const double* params,
+                                  const double* x0,
+                                  const double* base,
+                                  const double* tau,
+                                  const double* target_psi_b,
+                                  const double* target_psi_s,
+                                  const double* target_dpsi_b,
+                                  const double* target_dpsi_s,
+                                  const double* weights,
+                                  double* out_loss,
+                                  double* out_grad);
+
 
 #ifdef __cplusplus
 }  /* extern "C" */

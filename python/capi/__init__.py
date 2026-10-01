@@ -15,6 +15,7 @@ C 符号前缀统一为 tcbs_。
 from .capi_dm import (  # noqa: F401
     PARAM_GRADIENT_NAMES,
     ParamGradient,
+    ParamGradientBatch,
     ParamLossSpec,
     Params,
     Simulator,
@@ -37,7 +38,8 @@ from .capi_com import (  # noqa: F401
 )
 
 __all__ = ["Params", "State", "Simulator", "Trajectory", "TrajectoryLoss",
-           "ParamGradient", "ParamLossSpec", "PARAM_GRADIENT_NAMES", "library_path",
+           "ParamGradient", "ParamGradientBatch", "ParamLossSpec",
+           "PARAM_GRADIENT_NAMES", "library_path",
            # 通信模块（capi_com）
            "RobotCommunication", "ImuLocation", "YawMode", "LinearParams",
            "McuSendPacket", "McuReceivePacket", "ImuSendPacket", "ImuReceivePacket",

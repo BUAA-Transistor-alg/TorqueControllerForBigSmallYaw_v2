@@ -7,6 +7,7 @@
 #include "params.hpp"
 #include "simulator.hpp"
 #include "param_gradient.hpp"
+#include "param_gradient_batch.hpp"
 #include "state.hpp"
 #include "trajectory.hpp"
 
@@ -131,6 +132,19 @@ ParamGradientHolder* asParamGradient(TcbsTrajectory* t) {
 
 const ParamGradientHolder* asParamGradient(const TcbsTrajectory* t) {
     return reinterpret_cast<const ParamGradientHolder*>(t);
+}
+
+/// 批量参数梯度句柄的 C++ 侧持有点。
+struct ParamGradientBatchHolder {
+    tcbs::dm::ParamGradientBatchWorkspace ws;
+};
+
+ParamGradientBatchHolder* asBatch(TcbsParamGradientBatch* h) {
+    return reinterpret_cast<ParamGradientBatchHolder*>(h);
+}
+
+const ParamGradientBatchHolder* asBatch(const TcbsParamGradientBatch* h) {
+    return reinterpret_cast<const ParamGradientBatchHolder*>(h);
 }
 
 tcbs::dm::ParamLossSpec makeParamSpec(double w_psi_b,
@@ -576,6 +590,93 @@ double tcbs_param_gradient_run(TcbsTrajectory* t,
     } catch (...) {
         setError("tcbs_param_gradient_run: unknown error");
         return -1.0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 批量（SoA）参数梯度
+// ---------------------------------------------------------------------------
+TcbsParamGradientBatch* tcbs_param_gradient_batch_create(int refinement, int max_batch,
+                                                         size_t max_num_steps,
+                                                         int num_threads, int lanes) {
+    if (refinement < tcbs::dm::kRefinementMin ||
+        refinement > tcbs::dm::kRefinementMax) {
+        setError("tcbs_param_gradient_batch_create: refinement out of range");
+        return nullptr;
+    }
+    if (max_batch < 1 || max_num_steps < 1) {
+        setError("tcbs_param_gradient_batch_create: max_batch / max_num_steps must be >= 1");
+        return nullptr;
+    }
+    try {
+        g_last_error.clear();
+        auto* holder = new ParamGradientBatchHolder();
+        const int ln = (lanes <= 0) ? 16 : lanes;
+        if (!holder->ws.resize(refinement, max_batch, max_num_steps, num_threads, ln)) {
+            delete holder;
+            setError("tcbs_param_gradient_batch_create: workspace allocation failed");
+            return nullptr;
+        }
+        return reinterpret_cast<TcbsParamGradientBatch*>(holder);
+    } catch (const std::exception& e) {
+        setError(e.what());
+        return nullptr;
+    } catch (...) {
+        setError("tcbs_param_gradient_batch_create: unknown error");
+        return nullptr;
+    }
+}
+
+void tcbs_param_gradient_batch_destroy(TcbsParamGradientBatch* h) { delete asBatch(h); }
+
+int tcbs_param_gradient_batch_threads(const TcbsParamGradientBatch* h) {
+    if (h == nullptr) {
+        setError("tcbs_param_gradient_batch_threads: handle is NULL");
+        return 0;
+    }
+    return asBatch(h)->ws.num_threads;
+}
+
+int tcbs_param_gradient_batch_lanes(const TcbsParamGradientBatch* h) {
+    if (h == nullptr) {
+        setError("tcbs_param_gradient_batch_lanes: handle is NULL");
+        return 0;
+    }
+    return asBatch(h)->ws.lanes;
+}
+
+int tcbs_param_gradient_batch_run(TcbsParamGradientBatch* h,
+                                  int batch,
+                                  size_t num_steps,
+                                  double dt,
+                                  const double* params,
+                                  const double* x0,
+                                  const double* base,
+                                  const double* tau,
+                                  const double* target_psi_b,
+                                  const double* target_psi_s,
+                                  const double* target_dpsi_b,
+                                  const double* target_dpsi_s,
+                                  const double* weights,
+                                  double* out_loss,
+                                  double* out_grad) {
+    if (h == nullptr) {
+        setError("tcbs_param_gradient_batch_run: handle is NULL");
+        return 0;
+    }
+    try {
+        g_last_error.clear();
+        tcbs::dm::computeParamGradientBatch(params, x0, base, tau, target_psi_b,
+                                            target_psi_s, target_dpsi_b, target_dpsi_s,
+                                            weights, batch, num_steps, dt, asBatch(h)->ws,
+                                            out_loss, out_grad);
+        return 1;
+    } catch (const std::exception& e) {
+        setError(e.what());
+        return 0;
+    } catch (...) {
+        setError("tcbs_param_gradient_batch_run: unknown error");
+        return 0;
     }
 }
 

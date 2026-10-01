@@ -233,6 +233,29 @@ def _load_library() -> ctypes.CDLL:
         _dbl_p, ctypes.POINTER(_CState),
     ]
 
+    # ---- 批量（SoA）参数梯度 ----
+    lib.tcbs_param_gradient_batch_create.restype = ctypes.c_void_p
+    lib.tcbs_param_gradient_batch_create.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_size_t, ctypes.c_int, ctypes.c_int]
+
+    lib.tcbs_param_gradient_batch_destroy.restype = None
+    lib.tcbs_param_gradient_batch_destroy.argtypes = [ctypes.c_void_p]
+
+    lib.tcbs_param_gradient_batch_threads.restype = ctypes.c_int
+    lib.tcbs_param_gradient_batch_threads.argtypes = [ctypes.c_void_p]
+
+    lib.tcbs_param_gradient_batch_lanes.restype = ctypes.c_int
+    lib.tcbs_param_gradient_batch_lanes.argtypes = [ctypes.c_void_p]
+
+    lib.tcbs_param_gradient_batch_run.restype = ctypes.c_int
+    lib.tcbs_param_gradient_batch_run.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_size_t, ctypes.c_double,
+        _dbl_p, _dbl_p, _dbl_p, _dbl_p,
+        _dbl_p, _dbl_p, _dbl_p, _dbl_p,
+        _dbl_p, _dbl_p, _dbl_p,
+    ]
+
     return lib
 
 
@@ -848,3 +871,138 @@ class ParamGradient:
 
     def __repr__(self) -> str:
         return f"ParamGradient({self._params!r})"
+
+
+class ParamGradientBatch:
+    """批量参数梯度：一次对 **一批** 序列求 (loss[b], dL/dp[b])。
+
+    数学与 :class:`ParamGradient` 完全一致，但一次处理 B 条互相独立的序列，
+    并且所有数组都是 **SoA**：样本维 b 最连续（不同样本的同一个量相邻），
+    底层用 SIMD + 多线程并行。
+
+    与 :class:`ParamGradient` 的区别：``ParamGradient`` 的求导点参数写在句柄里
+    （``set_params``），而这里参数是**每次调用一起传进来的**（因为同一批里
+    每条序列的 gx/gy 可以不同）。
+
+    :param refinement:   每个 dt 内的 RK4 子步数
+    :param max_batch:    允许的最大批大小 B（缓冲按此分配）
+    :param max_num_steps: 允许的最大步数 K
+    :param num_threads:  <= 0 表示用硬件并发
+    :param lanes:        每个 SIMD 分块处理的样本数上限
+
+    用法::
+
+        pgb = ParamGradientBatch(refinement=16, max_batch=120, max_num_steps=300)
+        loss, grad = pgb.run(params, x0, base, tau, targets, weights, dt)
+        # loss: (B,)   grad: (14, B)
+
+    数组形状（均为 float64）：
+        params  (17, B)  顺序同 Params 字段
+        x0      (4,  B)  theta_b dtheta_b theta_s dtheta_s
+        base    (3,  B)  theta_c0 dtheta_c ddtheta_c
+        tau     (K, 2, B)  —— 即 (2k+c) 行、样本维连续
+        targets 长度 4 的序列，每项 (K, B) 或 None（目标恒 0）
+        weights (4,  B)  w_psi_b w_psi_s w_dpsi_b w_dpsi_s
+    """
+
+    def __init__(self, refinement: int, max_batch: int, max_num_steps: int,
+                 num_threads: int = 0, lanes: int = 16):
+        handle = _lib.tcbs_param_gradient_batch_create(
+            int(refinement), int(max_batch), ctypes.c_size_t(max_num_steps),
+            int(num_threads), int(lanes))
+        if not handle:
+            raise RuntimeError(f"tcbs_param_gradient_batch_create 失败: {_last_error()}")
+        self._handle = handle
+        self._refinement = int(refinement)
+        self._max_batch = int(max_batch)
+        self._max_num_steps = int(max_num_steps)
+
+    def close(self) -> None:
+        if getattr(self, "_handle", None):
+            _lib.tcbs_param_gradient_batch_destroy(self._handle)
+            self._handle = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "ParamGradientBatch":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def _require_handle(self) -> ctypes.c_void_p:
+        if not getattr(self, "_handle", None):
+            raise RuntimeError("ParamGradientBatch 已关闭")
+        return self._handle
+
+    @property
+    def num_threads(self) -> int:
+        """实际使用的线程数。"""
+        return int(_lib.tcbs_param_gradient_batch_threads(self._require_handle()))
+
+    @property
+    def lanes(self) -> int:
+        """实际使用的 SIMD 分块宽度。"""
+        return int(_lib.tcbs_param_gradient_batch_lanes(self._require_handle()))
+
+    def run(self, params, x0, base, tau, targets, weights, dt):
+        """计算一批序列的 (loss, grad)。
+
+        返回 ``(loss, grad)``：``loss`` 形状 (B,)，``grad`` 形状 (14, B)。
+        失败抛 RuntimeError。
+        """
+        pr = np.ascontiguousarray(params, dtype=np.float64)
+        x0a = np.ascontiguousarray(x0, dtype=np.float64)
+        ba = np.ascontiguousarray(base, dtype=np.float64)
+        ta = np.ascontiguousarray(tau, dtype=np.float64)
+        wa = np.ascontiguousarray(weights, dtype=np.float64)
+        if pr.ndim != 2 or pr.shape[0] != 17:
+            raise ValueError(f"params 形状应为 (17, B)，收到 {pr.shape}")
+        B = pr.shape[1]
+        if x0a.shape != (4, B):
+            raise ValueError(f"x0 形状应为 (4, {B})，收到 {x0a.shape}")
+        if ba.shape != (3, B):
+            raise ValueError(f"base 形状应为 (3, {B})，收到 {ba.shape}")
+        if ta.ndim != 3 or ta.shape[1] != 2 or ta.shape[2] != B:
+            raise ValueError(f"tau 形状应为 (K, 2, {B})，收到 {ta.shape}")
+        K = ta.shape[0]
+        if wa.shape != (4, B):
+            raise ValueError(f"weights 形状应为 (4, {B})，收到 {wa.shape}")
+        if B > self._max_batch:
+            raise ValueError(f"batch={B} 超过 max_batch={self._max_batch}")
+        if K > self._max_num_steps:
+            raise ValueError(f"num_steps={K} 超过 max_num_steps={self._max_num_steps}")
+
+        tarr = []
+        if len(targets) != 4:
+            raise ValueError("targets 必须是长度 4 的序列")
+        for name, t in zip(("target_psi_b", "target_psi_s",
+                            "target_dpsi_b", "target_dpsi_s"), targets):
+            if t is None:
+                tarr.append(None)
+                continue
+            a = np.ascontiguousarray(t, dtype=np.float64)
+            if a.shape != (K, B):
+                raise ValueError(f"{name} 形状应为 ({K}, {B})，收到 {a.shape}")
+            tarr.append(a)
+
+        loss = np.zeros(B, dtype=np.float64)
+        grad = np.zeros(14 * B, dtype=np.float64)
+        ok = _lib.tcbs_param_gradient_batch_run(
+            self._require_handle(),
+            ctypes.c_int(B), ctypes.c_size_t(K), ctypes.c_double(dt),
+            _dbl_ptr(pr), _dbl_ptr(x0a), _dbl_ptr(ba), _dbl_ptr(ta),
+            _dbl_ptr(tarr[0]), _dbl_ptr(tarr[1]), _dbl_ptr(tarr[2]), _dbl_ptr(tarr[3]),
+            _dbl_ptr(wa), _dbl_ptr(loss), _dbl_ptr(grad),
+        )
+        if not ok:
+            raise RuntimeError(f"tcbs_param_gradient_batch_run 失败: {_last_error()}")
+        return loss, grad.reshape(14, B)
+
+    def __repr__(self) -> str:
+        return (f"ParamGradientBatch(refinement={self._refinement}, "
+                f"max_batch={self._max_batch}, max_num_steps={self._max_num_steps})")
