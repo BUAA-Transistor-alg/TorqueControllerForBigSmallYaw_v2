@@ -35,7 +35,8 @@ tcbs::dm::Params toParams(const TcbsParams& c) {
     return tcbs::dm::Params(c.mb, c.Ib, c.Pbx, c.Pby,
                          c.ms, c.Is, c.Psx, c.Psy,
                          c.Dx, c.Dy, c.gx, c.gy,
-                         c.fbc, c.fbv, c.fsc, c.fsv, c.lambda_);
+                         c.fbc, c.fbv, c.fsc, c.fsv, c.lambda_,
+                         c.kb, c.ks);
 }
 
 TcbsParams toCParams(const tcbs::dm::Params& p) {
@@ -57,6 +58,8 @@ TcbsParams toCParams(const tcbs::dm::Params& p) {
     c.fsc = p.fsc;
     c.fsv = p.fsv;
     c.lambda_ = p.lambda;
+    c.kb = p.kb;
+    c.ks = p.ks;
     return c;
 }
 

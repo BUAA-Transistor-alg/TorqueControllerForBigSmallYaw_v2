@@ -83,7 +83,7 @@ public:
     /// @param comm            机器人通信（可为 nullptr，此时不退化为发送、step 返回 invalid）
     /// @param params          动力学参数
     /// @param mpc_options     MPC 求解器配置（dt / N / 限幅 / 权重 / refinement，
-    ///                        以及 use_gravity：默认 false = 模型里没有重力项，
+    ///                        以及 use_gravity：默认 true = 使用重力，
     ///                        实测 gx/gy 仍照常读出但不参与求解）
     /// @param wrapper_options 积分补偿配置（两轴各自增益；默认不积分）
     /// @param loop_period     后台 loop 周期 [s]（默认 0.01 = 100Hz）

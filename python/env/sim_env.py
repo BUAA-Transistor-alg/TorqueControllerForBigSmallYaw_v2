@@ -3,7 +3,7 @@
 对外只暴露两个操作接口
 ----------------------
     state()          -> State    立即获取当前状态
-    step(Tb, Ts)     -> State    输入两个控制力矩，推进一个 dt，返回推进后的状态
+    step(Tb, Ts)     -> State    输入两个**给电控的指令值**（[-1, +1]），推进一个 dt
 
 只读信息（构造后固定，不能设置）
 --------------------------------
@@ -68,9 +68,10 @@ class SimEnv:
     """双连杆仿真环境（基座静止、参数来自配置文件、重力随机但固定、不可重置）。
 
     噪声模型（构造时用 noise 开关控制，默认开）：
-      * **执行器侧**：step(Tb, Ts) 内部把输入力矩叠加 σ_tau 的高斯噪声后再送进仿真，
-        也就是"实际施加的力矩 = 输入的力矩 + 噪声"；外部拿到的记录值就是那个输入，
-        等价于"记录力矩上叠了噪声"。
+      * **执行器侧**：step(Tb, Ts) 内部把输入**指令值**叠加 σ_tau 的高斯噪声后再送进
+        仿真；外部拿到的记录值就是那个输入，等价于"记录值上叠了噪声"。
+        ★ 输入是"下发给电控的指令值"（协议恒在 [-1, +1]）；真实物理力矩由模型内部的
+        通道增益换算：物理力矩 = kb·Tb、ks·Ts（见 sim_config.DEFAULT_PARAMS）。
       * **传感器侧**：state()/step() 返回的都是**叠加了测量噪声**的状态
         （角 σ_pos、角速度 σ_vel），内部仿真用的是无噪声的真实状态。
       采集脚本因此只需原样记录接口返回的状态、以及自己发出去的力矩，不自己做任何加噪。
@@ -94,7 +95,7 @@ class SimEnv:
                               ms=d["ms"], Is=d["Is"], Psx=d["Psx"], Psy=d["Psy"],
                               Dx=d["Dx"], Dy=d["Dy"], gx=gx, gy=gy,
                               fbc=d["fbc"], fbv=d["fbv"], fsc=d["fsc"], fsv=d["fsv"],
-                              lambda_=d["lambda_"])
+                              lambda_=d["lambda_"], kb=d.get("kb", 1.0), ks=d.get("ks", 1.0))
         self._dt = float(dt)
         self._refinement = int(refinement)
         self._noise = bool(noise)
@@ -121,10 +122,10 @@ class SimEnv:
         return self._measured(self._sim.state)
 
     def step(self, Tb: float, Ts: float) -> State:
-        """输入两个控制力矩，推进一个 dt，返回推进后的状态（启用噪声时为**测量值**）。
+        """输入两个**指令值**（[-1, +1]），推进一个 dt，返回推进后的状态（启用噪声时为**测量值**）。
 
-        内部按 "输入力矩 + σ_tau 高斯噪声" 作为实际施加力矩推进（并受力矩限幅），
-        基座状态恒为 0（theta_c = dtheta_c = ddtheta_c = 0）。
+        内部按 "输入 + σ_tau 高斯噪声" 作为下发的指令推进（并做指令限幅），真实物理
+        力矩 = kb/ks × 该指令值；基座状态恒为 0（theta_c = dtheta_c = ddtheta_c = 0）。
         """
         ab, as_ = float(Tb), float(Ts)
         if self._noise:
@@ -167,10 +168,14 @@ class SimEnv:
     # ---------------- 控制器需要的模型量（不暴露参数本身） ----------------
     def gravity_torque(self, theta_b: float | None = None,
                        theta_s: float | None = None) -> tuple[float, float]:
-        """给定状态下的静态重力矩 (G1, G2)；不给状态则用当前状态。
+        """给定状态下的静态重力矩，**已换算成"下发给电控的指令值"单位**。
 
-        静止时 Q = G，所以这就是"扛住重力"所需的前馈力矩。放在环境里是为了让
-        采集脚本在做控制时不必接触真实参数。
+        静止时物理力矩要扛住重力，即 κ = G；而 κ = k·(指令值) ⇒ 指令值 = G/k。
+        所以这里返回 (G1/kb, G2/ks)，可以直接作为前馈叠加到 step() 的输入上
+        （step 收的就是指令值）。放在环境里是为了让采集脚本做控制时不必接触
+        真实参数、也不必自己换算增益。
+
+        参数不给则用当前状态。
         """
         st = self._sim.state
         tb = st.theta_b if theta_b is None else float(theta_b)
@@ -183,7 +188,7 @@ class SimEnv:
         psi_b, psi_s = tb, tb + ts
         G2 = gs_sin * math.sin(psi_s) + gs_cos * math.cos(psi_s)
         G1 = gb_sin * math.sin(psi_b) + gb_cos * math.cos(psi_b) + G2
-        return G1, G2
+        return G1 / p.kb, G2 / p.ks
 
     # ---------------- 生命周期 ----------------
     def close(self) -> None:

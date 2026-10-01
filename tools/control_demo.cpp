@@ -75,7 +75,8 @@ constexpr double INTEGRAL_GAIN_S = 0.01;      // 小 yaw 积分补偿比例系�
 // ===========================================================================
 //   gx / gy 是"摆平面内的等效重力分量"，运行期由 FullStrictPoseBuilder 反解得到。
 //   **是否真的进模型**由 MPCController::Options::use_gravity 决定（本文件里经
-//   makeMpcOptions(use_gravity) 设置，命令行开关见 main）：
+//   makeMpcOptions(use_gravity) 设置，**默认 true = 使用重力**，
+//   命令行 --no-gravity 可切成对照模式，见 main）：
 //     * 默认（不加命令行参数）= 不使用重力 ⇒ 模型里没有重力项，setGravity 收到的
 //       实测值会被求解器按 0 存，重力矩完全靠反馈扛（做对照实验用）；
 //     * 加 --gravity / --use-gravity 才让实测 gx/gy 真正参与求解。
@@ -110,7 +111,7 @@ mpc::MPCController::Options makeMpcOptions(bool use_gravity) {
     opt.w_x          = W_X;
     opt.w_dx         = W_DX;
     opt.max_iter     = MAX_ITER;
-    opt.use_gravity  = use_gravity;   // false（默认）= 模型里没有重力项
+    opt.use_gravity  = use_gravity;   // true（默认）= 实测 gx/gy 进模型
     return opt;
 }
 
@@ -148,10 +149,10 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, signalHandler);
 
     // 重力开关：直接写进 MPCController::Options::use_gravity（不再单独传参）。
-    // 默认**不使用**重力（模型里没有重力项）：
-    //   --gravity / --use-gravity 打开（实测 gx/gy 真正参与求解）
-    //   --no-gravity 显式关闭（= 默认，便于脚本里写清楚）
-    bool use_gravity = false;
+    // **默认使用重力**（实测 gx/gy 每步真正进 MPC 模型）：
+    //   --no-gravity 显式关闭（模型里没有重力项，做对照实验）
+    //   --gravity / --use-gravity 冗余打开（便于脚本里写清楚）
+    bool use_gravity = true;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--gravity") == 0
             || std::strcmp(argv[i], "--use-gravity") == 0) {
@@ -159,7 +160,7 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--no-gravity") == 0) {
             use_gravity = false;
         } else {
-            printf("未知参数: %s（可用: --gravity / --use-gravity / --no-gravity）\n",
+            printf("未知参数: %s（可用: --no-gravity / --gravity / --use-gravity）\n",
                    argv[i]);
             return 2;
         }

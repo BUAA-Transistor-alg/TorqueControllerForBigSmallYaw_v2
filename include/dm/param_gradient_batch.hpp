@@ -12,15 +12,17 @@
 // ---------------------------------------------------------------------------
 // 内存布局（所有数组都按 "量 × 样本" 的扁平 SoA 存放，样本维 b 连续）
 // ---------------------------------------------------------------------------
-//   params[q*B + b]      q = 0..16，顺序同 Params 字段：
-//                        mb Ib Pbx Pby ms Is Psx Psy Dx Dy gx gy fbc fbv fsc fsv lambda
+//   params[q*B + b]      q = 0..18，顺序同 Params 字段：
+//                        mb Ib Pbx Pby ms Is Psx Psy Dx Dy gx gy fbc fbv fsc fsv
+//                        lambda kb ks
 //   x0[i*B + b]          i = 0..3：theta_b dtheta_b theta_s dtheta_s
 //   base[j*B + b]        j = 0..2：theta_c0 dtheta_c ddtheta_c
 //   tau[(2k+c)*B + b]    k = 0..K-1，c = 0/1：tau_b / tau_s
+//                        ★ 是"发给电控的指令值"，物理力矩 = kb/ks × 该值
 //   target_*(k*B + b)    k = 0..K-1；指针为 nullptr 表示该项目标恒为 0
 //   weights[q*B + b]     q = 0..3：w_psi_b w_psi_s w_dpsi_b w_dpsi_s
 //   out_loss[b]                     长度 B
-//   out_grad[j*B + b]    j = 0..13：14 个可辨识参数（顺序同 paramGradientNames()）
+//   out_grad[j*B + b]    j = 0..15：16 个可辨识参数（顺序同 paramGradientNames()）
 //
 // 同一批内所有样本共享 num_steps / dt / refinement。
 
@@ -33,8 +35,8 @@
 namespace tcbs {
 namespace dm {
 
-/// params 每个样本的量个数（= Params 的 17 个字段）。
-inline constexpr int kBatchParamCount = 17;
+/// params 每个样本的量个数（= Params 的 19 个字段）。
+inline constexpr int kBatchParamCount = 19;
 
 /// 内部缓冲。创建/扩容一次后可反复复用（跨 batch、跨 num_steps）。
 ///

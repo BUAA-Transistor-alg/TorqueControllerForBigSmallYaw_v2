@@ -468,7 +468,8 @@ def main() -> int:
                     help="类别名（= 目录名）：输出到 data/<类别>/sweep_s_<时间戳>.npz")
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--zero-gravity", action="store_true",
-                    help="[仿真] 把等效重力强制设为 0（水平面）；不给则随机")
+                    help="[仿真] 把等效重力强制设为 0（水平面，做「不用重力」的对照）；"
+                         "不给则**默认在倾角范围内随机抽重力**——即默认使用重力。")
     ap.add_argument("--gravity-seed", type=int, default=None)
     ap.add_argument("--no-noise", dest="noise", action="store_false",
                     help="[仿真] 关闭环境噪声")
@@ -491,9 +492,10 @@ def main() -> int:
     # ---- 本实验特有 ----
     ap.add_argument("--hold-big", action="store_true",
                     help="用位置环把大 yaw 抱在会话开始角度；不给则 Tb=0（人工/机械固定）")
-    ap.add_argument("--no-gravity-ff", dest="gravity_ff", action="store_false",
-                    default=cfg.SS_GRAVITY_FF,
-                    help="关掉关节 s 的重力前馈 G2（做对照用；差分法本身不依赖它）")
+    ap.add_argument("--no-gravity-ff", "--no-gravity", dest="gravity_ff",
+                    action="store_false", default=True,
+                    help="关掉关节 s 的重力前馈 G2（做「不用重力」的对照；"
+                         "差分法本身不依赖它）。★ 默认**开启**重力前馈（cfg.SS_GRAVITY_FF=True）")
     ap.add_argument("--ss-a-ref", type=float, default=cfg.SS_A_REF,
                     help="参考速度斜坡角加速度 [rad/s²]（越小反作用力矩越小、匀速段越短）")
     ap.add_argument("--ss-time-budget", type=float, default=cfg.SS_TIME_BUDGET,

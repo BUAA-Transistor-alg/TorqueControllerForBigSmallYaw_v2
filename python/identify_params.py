@@ -7,22 +7,47 @@
   2) **课程 + 梯度精修**：用库的解析梯度（ParamGradient，前向灵敏度）+ torch Adam，
      拟合窗口从 K=5 逐步拉长到全窗口 K=300，把组合误差压到 ~0.1%、loss 压到噪声底。
 
-梯度来源：ParamGradient（对 14 个动力学参数的前向灵敏度解析梯度，已用有限差分验证
+梯度来源：ParamGradient（对 16 个动力学参数的前向灵敏度解析梯度，已用有限差分验证
 到 1e-9，见 tests/test_trajectory_gradient.cpp）。torch 只负责参数容器与 Adam 更新。
 
-被辨识参数（14 个）：
-    mb, Ib, Pbx, Pby, ms, Is, Psx, Psy, Dx, Dy, fbc, fbv, fsc, fsv
+被辨识参数（16 个）：
+    mb, Ib, Pbx, Pby, ms, Is, Psx, Psy, Dx, Dy, fbc, fbv, fsc, fsv, kb, ks
+
+控制力矩通道增益 kb / ks
+-----------------------
+所有力矩输入（npz 里的 tau_b/tau_s、Simulator/ParamGradient 的 Tb/Ts）**永远是
+"下发给电控的指令值"**（协议规定恒在 [-1, +1]，电控/电机内部再换算成力矩）。
+真实物理力矩是 kb·Tb / ks·Ts，所以这两个增益是**动力学模型的一部分**：
+
+    Qb = kb·Tb − fbv·ḃb − fbc·tanh(λ·ḃb),   Qs = ks·Ts − fsv·ḃs − fsc·tanh(λ·ḃs)
+
+实测口径（Sentry1）：**kb = 4**（下发 1 ⇒ 电机发力 4 N·m）。ks 未实测。
+
+★ 采集脚本一个都不用改：它们保存的一直是"发给电控的指令值"，语义没变；
+  模型侧把增益补上即可，因此**已采集的数据全部继续可用**。
+
+★ 自由度：kb 与 ks 的**公共尺度**与物理参数的标度严格不可辨识（同乘 λ、惯量/质心
+  同除 λ 得到逐点相同的轨迹）。固定其中一个即可消除自由度，本脚本两种都支持：
+
+    --known-params "kb=4.0"          # 固定 kb（已实测），辨识 ks
+    --known-params "ks=1.0"          # 固定 ks，辨识 kb
+    --freeze-params "kb:3000"        # 先冻 kb 3000 步再放开
+
+  --known-params 只在**初始最小二乘阶段**指定值；后续优化是否冻结由 --freeze-params
+  单独决定（不给则沿用旧行为=全程冻结；写 "kb:0" 就是只当初值、训练中放开）。
 已知量（不辨识，随数据给出）：
     gx, gy —— 重力矢量，**每条数据各自在半径 9.81 的圆内随机采样**并存在该条
               npz 里（见 generate_id_dataset.py）；求导时按条设置。
-              命令行 ``--ignore-gravity`` 时**完全忽略重力**：主辨识与摩擦扫频
-              拟合里的一切 gx/gy 都按 0 处理（模型里不再有重力项），
+              ★ **默认使用重力**：主辨识与摩擦扫频拟合都按数据里记录的 gx/gy
+              计入重力项（真机口径，与 MPC 的 use_gravity=true 默认一致）。
+              命令行 ``--ignore-gravity``（别名 ``--no-gravity``）是**显式关闭**的
+              对照模式：一切 gx/gy 都按 0 处理（模型里不再有重力项），
               数据里记录的取值只用于打印对照。注意 g=0 时重力列恒为 0，
               代数初始化要靠 ``--known-params "Dx=…,Dy=…"`` 才能分离
-              Dx/Dy/Psx/Psy（否则只能 ``--init random``）。
+              Dx/Psx/Psy（否则只能 ``--init random``）。
     lambda_ —— 固定的平滑摩擦常数
 
-重要：**并非 14 个参数都能辨识**。动力学只通过这些聚合量依赖参数：
+重要：**并非 16 个参数都能辨识**。动力学只通过这些聚合量依赖参数：
     I_B=Ib+mb*Pb^2, I_S=Is+ms*Ps^2, I_D=ms*D^2, ms*h, ms*dhd,
     gs_*=ms*(gx*Psx+gy*Psy), gb_*=gx*(mb*Pbx+ms*Dx)+gy*(mb*Pby+ms*Dy), 4 个摩擦
 把它们当自由未知数后方程对它们严格线性；线性系统里有 5 组共线列，等价于**恰好
@@ -30,7 +55,7 @@
 本身没有意义**，参数可以沿平坦谷滑很远而 loss 完全不变；只有 IDENTIFIABLE 里那
 12 个组合是有意义的评价指标。绘图里参数曲线对不可辨识方向会明显偏离真值，属正常。
 
-reparameterization（把 14 个量映射到 14 个 O(1) 的 theta）：
+reparameterization（把 16 个量映射到 16 个 O(1) 的 theta）：
     mb, Ib, ms, Is, fbc, fbv, fsc, fsv  > 0   -> theta = log(p)
     (Pbx,Pby), (Psx,Psy), (Dx,Dy)             -> theta = (log r, phi), p = (r cos phi, r sin phi)
 
@@ -121,24 +146,25 @@ DATA_DIR = REPO / "data" / "sim"
 # ===========================================================================
 # 参数分类与取值范围（用于随机初始化；"不离谱"的物理量级）
 # ===========================================================================
-# 重参数化：把 14 个被辨识参数映射到 14 个无量纲 / 角度变量 theta
+# 重参数化：把 16 个被辨识参数映射到 16 个无量纲 / 角度变量 theta
 #   * 8 个恒正标量      -> theta = log(p)        (mb,Ib,ms,Is,fbc,fbv,fsc,fsv)
 #   * 3 组有符号参数对  -> theta = (log r, phi)  ((Pbx,Pby),(Psx,Psy),(Dx,Dy))
 #         p = (r cos phi, r sin phi)
 #
 # 为什么要用极坐标：直接对有符号参数做加法参数化时，同一组内两个分量可以相差
 # 一个量级（例如 (Dx,Dy)），Adam 的统一步长会让小的那个一步跳很多、大的几乎不动。
-# 换成 (log r, phi) 后 14 个 theta 分量都是 O(1)，单一学习率对所有参数都合适。
+# 换成 (log r, phi) 后 16 个 theta 分量都是 O(1)，单一学习率对所有参数都合适。
 #
 # 重力 gx/gy **不在**被辨识参数里：它是随采集数据一起保存的已知输入
 # （每条 npz 内的 gx/gy），只参与正演，不求导。
 # ===========================================================================
-POSITIVE = {"mb", "Ib", "ms", "Is", "fbc", "fbv", "fsc", "fsv"}
+POSITIVE = {"mb", "Ib", "ms", "Is", "fbc", "fbv", "fsc", "fsv", "kb", "ks"}
 PARAM_NAMES = list(PARAM_GRADIENT_NAMES)
 assert set(PARAM_NAMES) == POSITIVE | {"Pbx", "Pby", "Psx", "Psy", "Dx", "Dy"}, PARAM_NAMES
 
 # theta 分量 -> 物理量的布局（下标与 PARAM_GRADIENT_NAMES 对齐）
-SCALAR_AT = {0: "mb", 1: "Ib", 4: "ms", 5: "Is", 10: "fbc", 11: "fbv", 12: "fsc", 13: "fsv"}
+SCALAR_AT = {0: "mb", 1: "Ib", 4: "ms", 5: "Is", 10: "fbc", 11: "fbv",
+             12: "fsc", 13: "fsv", 14: "kb", 15: "ks"}
 PAIR_AT = {2: ("Pbx", "Pby"), 6: ("Psx", "Psy"), 8: ("Dx", "Dy")}
 _PARAM_INDEX = {n: i for i, n in enumerate(PARAM_NAMES)}
 
@@ -190,6 +216,9 @@ IDENTIFIABLE = [
     ("fbv",                   lambda p: p["fbv"]),
     ("fsc",                   lambda p: p["fsc"]),
     ("fsv",                   lambda p: p["fsv"]),
+    # 控制力矩通道增益：物理力矩 = k × 下发给电控的指令值（模型里的直接参数）
+    ("kb",                    lambda p: p["kb"]),
+    ("ks",                    lambda p: p["ks"]),
 ]
 
 
@@ -443,7 +472,8 @@ def parse_freeze_params(spec: str) -> dict[str, float]:
 # Pbx/Pby/Psx/Psy/Ib/Is 不能单独给定：它们只以 mb·Pbx、ms·Dx、Is+ms·Ps² 这类
 # 聚合形式进入方程，单独固定某一个而不知道质量标度时方程无法自洽。
 # ===========================================================================
-KNOWN_OK = {"Dx", "Dy", "mb", "ms", "fbc", "fbv", "fsc", "fsv"}
+KNOWN_OK = {"Dx", "Dy", "mb", "ms", "fbc", "fbv", "fsc", "fsv",
+            "kb", "ks"}
 KNOWN_UNSUPPORTED = {"Pbx", "Pby", "Psx", "Psy", "Ib", "Is"}
 
 
@@ -664,28 +694,31 @@ def pack_batch_data(cases: list["Case"], lam: float) -> dict:
 def batch_loss_and_grad(pgb: ParamGradientBatch, win_case, win_start, K: int,
                         params_now: dict, data: dict,
                         loss_scale: float) -> tuple[float, np.ndarray]:
-    """一个 batch 的 (loss 之和, dL/dp 之和 × loss_scale)，grad 形状 (14,)。
+    """一个 batch 的 (loss 之和, dL/dp 之和 × loss_scale)，grad 形状 (16,)。
 
     ``win_case`` / ``win_start`` 是这个 batch 里各样本的（数据下标, 窗口起点 s）：
     样本覆盖该条数据的 [s, s+K) 段，初值取该时刻的实测状态 ``xstate[:, s]``，
     基座起点取 ``base_seq[:, s]``（等价于把整段序列的窗口段单独拎出来）。
 
-    ``params_now`` 是 14 个被辨识参数（同一批共享）；每条数据的 gx/gy 不同，
-    按样本从 ``data`` 里取。
+    ``params_now`` 是 16 个被辨识参数（同一批共享，含 kb/ks）；每条数据的 gx/gy
+    不同，按样本从 ``data`` 里取。
     """
     ci = np.asarray(win_case, dtype=np.intp)
     st = np.asarray(win_start, dtype=np.intp)
     B = ci.size
     cols = st[:, None] + np.arange(K, dtype=np.intp)[None, :]        # (B, K)
-    # params: (17, B)，顺序同 Params 字段（mb..Dy | gx gy | fbc..fsv | lambda）
-    pr = np.empty((17, B), dtype=np.float64)
-    pr[:10, :] = np.array([params_now[n] for n in PARAM_NAMES[:10]],
-                          dtype=np.float64)[:, None]
+    # params: (19, B)，顺序同 Params 字段
+    #   mb..Dy | gx gy | fbc..fsv | lambda | kb ks
+    pr = np.empty((19, B), dtype=np.float64)
+    pr[0:10, :] = np.array([params_now[n] for n in PARAM_NAMES[0:10]],
+                           dtype=np.float64)[:, None]
     pr[10, :] = data["gx"][ci]
     pr[11, :] = data["gy"][ci]
-    pr[12:16, :] = np.array([params_now[n] for n in PARAM_NAMES[10:]],
+    pr[12:16, :] = np.array([params_now[n] for n in PARAM_NAMES[10:14]],
                             dtype=np.float64)[:, None]
     pr[16, :] = data["lambda"]
+    pr[17, :] = float(params_now["kb"])
+    pr[18, :] = float(params_now["ks"])
     loss, grad = pgb.run(
         pr,
         data["xstate"][ci, st].T,                     # (4, B)
@@ -1257,7 +1290,7 @@ def report_init(init_p: dict, ref: dict, ref_ident: dict, has_truth: bool,
 
     ``--init algebraic``（默认）时 ``init_p`` 就是闭式最小二乘（algebraic_init）解出的初值。
     保存到 ``out_dir``：
-      * ``init_algebraic.png``：左 = 14 个参数绝对值（symlog）初值 vs 真值/标称；
+      * ``init_algebraic.png``：左 = 16 个参数绝对值（symlog）初值 vs 真值/标称；
         右 = 12 个可辨识组合的相对误差；
       * ``init_trajectory_algebraic.png``：``plot_pick`` 指定的几条数据上，
         用初值参数前向仿真的 ψ_b/ψ_s 位置曲线 vs 实测（有真值再叠真值曲线）。
@@ -1291,7 +1324,7 @@ def report_init(init_p: dict, ref: dict, ref_ident: dict, has_truth: bool,
 
         fig, axes = plt.subplots(1, 2, figsize=(16, 7), constrained_layout=True)
 
-        # 左：14 个参数的绝对值（symlog 同时容纳正负与跨数量级）
+        # 左：16 个参数的绝对值（symlog 同时容纳正负与跨数量级）
         ax = axes[0]
         y = np.arange(len(names))
         h = 0.38
@@ -1476,16 +1509,22 @@ def main() -> int:
     ap.add_argument("--known-params", type=str, default="",
                     help='外部已知参数表 "参数=值,..."：代数初始化时当已知量用'
                          '（Dx,Dy 解析折掉 A+B/C−D 两列；摩擦搬到右端；mb,ms 直接'
-                         '固定标度、跳过网格搜索），并默认全程冻结在给定值上。'
-                         '例: --known-params "Dx=0.05,Dy=0.30"。'
-                         '若想让某个已知值只当初值、训练时放开，'
-                         '用 --freeze-params "Dx:0"（或给个有限步数先冻后放）。'
+                         '固定标度、跳过网格搜索；kb,ks 作为该通道增益的初值）。'
+                         '★ 只负责**初始最小二乘阶段的值**；后续优化是否冻结由'
+                         ' --freeze-params 单独决定（不给则沿用旧行为=全程冻结；'
+                         '写 "名字:0" 则只当初值、训练中放开）。'
+                         '例: --known-params "Dx=0.05,Dy=0.30"；'
+                         '固定力矩通道增益以消除自由度: --known-params "kb=4.0"'
+                         '（实测口径：下发 1 ⇒ 4 N·m）或 "ks=1.0"。'
                          f"可用的已知参数: {', '.join(sorted(KNOWN_OK))}")
-    ap.add_argument("--ignore-gravity", action="store_true",
-                    help="完全忽略重力：主辨识（loss / 代数初始化 / 画图）与摩擦扫频"
-                         "拟合里扣的 G1/G2，所有 gx/gy 一律按 0 处理，而不是用数据里"
-                         "记录的重力（默认关闭 = 用数据里的重力）。"
-                         "注意 g=0 时重力列恒为 0，代数初始化无法分离 Dx/Dy/Psx/Psy，"
+    ap.add_argument("--ignore-gravity", "--no-gravity", dest="ignore_gravity",
+                    action="store_true",
+                    help="★ 默认**使用重力**：主辨识（loss / 代数初始化 / 画图）与摩擦"
+                         "扫频拟合都按数据里逐条记录的 gx/gy 计入重力项。"
+                         "本开关是**显式关闭**的对照模式：所有 gx/gy 一律按 0 处理，"
+                         "模型里完全没有重力项。"
+                         "注意 g=0 时回归的 4 个重力列（P/Q2/R+U/S+V）恒为 0，"
+                         "代数初始化无法分离 Dx/Dy/Psx/Psy，"
                          "需同时给 --known-params \"Dx=值,Dy=值\"（或改用 --init random）")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--out", type=str, default=None,
@@ -1498,17 +1537,27 @@ def main() -> int:
         known = parse_known_params(args.known_params)
     except ValueError as e:
         ap.error(str(e))
-    # 已知参数默认全程冻结；表里明确写了 0（= 不冻结）或有限步数时按表来
+    # ---- known 与 freeze 是两件事 ----
+    #   --known-params  只在**初始最小二乘阶段**指定值（kb/ks 作为该通道增益初值）。
+    #   --freeze-params 控制**后续优化**是否冻结（含"先冻 n 步再放开"）。
+    # 为不破坏既有命令行，known 里的参数默认仍按全程冻结处理；
+    # 想"只当初始值、训练时放开"就显式写 --freeze-params "名字:0"。
     for n in known:
         freeze_until.setdefault(n, math.inf)
+    known_only = [n for n in PARAM_NAMES
+                  if n in known and freeze_until.get(n, 0.0) == 0.0]
+    if known_only:
+        print(f"[提示] --known-params 里的 {', '.join(known_only)} 被 --freeze-params "
+              f"明确设为不冻结：只作为初始值，训练中会被优化。")
 
     # --ignore-gravity 下 _regression_block 里的 4 个重力列（P/Q2/R+U/S+V）恒为 0，
     # det = P²+Q² = 0 ⇒ 代数初始化必然退化（Dx = 0/0 = nan），最后只会得到
     # "找不到可行的 (mb, ms)"这种误导性报错。这里提前拦下并给出可操作的做法。
     if args.ignore_gravity and args.init == "algebraic" and not {"Dx", "Dy"} <= set(known):
-        ap.error("--ignore-gravity 时重力项全为 0（P/Q2/R+U/S+V 四列恒为 0），"
-                 "代数初始化无法分离 Dx/Dy/Psx/Psy；"
-                 "请配 --known-params \"Dx=<值>,Dy=<值>\"，或改用 --init random")
+        ap.error("--ignore-gravity（别名 --no-gravity）时重力项全为 0"
+                 "（P/Q2/R+U/S+V 四列恒为 0），代数初始化无法分离 Dx/Dy/Psx/Psy；"
+                 "请配 --known-params \"Dx=<值>,Dy=<值>\"，或改用 --init random。"
+                 "（默认是**使用重力**，不加这个开关就不会走到这里）")
 
     def _stamp_of(name: str) -> str:
         """从 case_<时间戳>_<序号>.npz 里解析出时间戳（旧的无戳文件返回 unknown）。"""
@@ -1566,11 +1615,11 @@ def main() -> int:
           f"psi_s={cases[0].weights[1]:g}   速度 dpsi_b={cases[0].weights[2]:g} "
           f"dpsi_s={cases[0].weights[3]:g}")
     if args.ignore_gravity:
-        print(f"被辨识参数: {len(PARAM_NAMES)} 个（--ignore-gravity：重力 gx/gy 一律按 0 "
-              f"处理，数据里记录的重力被忽略；摩擦扫频拟合同样不扣 G1/G2）")
+        print(f"被辨识参数: {len(PARAM_NAMES)} 个（--ignore-gravity/--no-gravity 对照模式：重力 gx/gy "
+              f"一律按 0 处理，数据里记录的重力被忽略；摩擦扫频拟合同样不扣 G1/G2）")
     else:
-        print(f"被辨识参数: {len(PARAM_NAMES)} 个（重力 gx/gy 为已知输入，取值跨度 "
-              f"[{g_range[0]:.2f}, {g_range[1]:.2f}]）")
+        print(f"被辨识参数: {len(PARAM_NAMES)} 个（**使用重力**：gx/gy 为逐条已知输入，"
+              f"取值跨度 [{g_range[0]:.2f}, {g_range[1]:.2f}]）")
     print(f"优化: {args.steps} 步, batch={args.batch}, Adam lr={args.lr}")
     effective_bs = min(args.batch, N)
     print(f"每 epoch batch 数 ≈ {max(1, N // effective_bs)}   "
@@ -1682,6 +1731,9 @@ def main() -> int:
             print(f"（未找到 {sweep_path}，摩擦改用主回归结果）")
         p_init, ainfo = algebraic_init(cases, nominal=tuple(args.mass_nominal),
                                       friction=friction, known=known)
+        # kb / ks 不参与闭式回归（只缩放两行的 y，几何不变），由已知量或标称值补上
+        for g in ("kb", "ks"):
+            p_init[g] = float(known.get(g, cfg.DEFAULT_PARAMS[g]))
         ps = ParamSpec(ref, rng, orders=(0.0, 0.0))
         ps.theta = torch.tensor(
             ParamSpec.to_theta([p_init[n] for n in PARAM_NAMES]),
@@ -1694,17 +1746,26 @@ def main() -> int:
     else:
         init_orders = tuple(float(v) for v in args.init_orders.split(","))
         ps = ParamSpec(ref, rng, orders=init_orders)
+        # kb / ks 不做数量级扰动：它们有明确物理含义（Sentry1 实测 kb=4）
+        p_rand = ps.seed_values()
+        for g in ("kb", "ks"):
+            p_rand[g] = float(known.get(g, cfg.DEFAULT_PARAMS[g]))
         if known:       # 随机初值也要把已知量写进去（随后按冻结表固定）
-            p_rand = ps.seed_values()
             p_rand.update(known)
-            with torch.no_grad():
-                ps.theta.copy_(torch.tensor(
-                    ParamSpec.to_theta([p_rand[n] for n in PARAM_NAMES]),
-                    dtype=torch.float64))
-        print(f"随机初始化: 每个参数乘 10^(±[{init_orders[0]}, {init_orders[1]}])")
+        with torch.no_grad():
+            ps.theta.copy_(torch.tensor(
+                ParamSpec.to_theta([p_rand[n] for n in PARAM_NAMES]),
+                dtype=torch.float64))
+        print(f"随机初始化: 每个参数乘 10^(±[{init_orders[0]}, {init_orders[1]}])"
+              f"（kb/ks 除外，固定为 {p_rand['kb']:.6g} / {p_rand['ks']:.6g}）")
     if known:
-        print("已知参数（外部给定，初始化时当已知量、训练中按冻结表固定）: "
+        frozen_known = [n for n in PARAM_NAMES
+                        if n in known and freeze_until.get(n, 0.0) != 0.0]
+        print("已知参数（--known-params，仅在初始最小二乘阶段指定值）: "
               + "，".join(f"{n}={known[n]:.6g}" for n in PARAM_NAMES if n in known))
+        print("  其中训练中被冻结的: "
+              + ("，".join(frozen_known) if frozen_known
+                 else "无（都只作为初始值；用 --freeze-params 指定名字可冻结）"))
 
     # 梯度优化开始前：先把初值（algebraic 时 = 闭式最小二乘解）打印并画一遍图
     init0 = ps.seed_values()
@@ -1921,9 +1982,9 @@ def main() -> int:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        # 1) 14 个被辨识参数曲线
+        # 1) 16 个被辨识参数曲线
         fig, axes = plt.subplots(4, 4, figsize=(15, 10), constrained_layout=True)
-        for k in range(len(PARAM_NAMES), axes.size):   # 14 个参数，关掉多余空轴
+        for k in range(len(PARAM_NAMES), axes.size):   # 关掉多余空轴
             axes.flatten()[k].axis("off")
         for k, n in enumerate(PARAM_NAMES):
             ax = axes[k // 4][k % 4]
@@ -2095,7 +2156,7 @@ if __name__ == "__main__":
 #    步长。默认按 lr ∝ 1/K（以全窗口 lr=5e-4 为基准），并在每个阶段内做余弦衰减
 #    （warm restart）。实测 lr=0.02 时即使从 eps=0.02 出发 loss 也会从 1.84 炸到 43。
 #
-# 结论：先前"14 个参数都恢复到 0.2%~3%"的说法是**误导性的**——mb/ms 那 2 条方向
+# 结论：先前"参数都恢复到 0.2%~3%"的说法是**误导性的**——mb/ms 那 2 条方向
 # 严格不可辨识，当初始点在真值附近时梯度根本不移动它们，"恢复"只是"没动过"。
 # 正确的评价指标只有 IDENTIFIABLE 里那 12 个组合。
 # 解析梯度本身没有问题，已用有限差分逐分量验证到 1e-9

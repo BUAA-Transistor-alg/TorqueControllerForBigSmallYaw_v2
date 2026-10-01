@@ -178,7 +178,7 @@ DualYawMpcController::Result DualYawMpcController::solveWith(
 
     // ---- 3. 重力更新：底盘俯仰/横滚变化 ⇒ 旋转平面内重力分量变化 ----
     // 底盘水平时 gx = gy = 0（重力全在 z 轴、平面内无分量），与 dm 模型一致。
-    // 照常传实测值；MPCController::Options::use_gravity = false（默认）时
+    // 照常传实测值；MPCController::Options::use_gravity = false（对照模式）时
     // 求解器内部会把它按 (0,0) 存，模型里就没有重力项。
     mpc_.setGravity(measurement.gx, measurement.gy);
 

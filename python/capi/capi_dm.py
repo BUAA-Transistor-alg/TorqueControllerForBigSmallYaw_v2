@@ -56,6 +56,9 @@ class _CParams(ctypes.Structure):
         ("fsc", ctypes.c_double),
         ("fsv", ctypes.c_double),
         ("lambda_", ctypes.c_double),
+        # 控制力矩通道增益：物理力矩 = kb/ks × 下发给电控的指令值
+        ("kb", ctypes.c_double),
+        ("ks", ctypes.c_double),
     ]
 
 
@@ -299,13 +302,19 @@ class Params:
     fsv: float
     lambda_: float
 
+    # 控制力矩通道增益：物理力矩 = kb/ks × 下发给电控的指令值。
+    # 带默认值 1.0 = 旧行为（指令值即物理力矩）；凡是描述真机/真机数据的路径
+    # 都必须显式给出（Sentry1 实测 kb = 4）。
+    kb: float = 1.0
+    ks: float = 1.0
+
     def _to_c(self) -> _CParams:
         return _CParams(
             mb=self.mb, Ib=self.Ib, Pbx=self.Pbx, Pby=self.Pby,
             ms=self.ms, Is=self.Is, Psx=self.Psx, Psy=self.Psy,
             Dx=self.Dx, Dy=self.Dy, gx=self.gx, gy=self.gy,
             fbc=self.fbc, fbv=self.fbv, fsc=self.fsc, fsv=self.fsv,
-            lambda_=self.lambda_,
+            lambda_=self.lambda_, kb=self.kb, ks=self.ks,
         )
 
     @classmethod
@@ -315,7 +324,7 @@ class Params:
             ms=c.ms, Is=c.Is, Psx=c.Psx, Psy=c.Psy,
             Dx=c.Dx, Dy=c.Dy, gx=c.gx, gy=c.gy,
             fbc=c.fbc, fbv=c.fbv, fsc=c.fsc, fsv=c.fsv,
-            lambda_=c.lambda_,
+            lambda_=c.lambda_, kb=c.kb, ks=c.ks,
         )
 
 
@@ -706,7 +715,10 @@ PARAM_GRADIENT_NAMES = tuple(
     _lib.tcbs_param_gradient_name(i).decode()
     for i in range(_lib.tcbs_param_gradient_count())
 )
-"""参与辨识的参数名，顺序与 C 接口严格一致。"""
+"""参与辨识的参数名，顺序与 C 接口严格一致（含 kb / ks）。"""
+
+NPARAM = len(PARAM_GRADIENT_NAMES)
+"""被辨识参数个数（= C 接口的 tcbs_param_gradient_count()，当前为 16）。"""
 
 
 @dataclass(frozen=True)
@@ -745,7 +757,7 @@ class ParamGradient:
 
         pg = ParamGradient(PARAMS)
         loss, grad = pg.gradient(theta_c0, dtheta_c, ddtheta_c, dt, tau, x0, spec)
-        # grad 形状 (16,)，顺序见 PARAM_GRADIENT_NAMES
+        # grad 形状 (16,)，顺序见 PARAM_GRADIENT_NAMES（含 kb/ks）
     """
 
     def __init__(self, params: Params, refinement: int = 4):
@@ -894,10 +906,10 @@ class ParamGradientBatch:
 
         pgb = ParamGradientBatch(refinement=16, max_batch=120, max_num_steps=300)
         loss, grad = pgb.run(params, x0, base, tau, targets, weights, dt)
-        # loss: (B,)   grad: (14, B)
+        # loss: (B,)   grad: (16, B)
 
     数组形状（均为 float64）：
-        params  (17, B)  顺序同 Params 字段
+        params  (19, B)  顺序同 Params 字段（mb..lambda, kb, ks）
         x0      (4,  B)  theta_b dtheta_b theta_s dtheta_s
         base    (3,  B)  theta_c0 dtheta_c ddtheta_c
         tau     (K, 2, B)  —— 即 (2k+c) 行、样本维连续
@@ -952,7 +964,7 @@ class ParamGradientBatch:
     def run(self, params, x0, base, tau, targets, weights, dt):
         """计算一批序列的 (loss, grad)。
 
-        返回 ``(loss, grad)``：``loss`` 形状 (B,)，``grad`` 形状 (14, B)。
+        返回 ``(loss, grad)``：``loss`` 形状 (B,)，``grad`` 形状 (16, B)。
         失败抛 RuntimeError。
         """
         pr = np.ascontiguousarray(params, dtype=np.float64)
@@ -960,8 +972,8 @@ class ParamGradientBatch:
         ba = np.ascontiguousarray(base, dtype=np.float64)
         ta = np.ascontiguousarray(tau, dtype=np.float64)
         wa = np.ascontiguousarray(weights, dtype=np.float64)
-        if pr.ndim != 2 or pr.shape[0] != 17:
-            raise ValueError(f"params 形状应为 (17, B)，收到 {pr.shape}")
+        if pr.ndim != 2 or pr.shape[0] != 19:
+            raise ValueError(f"params 形状应为 (19, B)，收到 {pr.shape}")
         B = pr.shape[1]
         if x0a.shape != (4, B):
             raise ValueError(f"x0 形状应为 (4, {B})，收到 {x0a.shape}")
@@ -991,7 +1003,7 @@ class ParamGradientBatch:
             tarr.append(a)
 
         loss = np.zeros(B, dtype=np.float64)
-        grad = np.zeros(14 * B, dtype=np.float64)
+        grad = np.zeros(NPARAM * B, dtype=np.float64)
         ok = _lib.tcbs_param_gradient_batch_run(
             self._require_handle(),
             ctypes.c_int(B), ctypes.c_size_t(K), ctypes.c_double(dt),
@@ -1001,7 +1013,7 @@ class ParamGradientBatch:
         )
         if not ok:
             raise RuntimeError(f"tcbs_param_gradient_batch_run 失败: {_last_error()}")
-        return loss, grad.reshape(14, B)
+        return loss, grad.reshape(NPARAM, B)
 
     def __repr__(self) -> str:
         return (f"ParamGradientBatch(refinement={self._refinement}, "

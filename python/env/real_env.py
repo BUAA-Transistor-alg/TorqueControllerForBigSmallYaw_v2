@@ -308,11 +308,12 @@ class RealEnv:
     # ================= 控制器需要的模型量 =================
     def gravity_torque(self, theta_b: float | None = None,
                        theta_s: float | None = None) -> tuple[float, float]:
-        """给定状态下的静态重力矩 (G1, G2)；不给状态则用当前状态。
+        """给定状态下的静态重力矩，**已换算成"下发给电控的指令值"单位**。
 
-        与 SimEnv 同一公式，但重力用**本会话开始时反解出的 (gx, gy)**（即记录进
-        数据集的同一组值，保证控制前馈与辨识模型一致）；动力学参数用标称值
-        （cfg.DEFAULT_PARAMS）。
+        与 SimEnv 同一公式与同一单位约定：返回 (G1/kb, G2/ks)，可直接作为前馈
+        叠加到 step() 的输入上（step 收的就是指令值）。重力用**本会话开始时反解出的
+        (gx, gy)**（即记录进数据集的同一组值，保证控制前馈与辨识模型一致）；
+        动力学参数与增益用标称值（cfg.DEFAULT_PARAMS）。
         """
         st = self._state
         tb = st.theta_b if theta_b is None else float(theta_b)
@@ -326,7 +327,7 @@ class RealEnv:
         psi_b, psi_s = tb, tb + ts
         G2 = gs_sin * math.sin(psi_s) + gs_cos * math.cos(psi_s)
         G1 = gb_sin * math.sin(psi_b) + gb_cos * math.cos(psi_b) + G2
-        return G1, G2
+        return G1 / p.get("kb", 1.0), G2 / p.get("ks", 1.0)
 
     # ================= 生命周期 =================
     def close(self) -> None:

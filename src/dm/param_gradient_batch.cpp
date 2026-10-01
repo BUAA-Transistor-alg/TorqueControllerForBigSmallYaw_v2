@@ -37,19 +37,19 @@ namespace tcbs {
 namespace dm {
 namespace {
 
-constexpr int NP = kParamGradientCount;   // 14 个可辨识参数
-constexpr int NQ = kBatchParamCount;      // 17 个 Params 字段
+constexpr int NP = kParamGradientCount;   // 16 个可辨识参数（14 物理 + kb + ks）
+constexpr int NQ = kBatchParamCount;      // 19 个 Params 字段
 
-// params 的 SoA 下标（顺序同 Params 字段）
+// params 的 SoA 下标（顺序同 Params 字段；kb/ks 追加在 lambda 之后）
 enum {
     qMb = 0, qIb, qPbx, qPby, qMs, qIs, qPsx, qPsy,
-    qDx, qDy, qGx, qGy, qFbc, qFbv, qFsc, qFsv, qLambda
+    qDx, qDy, qGx, qGy, qFbc, qFbv, qFsc, qFsv, qLambda, qKb, qKs
 };
 
 // 可辨识参数下标（顺序同 paramGradientNames()）
 enum {
     iMb = 0, iIb, iPbx, iPby, iMs, iIs, iPsx, iPsy,
-    iDx, iDy, iFbc, iFbv, iFsc, iFsv
+    iDx, iDy, iFbc, iFbv, iFsc, iFsv, iKb, iKs
 };
 
 // evaluateBatchLanes 的中间量槽位（单位 = cap）
@@ -80,12 +80,15 @@ inline void sincos3(double a, double b, double c, double& sa, double& ca, double
 
 /// 由某个参数的部分导数写 Jp 的两行非零项（0/2 行恒为 0）。
 /// 与标量实现 evaluate() 的参数雅可比段逐行一致。
+///
+/// d_kb / d_ks 是"控制力矩通道增益"这一路的偏导：Qb = kb·Tb − 摩擦，
+/// 所以 ∂Qb/∂kb = Tb（对其它参数为 0）。物理参数调用时传 0。
 inline void writeJp(const double* TCBS_RESTRICT mid, int cap, int b, double ms,
                     double d_h, double d_dhd,
                     double d_IB, double d_IS, double d_ID,
                     double d_gss, double d_gsc, double d_gbs, double d_gbc,
                     double d_fbc, double d_fbv, double d_fsc, double d_fsv,
-                    double d_ms,
+                    double d_ms, double d_kb, double d_ks,
                     double* TCBS_RESTRICT jp, int i) {
     const double h     = mid[mH * cap + b];
     const double dhdv  = mid[mDhd * cap + b];
@@ -113,8 +116,8 @@ inline void writeJp(const double* TCBS_RESTRICT mid, int cap, int b, double ms,
     const double dC2p = -d_cpl * dpb * dpb;
     const double dG2p = d_gss * ss + d_gsc * cs;
     const double dG1p = d_gbs * sb + d_gbc * cb + dG2p;
-    const double dQbp = -d_fbv * dtb - d_fbc * th_tb;
-    const double dQsp = -d_fsv * dts - d_fsc * th_ts;
+    const double dQbp = d_kb - d_fbv * dtb - d_fbc * th_tb;
+    const double dQsp = d_ks - d_fsv * dts - d_fsc * th_ts;
     const double dF1p = dQbp - dC1p - dG1p - dM11p * ddtc;
     const double dF2p = dQsp - dC2p - dG2p - dM12p * ddtc;
     const double e1 = dF1p - (dM11p * qdd_b + dM12p * qdd_s);
@@ -155,6 +158,8 @@ void evaluateBatchLanes(const double* const* TCBS_RESTRICT pq,
     const double* TCBS_RESTRICT pFsc = pq[qFsc];
     const double* TCBS_RESTRICT pFsv = pq[qFsv];
     const double* TCBS_RESTRICT pLam = pq[qLambda];
+    const double* TCBS_RESTRICT pKb = pq[qKb];
+    const double* TCBS_RESTRICT pKs = pq[qKs];
 
     const double* TCBS_RESTRICT xtb = px[0];
     const double* TCBS_RESTRICT xdtb = px[1];
@@ -220,8 +225,9 @@ void evaluateBatchLanes(const double* const* TCBS_RESTRICT pq,
 
         const double th_tb = mid[mThTb * cap + b];
         const double th_ts = mid[mThTs * cap + b];
-        const double Qb = pTb[b] - fbv_ * dtb - fbc_ * th_tb;
-        const double Qs = pTs[b] - fsv_ * dts - fsc_ * th_ts;
+        // ★ 输入的力矩是"指令值"，物理力矩 = 增益 × 指令值
+        const double Qb = pKb[b] * pTb[b] - fbv_ * dtb - fbc_ * th_tb;
+        const double Qs = pKs[b] * pTs[b] - fsv_ * dts - fsc_ * th_ts;
 
         const double F1 = Qb - C1 - G1 - M11 * ddtc;
         const double F2 = Qs - C2 - G2 - M12 * ddtc;
@@ -303,14 +309,14 @@ void evaluateBatchLanes(const double* const* TCBS_RESTRICT pq,
                     writeJp(mid, cap, b, pMs[b], 0.0, 0.0,
                             Pbx_ * Pbx_ + Pby_ * Pby_, 0.0, 0.0,
                             0.0, 0.0, gx_ * Pbx_ + gy_ * Pby_, gx_ * Pby_ - gy_ * Pbx_,
-                            0.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
+                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
                 }
                 break;
             case iIb:
 #pragma omp simd
                 for (int b = 0; b < n; ++b)
                     writeJp(mid, cap, b, pMs[b], 0.0, 0.0, 1.0, 0.0, 0.0,
-                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
+                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
                 break;
             case iPbx:
 #pragma omp simd
@@ -320,7 +326,7 @@ void evaluateBatchLanes(const double* const* TCBS_RESTRICT pq,
                     writeJp(mid, cap, b, pMs[b], 0.0, 0.0,
                             2.0 * mb_ * Pbx_, 0.0, 0.0,
                             0.0, 0.0, gx_ * mb_, -gy_ * mb_,
-                            0.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
+                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
                 }
                 break;
             case iPby:
@@ -331,7 +337,7 @@ void evaluateBatchLanes(const double* const* TCBS_RESTRICT pq,
                     writeJp(mid, cap, b, pMs[b], 0.0, 0.0,
                             2.0 * mb_ * Pby_, 0.0, 0.0,
                             0.0, 0.0, gy_ * mb_, gx_ * mb_,
-                            0.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
+                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
                 }
                 break;
             case iMs:
@@ -344,14 +350,14 @@ void evaluateBatchLanes(const double* const* TCBS_RESTRICT pq,
                             0.0, Psx_ * Psx_ + Psy_ * Psy_, Dx_ * Dx_ + Dy_ * Dy_,
                             gx_ * Psx_ + gy_ * Psy_, gx_ * Psy_ - gy_ * Psx_,
                             gx_ * Dx_ + gy_ * Dy_, gx_ * Dy_ - gy_ * Dx_,
-                            0.0, 0.0, 0.0, 0.0, 1.0, Jp, i);
+                            0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, Jp, i);
                 }
                 break;
             case iIs:
 #pragma omp simd
                 for (int b = 0; b < n; ++b)
                     writeJp(mid, cap, b, pMs[b], 0.0, 0.0, 0.0, 1.0, 0.0,
-                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
+                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
                 break;
             case iPsx:
 #pragma omp simd
@@ -364,7 +370,7 @@ void evaluateBatchLanes(const double* const* TCBS_RESTRICT pq,
                             Dx_ * ct_ + Dy_ * st_, -Dx_ * st_ + Dy_ * ct_,
                             0.0, 2.0 * ms_ * Psx_, 0.0,
                             ms_ * gx_, -ms_ * gy_, 0.0, 0.0,
-                            0.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
+                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
                 }
                 break;
             case iPsy:
@@ -378,7 +384,7 @@ void evaluateBatchLanes(const double* const* TCBS_RESTRICT pq,
                             Dy_ * ct_ - Dx_ * st_, -Dy_ * st_ - Dx_ * ct_,
                             0.0, 2.0 * ms_ * Psy_, 0.0,
                             ms_ * gy_, ms_ * gx_, 0.0, 0.0,
-                            0.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
+                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
                 }
                 break;
             case iDx:
@@ -392,7 +398,7 @@ void evaluateBatchLanes(const double* const* TCBS_RESTRICT pq,
                             -Psy_ * st_ + Psx_ * ct_, -Psy_ * ct_ - Psx_ * st_,
                             0.0, 0.0, 2.0 * ms_ * Dx_,
                             0.0, 0.0, gx_ * ms_, -gy_ * ms_,
-                            0.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
+                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
                 }
                 break;
             case iDy:
@@ -406,33 +412,49 @@ void evaluateBatchLanes(const double* const* TCBS_RESTRICT pq,
                             Psy_ * ct_ + Psx_ * st_, -Psy_ * st_ + Psx_ * ct_,
                             0.0, 0.0, 2.0 * ms_ * Dy_,
                             0.0, 0.0, gy_ * ms_, gx_ * ms_,
-                            0.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
+                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
                 }
                 break;
             case iFbc:
 #pragma omp simd
                 for (int b = 0; b < n; ++b)
                     writeJp(mid, cap, b, pMs[b], 0.0, 0.0, 0.0, 0.0, 0.0,
-                            0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
+                            0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
                 break;
             case iFbv:
 #pragma omp simd
                 for (int b = 0; b < n; ++b)
                     writeJp(mid, cap, b, pMs[b], 0.0, 0.0, 0.0, 0.0, 0.0,
-                            0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, Jp, i);
+                            0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
                 break;
             case iFsc:
 #pragma omp simd
                 for (int b = 0; b < n; ++b)
                     writeJp(mid, cap, b, pMs[b], 0.0, 0.0, 0.0, 0.0, 0.0,
-                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, Jp, i);
+                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, Jp, i);
                 break;
             case iFsv:
             default:
 #pragma omp simd
                 for (int b = 0; b < n; ++b)
                     writeJp(mid, cap, b, pMs[b], 0.0, 0.0, 0.0, 0.0, 0.0,
-                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, Jp, i);
+                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, Jp, i);
+                break;
+            // ---- 控制力矩通道增益：Qb = kb·Tb − 摩擦 ⇒ ∂Qb/∂kb = Tb ----
+            // 增益不参与 M / C / G，所以 Jp 只有 dQb（或 dQs）一项进 F1 / F2。
+            case iKb:
+#pragma omp simd
+                for (int b = 0; b < n; ++b)
+                    writeJp(mid, cap, b, pMs[b], 0.0, 0.0, 0.0, 0.0, 0.0,
+                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                            pTb[b], 0.0, Jp, i);
+                break;
+            case iKs:
+#pragma omp simd
+                for (int b = 0; b < n; ++b)
+                    writeJp(mid, cap, b, pMs[b], 0.0, 0.0, 0.0, 0.0, 0.0,
+                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                            0.0, pTs[b], Jp, i);
                 break;
         }
     }

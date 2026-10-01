@@ -32,10 +32,12 @@ inline void sincos3(double a, double b, double c, double& sa, double& ca, double
 /// 参数索引（与头文件注释、paramGradientNames() 严格一致）。
 /// 注意：重力 gx/gy 是随采集数据一起给出的**已知量**，不是被辨识参数，
 /// 因此不在此枚举内（它仍留在 Params 里供正演使用）。
+/// kb / ks 是"下发指令值 → 实际电机力矩"的通道增益，追加在最后。
 enum ParamIndex {
     kMb = 0, kIb, kPbx, kPby,
     kMs, kIs, kPsx, kPsy,
-    kDx, kDy, kFbc, kFbv, kFsc, kFsv
+    kDx, kDy, kFbc, kFbv, kFsc, kFsv,
+    kKb, kKs
 };
 
 constexpr int NP = kParamGradientCount;
@@ -92,8 +94,8 @@ inline void accelOnly(const Params& p,
                           p.gy * (p.mb * p.Pbx + p.ms * p.Dx);
     const double G1 = gb_sin * sb + gb_cos * cb + G2;
 
-    const double Qb = Tb - p.fbv * dtb - p.fbc * std::tanh(p.lambda * dtb);
-    const double Qs = Ts - p.fsv * dts - p.fsc * std::tanh(p.lambda * dts);
+    const double Qb = p.kb * Tb - p.fbv * dtb - p.fbc * std::tanh(p.lambda * dtb);
+    const double Qs = p.ks * Ts - p.fsv * dts - p.fsc * std::tanh(p.lambda * dts);
 
     const double F1 = Qb - C1 - G1 - M11 * ddtc;
     const double F2 = Qs - C2 - G2 - M12 * ddtc;
@@ -105,12 +107,14 @@ inline void accelOnly(const Params& p,
 /// 按参数索引构造扰动后的 Params（用于局部差分）。
 inline Params paramsWithDelta(const Params& p, int idx, double delta) {
     double v[NP] = {p.mb,  p.Ib,  p.Pbx, p.Pby, p.ms,  p.Is,  p.Psx,
-                    p.Psy, p.Dx,  p.Dy,  p.fbc, p.fbv, p.fsc, p.fsv};
+                    p.Psy, p.Dx,  p.Dy,  p.fbc, p.fbv, p.fsc, p.fsv,
+                    p.kb,  p.ks};
     v[idx] += delta;
     return Params(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
                   v[8], v[9],
                   p.gx, p.gy,   // 重力是已知量，不参与求导
-                  v[10], v[11], v[12], v[13], p.lambda);
+                  v[10], v[11], v[12], v[13], p.lambda,
+                  v[14], v[15]);
 }
 
 /// 返回该参数的解析偏导是否已经验证过。
@@ -144,6 +148,7 @@ struct ParamPartials {
     double d_gs_sin = 0.0, d_gs_cos = 0.0, d_gb_sin = 0.0, d_gb_cos = 0.0;
     double d_fbc = 0.0, d_fbv = 0.0, d_fsc = 0.0, d_fsv = 0.0;
     double d_ms = 0.0;
+    double d_kb = 0.0, d_ks = 0.0;   ///< 增益通道：∂Qb/∂kb、∂Qs/∂ks 的系数
 };
 
 inline void paramPartials(const Params& p, double ct, double st, int idx,
@@ -230,6 +235,14 @@ inline void paramPartials(const Params& p, double ct, double st, int idx,
         case kFsv:
             q.d_fsv = 1.0;
             break;
+        // ---- 控制力矩通道增益：Qb = kb·Tb − 摩擦 ⇒ ∂Qb/∂kb = Tb ----
+        // 与所有物理参数无关，因此这一路只有 dQbp / dQsp 贡献。
+        case kKb:
+            q.d_kb = 1.0;
+            break;
+        case kKs:
+            q.d_ks = 1.0;
+            break;
         default:
             break;
     }
@@ -273,8 +286,9 @@ inline void evaluate(const Params& p,
 
     const double th_tb = std::tanh(p.lambda * dtb);
     const double th_ts = std::tanh(p.lambda * dts);
-    const double Qb = Tb - p.fbv * dtb - p.fbc * th_tb;
-    const double Qs = Ts - p.fsv * dts - p.fsc * th_ts;
+    // ★ Tb / Ts 是"下发给电控的指令值"；物理力矩 = kb·Tb / ks·Ts
+    const double Qb = p.kb * Tb - p.fbv * dtb - p.fbc * th_tb;
+    const double Qs = p.ks * Ts - p.fsv * dts - p.fsc * th_ts;
 
     const double F1 = Qb - C1 - G1 - M11 * ddtc;
     const double F2 = Qs - C2 - G2 - M12 * ddtc;
@@ -330,7 +344,8 @@ inline void evaluate(const Params& p,
     for (int i = 0; i < NP; ++i) {
         if (!analyticPartialVerified(i)) {
             const double base_i[NP] = {p.mb,  p.Ib,  p.Pbx, p.Pby, p.ms,  p.Is,  p.Psx,
-                                       p.Psy, p.Dx,  p.Dy,  p.fbc, p.fbv, p.fsc, p.fsv};
+                                       p.Psy, p.Dx,  p.Dy,  p.fbc, p.fbv, p.fsc, p.fsv,
+                                       p.kb,  p.ks};
             const double scale = std::fabs(base_i[i]) > 1.0 ? std::fabs(base_i[i]) : 1.0;
             const double hstep = 1e-7 * scale;
             double bp, bs, mp, ms_;
@@ -360,8 +375,8 @@ inline void evaluate(const Params& p,
         const double dG2p = q.d_gs_sin * ss + q.d_gs_cos * cs;
         const double dG1p = q.d_gb_sin * sb + q.d_gb_cos * cb + dG2p;
 
-        const double dQbp = -q.d_fbv * dtb - q.d_fbc * th_tb;
-        const double dQsp = -q.d_fsv * dts - q.d_fsc * th_ts;
+        const double dQbp = q.d_kb * Tb - q.d_fbv * dtb - q.d_fbc * th_tb;
+        const double dQsp = q.d_ks * Ts - q.d_fsv * dts - q.d_fsc * th_ts;
 
         const double dF1p = dQbp - dC1p - dG1p - dM11p * ddtc;
         const double dF2p = dQsp - dC2p - dG2p - dM12p * ddtc;
@@ -418,7 +433,7 @@ inline double stepLoss(const ParamLossSpec& w,
 
 const char* const kNames[NP] = {
     "mb", "Ib", "Pbx", "Pby", "ms", "Is", "Psx", "Psy",
-    "Dx", "Dy", "fbc", "fbv", "fsc", "fsv"};
+    "Dx", "Dy", "fbc", "fbv", "fsc", "fsv", "kb", "ks"};
 
 /// 只要状态推进的经典 4 阶段 RK4（纯损失路径用，不碰灵敏度）。
 inline void substepStateOnly(const Params& p,

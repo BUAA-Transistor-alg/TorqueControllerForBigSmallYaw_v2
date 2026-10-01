@@ -49,6 +49,19 @@ typedef struct TcbsParams {
     double fsc;     /* 关节 s 库仑摩擦系数 */
     double fsv;     /* 关节 s 粘滞摩擦系数 */
     double lambda_; /* 平滑摩擦力参数（通常取 100） */
+
+    /*
+     * 控制力矩通道增益（"下发给电控的指令值 → 电机实际力矩"的比例）。
+     *
+     * ★ 所有力矩输入（Simulator / Trajectory / ParamGradient 的 Tb、Ts）**永远是
+     *   发给电控的指令值**（协议规定恒在 [-1, +1]，电控/电机内部再换算成力矩）。
+     *   真实物理力矩 = kb·Tb、ks·Ts，所以这两个增益是模型的一部分。
+     *
+     *   实测口径：kb = 4 表示"下发 1 ⇒ 电机发力 4 N·m"。
+     *   它们参与参数辨识（grad 顺序 [14] = kb、[15] = ks），共 16 个被辨识参数。
+     */
+    double kb;      /* 关节 b 控制力矩增益 [N·m / 指令单位] */
+    double ks;      /* 关节 s 控制力矩增益 [N·m / 指令单位] */
 } TcbsParams;
 
 /* 两个广义坐标的位置与速度。 */

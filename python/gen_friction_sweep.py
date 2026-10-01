@@ -110,7 +110,8 @@ def main() -> int:
                     help="类别名（= 目录名）：输出到 data/<类别>/sweep_<时间戳>.npz")
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--zero-gravity", action="store_true",
-                    help="把等效重力强制设为 0（水平面）；不给则在倾角范围内随机")
+                    help="[仿真] 把等效重力强制设为 0（水平面，做「不用重力」的对照）；"
+                         "不给则**默认在倾角范围内随机抽重力**——即默认使用重力。")
     ap.add_argument("--gravity-seed", type=int, default=None,
                     help="重力抽样的随机种子；不给则每次运行都不同")
     ap.add_argument("--no-noise", dest="noise", action="store_false",

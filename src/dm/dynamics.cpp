@@ -109,8 +109,10 @@ void computeGeneralizedForces(const Params& p,
                               double dtheta_s,
                               double& Qb,
                               double& Qs) {
-    Qb = Tb - p.fbv * dtheta_b - p.fbc * std::tanh(p.lambda * dtheta_b);
-    Qs = Ts - p.fsv * dtheta_s - p.fsc * std::tanh(p.lambda * dtheta_s);
+    // ★ Tb / Ts 是"发给电控的指令值"（协议恒在 [-1, +1]）；真实物理力矩是
+    //   kb·Tb / ks·Ts。两个增益是模型的一部分，和摩擦一样进广义力。
+    Qb = p.kb * Tb - p.fbv * dtheta_b - p.fbc * std::tanh(p.lambda * dtheta_b);
+    Qs = p.ks * Ts - p.fsv * dtheta_s - p.fsc * std::tanh(p.lambda * dtheta_s);
 }
 
 bool solveAccelerations(const MassMatrix& m,
@@ -133,8 +135,7 @@ bool solveAccelerations(const MassMatrix& m,
 
 void computeAccelerations(const Params& p,
                           double Tb,
-                          double Ts,
-                          double theta_c,
+                          double Ts,                          double theta_c,
                           double dtheta_c,
                           double ddtheta_c,
                           const State& state,

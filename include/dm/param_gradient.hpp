@@ -25,10 +25,15 @@
 // tau = k*dt + s*h。因此本文件的正向（仅损失 / 损失+灵敏度）与 trajectory、
 // 与逐步调用 Simulator::step 的结果完全相同。
 //
-// 被辨识参数（固定顺序，共 14 个）：
+// 被辨识参数（固定顺序，共 16 个）：
 //   0 mb   1 Ib   2 Pbx  3 Pby  4 ms   5 Is   6 Psx  7 Psy
-//   8 Dx   9 Dy  10 fbc 11 fbv 12 fsc 13 fsv
+//   8 Dx   9 Dy  10 fbc 11 fbv 12 fsc 13 fsv 14 kb  15 ks
 //   （kParamGradientCount / paramGradientNames() 给出权威值与顺序）
+//
+// kb / ks 是"下发给电控的指令值 → 电机实际力矩"的通道增益：模型里
+//   Qb = kb·Tb − 摩擦,  Qs = ks·Ts − 摩擦
+// 其中输入力矩 tau 序列**永远是发给电控的指令值**（协议恒在 [-1, +1]）。
+// 实测口径：kb = 4 表示"下发 1 ⇒ 电机发力 4 N·m"。
 //
 // 不在其中的量：
 //   * gx / gy：重力矢量是**随采集数据一起给出的已知输入**（存在 Params 里
@@ -46,7 +51,7 @@ namespace dm {
 /// refinement 为运行期参数（语义见 trajectory.hpp：每主步重复 refinement 次经典 RK4）。
 
 /// 参与辨识的参数个数。
-inline constexpr int kParamGradientCount = 14;
+inline constexpr int kParamGradientCount = 16;
 
 /// 参数名（用于 Python 侧校验顺序）。
 const char* const* paramGradientNames();

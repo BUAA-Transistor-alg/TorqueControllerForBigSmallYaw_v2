@@ -230,7 +230,8 @@ def main() -> int:
     ap.add_argument("--start-index", type=int, default=0,
                     help="本会话第一条的编号（多次运行拼接数据集时用）")
     ap.add_argument("--zero-gravity", action="store_true",
-                    help="把等效重力强制设为 0（水平面）；不给则在倾角范围内随机")
+                    help="**[仿真]** 把等效重力强制设为 0（水平面，做「不用重力」的对照）；"
+                         "不给则**默认在倾角范围内随机抽重力**——即默认使用重力。")
     ap.add_argument("--gravity-seed", type=int, default=None,
                     help="重力抽样的随机种子；不给则每次运行都不同")
     ap.add_argument("--no-noise", dest="noise", action="store_false",
@@ -261,8 +262,10 @@ def main() -> int:
                     help="[--real] 等待 MCU+IMU 首个有效样本的超时 [s]")
     ap.add_argument("--max-repos-steps", type=int, default=cfg.REPOS_MAX_STEPS,
                     help="[--real] 控回初值的最多步数（真机收敛慢时调大）")
-    ap.add_argument("--no-gravity-ff", dest="gravity_ff", action="store_false",
-                    help="关闭控回初值里的重力前馈（对照实验用；默认开启）")
+    ap.add_argument("--no-gravity-ff", "--no-gravity", dest="gravity_ff",
+                    action="store_false", default=True,
+                    help="关掉控回/激励控制器里的重力前馈 (G1, G2)，纯靠误差把重力扛住"
+                         "（做「不用重力」的对照）。★ 默认**开启**重力前馈")
     ap.add_argument("--hold-pitch", action="store_true",
                     help="[--real] 保持当前实测 pitch（不扰动）；不给则把 pitch 目标压到 "
                          "--pitch-target-deg")

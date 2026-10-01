@@ -38,7 +38,7 @@ private:
     const MPCController* owner_;
 };
 
-/// Options::use_gravity = false 时把参数里的重力清零：模型里完全没有重力项，
+/// Options::use_gravity = false（对照模式）时把参数里的重力清零：模型里没有重力项，
 /// 调用方传实测 gx/gy 也不会进入动力学。构造 / setParams / setGravity 三处
 /// 写重力的地方都要过这一道（params_ 与 one_step_sim_ 必须拿到同一份）。
 dm::Params withGravityOption(const dm::Params& params, bool use_gravity) {
@@ -116,7 +116,8 @@ void MPCController::setParams(const dm::Params& params) {
 }
 
 void MPCController::setGravity(double gx, double gy) {
-    // Options::use_gravity = false（默认）时模型里没有重力项：这里恒按 (0,0) 存，
+    // use_gravity = false（对照模式）时模型里没有重力项：这里恒按 (0,0) 存；
+    // 默认 true 时按实测值存、真正进入模型，
     // 调用方照常传实测值也不会进入动力学。
     if (!opt_.use_gravity) {
         gx = 0.0;

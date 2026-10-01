@@ -133,6 +133,33 @@ DEF_CATEGORY = "Sentry1"
 DEF_FRICTION_CATEGORY = "friction_Sentry1"
 DEF_FRICTION_CATEGORY_S = "friction_s_Sentry1"
 DEF_KNOWN_PARAMS = "Dx=0.0,Dy=0.07"
+# 控制力矩通道增益初值（物理力矩 = k × 下发给电控的指令值）。
+# kb=4 是 Sentry1 实测口径（下发 1 ⇒ 4 N·m）；ks 未实测，取 1 只是约定
+# ——它只决定参数的数值标度，模型响应只认 ks × 惯量参数这个乘积。
+DEF_TORQUE_GAIN = "kb=4.0,ks=1.0"
+
+
+def parse_torque_gain(spec: str) -> dict:
+    """解析 ``--torque-gain`` 的 "kb=值,ks=值" 表；缺项用默认值补齐。"""
+    out = {"kb": 4.0, "ks": 1.0}
+    for part in str(spec).replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(f"--torque-gain 的 {part!r} 缺少 '='；应为 kb=值 或 ks=值")
+        name, val_s = (s.strip() for s in part.split("=", 1))
+        if name not in out:
+            raise ValueError(f"--torque-gain 里未知的键 {name!r}；只能是 kb / ks")
+        try:
+            v = float(val_s)
+        except ValueError:
+            raise ValueError(f"--torque-gain 里 {name} 的值 {val_s!r} 不是数") from None
+        if not np.isfinite(v) or v == 0.0:
+            raise ValueError(f"--torque-gain 里 {name} 必须是有限非零数（收到 {val_s!r}）；"
+                             f"0 会让该轴完全没有力矩")
+        out[name] = v
+    return out
 
 
 # ===========================================================================
@@ -166,11 +193,12 @@ def collect_case_files(spec) -> list:
 
 
 def compute_algebraic_init(files, known, fric_big, fric_small, use_sweeps=True,
-                           log=print):
+                           gains=None, log=print):
     """按 ``identify_params.py --init algebraic`` 的口径算初值。
 
     返回 ``(p_init, cases, info)``：
-      * ``p_init``：14 个参数的 dict（代数最小二乘 + 摩擦扫频回代）；
+      * ``p_init``：**全部 16 个**参数的 dict（14 个物理量由代数最小二乘 + 摩擦
+        扫频回代；kb/ks 不参与那个闭式回归，由 ``gains``/``known`` 直接给出）；
       * ``cases`` ：全部 ``Case`` 对象，**保留数据里原始 gx/gy**（供前向仿真用，
                     初始值本身按 g=0 求，见下）；
       * ``info``  ：摩擦拟合诊断（打印 / 状态栏用）。
@@ -178,6 +206,7 @@ def compute_algebraic_init(files, known, fric_big, fric_small, use_sweeps=True,
     ★ 与最后一条指令一致：**初始值一律按 g=0 求**（``--ignore-gravity``），
       数据里记录的 gx/gy 只在"前向仿真使用重力"勾选时进入模型。
     """
+    gains = {"kb": 4.0, "ks": 1.0} if gains is None else dict(gains)
     cases = [Case(f) for f in files]
     raw_g = [(c.gx, c.gy) for c in cases]
     info = {"n_files": len(cases), "friction": None}
@@ -188,6 +217,8 @@ def compute_algebraic_init(files, known, fric_big, fric_small, use_sweeps=True,
             c.gy = 0.0
         # ---- 先解一次动力学（带 0 摩擦），用来给摩擦扫频扣 G1/G2 ----
         p_dyn, _ = algebraic_init(cases, friction=(0.0, 0.0, 0.0, 0.0), known=known)
+        for g in ("kb", "ks"):          # 摩擦扫频只用物理量，但补齐保证 Params 完整
+            p_dyn[g] = float(known.get(g, gains[g]))
 
         friction = None
         if use_sweeps and fric_big is not None and Path(fric_big).exists():
@@ -211,6 +242,10 @@ def compute_algebraic_init(files, known, fric_big, fric_small, use_sweeps=True,
             log(f"[warn] 未找到摩擦扫频目录 {fric_big}，摩擦改用主回归结果")
 
         p_init, ainfo = algebraic_init(cases, friction=friction, known=known)
+        # kb/ks 不进闭式回归：known 优先，否则用 --torque-gain 的初值。
+        # 必须补上，否则 sanitize_params 按 PARAM_NAMES(16) 取值会 KeyError。
+        for g in ("kb", "ks"):
+            p_init[g] = float(known.get(g, gains[g]))
         p_init = sanitize_params(p_init, log=log)
         info["mb"] = ainfo["mb"]
         info["ms"] = ainfo["ms"]
@@ -245,14 +280,14 @@ def sanitize_params(p: dict, log=print) -> dict:
 
 
 def _params_for(case: Case, p: dict, use_gravity: bool) -> Params:
-    """把 14 个参数 + 该条数据的重力（勾选时用记录值，否则 0）+ 固定 λ 拼成 Params。"""
+    """把参数（含 kb/ks）+ 该条数据的重力（勾选时用记录值，否则 0）+ 固定 λ 拼成 Params。"""
     gx = float(case.gx) if use_gravity else 0.0
     gy = float(case.gy) if use_gravity else 0.0
     return Params(mb=p["mb"], Ib=p["Ib"], Pbx=p["Pbx"], Pby=p["Pby"],
                   ms=p["ms"], Is=p["Is"], Psx=p["Psx"], Psy=p["Psy"],
                   Dx=p["Dx"], Dy=p["Dy"], gx=gx, gy=gy,
                   fbc=p["fbc"], fbv=p["fbv"], fsc=p["fsc"], fsv=p["fsv"],
-                  lambda_=LAMBDA)
+                  lambda_=LAMBDA, kb=p["kb"], ks=p["ks"])
 
 
 def default_param_dict() -> dict:
@@ -274,7 +309,7 @@ def write_params_file(path, p: dict, note: str = "") -> None:
 
 
 def read_params_file(path) -> dict:
-    """读 ``名字 = 值``（也兼容空白分隔），只取 14 个被辨识参数。"""
+    """读 ``名字 = 值``（也兼容空白分隔），只取 PARAM_NAMES 里的参数。"""
     vals = {}
     with open(path, "r", errors="replace") as fh:
         for ln in fh:
@@ -407,13 +442,18 @@ class ParamRow(QtWidgets.QWidget):
 # ===========================================================================
 class ManualTuneWindow(QtWidgets.QMainWindow):
     def __init__(self, files, known: dict, fric_big, fric_small,
-                 use_sweeps: bool = True, use_gravity: bool = False):
+                 use_sweeps: bool = True, use_gravity: bool = True,
+                 gains: dict | None = None):
         super().__init__()
         self.setWindowTitle("manual_tune —— 手动标定（实测 vs 仿真，v2 2-DOF）")
         self.known = dict(known)
         self.fric_big = fric_big
         self.fric_small = fric_small
         self.use_sweeps = bool(use_sweeps)
+        # 控制力矩通道增益初值（kb/ks 两个滑块）
+        self.gains = {"kb": 4.0, "ks": 1.0}
+        if gains:
+            self.gains.update({k: float(v) for k, v in gains.items()})
 
         self.files: list = []
         self.cases: list = []
@@ -471,13 +511,14 @@ class ManualTuneWindow(QtWidgets.QMainWindow):
         for b in (self.btn_open, self.btn_prev, self.btn_next):
             row.addWidget(b)
         dl.addLayout(row)
-        # ★ 重力开关只作用于**前向仿真**：勾选 = 模型里放入该条数据记录的 gx/gy；
-        #   不勾 = 模型里没有重力项。初始值始终按 --ignore-gravity 口径算好、不受影响。
+        # ★ 重力开关只作用于**前向仿真**：**默认勾选**（用数据里记录的 gx/gy，
+        #   与 MPC 的 use_gravity=true 默认一致）；取消勾选 = 模型里没有重力项，
+        #   是"不用重力"的对照。初始值仍按 g=0 口径算好、不受勾选影响。
         self.chk_gravity = QtWidgets.QCheckBox("前向仿真使用重力（数据里的 gx/gy）")
         self.chk_gravity.setToolTip(
-            "只影响画曲线时的正演模型：\n"
+            "只影响画曲线时的正演模型（★ 默认勾选 = 使用重力）：\n"
             "  勾选 = Params.gx/gy 取该条数据记录的等效重力；\n"
-            "  不勾 = gx=gy=0（模型里没有重力项，等价 --ignore-gravity）。\n"
+            "  不勾 = gx=gy=0（模型里没有重力项，等价 --ignore-gravity 对照模式）。\n"
             "★ 初始值（代数最小二乘 + 摩擦扫频）始终按 g=0 口径计算，"
             "勾选与否都不会改变参数的初值。")
         self.chk_gravity.setChecked(bool(use_gravity))
@@ -563,7 +604,7 @@ class ManualTuneWindow(QtWidgets.QMainWindow):
             try:
                 p_init, cases, info = compute_algebraic_init(
                     self.files, self.known, self.fric_big, self.fric_small,
-                    use_sweeps=self.use_sweeps)
+                    use_sweeps=self.use_sweeps, gains=self.gains)
             except Exception as exc:
                 QtWidgets.QMessageBox.warning(
                     self, "初始化失败",
@@ -573,11 +614,17 @@ class ManualTuneWindow(QtWidgets.QMainWindow):
                 QtWidgets.QApplication.restoreOverrideCursor()
             self.cases = cases
             self.p_init = dict(p_init)
-            self.p = dict(p_init)
+            # --known-params 与 --torque-gain 都可能给 kb/ks：known 优先（它是已知量），
+            # 其余用 --torque-gain 的初值。两者都只是初值，之后可自由手调。
+            for g in ("kb", "ks"):
+                self.p_init[g] = float(self.known.get(g, self.gains[g]))
+            self.p = dict(self.p_init)
             self.info = info
         else:
             self.cases = []
             self.p_init = default_param_dict()
+            for g in ("kb", "ks"):
+                self.p_init[g] = float(self.known.get(g, self.gains[g]))
             self.p = dict(self.p_init)
             self.info = {}
         self._sync_rows()
@@ -773,12 +820,22 @@ def main(argv=None) -> int:
                     help="初始值不用摩擦扫频，改由主回归给出（可能解成负值）")
     ap.add_argument("--known-params", type=str, default=DEF_KNOWN_PARAMS,
                     help=f'外部已知参数表 "参数=值,..."；默认 "{DEF_KNOWN_PARAMS}"')
-    ap.add_argument("--use-gravity", action="store_true",
-                    help="打开时默认勾选“前向仿真使用重力”（初始值仍按 g=0 求）")
+    ap.add_argument("--torque-gain", type=str, default=DEF_TORQUE_GAIN,
+                    help=f'控制力矩通道增益（物理力矩 = k × 下发给电控的指令值），'
+                         f'"kb=值,ks=值"；默认 "{DEF_TORQUE_GAIN}"。'
+                         f'★ 只决定参数与指令之间的标度，作为 kb/ks 两个滑块的初值，'
+                         f'随时可手调；模型响应只认它们的比值 × 惯量参数。')
+    ap.add_argument("--no-gravity", dest="use_gravity", action="store_false",
+                    help="★ 默认「使用重力」（前向仿真用数据里记录的 gx/gy，与 MPC 的 "
+                         "use_gravity=true 默认一致）；本开关取消勾选，做「不用重力」的对照。"
+                         "初始值始终按 g=0 口径求，不受影响。")
+    ap.add_argument("--use-gravity", dest="use_gravity", action="store_true",
+                    help="冗余的显式打开（= 默认行为），便于脚本里写清楚")
     a, _ = ap.parse_known_args(argv)
 
     try:
         known = parse_known_params(a.known_params)
+        gains = parse_torque_gain(a.torque_gain)
     except ValueError as exc:
         ap.error(str(exc))
 
@@ -791,7 +848,8 @@ def main(argv=None) -> int:
 
     app = QtWidgets.QApplication(sys.argv[:1])
     win = ManualTuneWindow(files, known, fric_big, fric_small,
-                           use_sweeps=a.use_sweeps, use_gravity=a.use_gravity)
+                           use_sweeps=a.use_sweeps, use_gravity=a.use_gravity,
+                           gains=gains)
     win.show()
     return app.exec_()
 
