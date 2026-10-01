@@ -894,6 +894,163 @@ def algebraic_init(cases: list[Case], nominal=(1.0, 1.0),
     return best, info
 
 
+def _select_joint(d: dict, want_s: bool) -> None:
+    """按 ``joint`` 列就地过滤（1=关节 s 小 yaw；缺列/0=关节 b 大 yaw）。
+
+    两种采集分开成两个类别目录时不会混，但同一个目录里放了两类文件、
+    或者把 s 数据指给了大 yaw 的选项时，必须给出干净的报错而不是算出一堆垃圾。
+    """
+    j = d.get("joint")
+    if j is None:
+        if want_s:
+            raise ValueError(
+                "这份数据的 npz 里没有 joint=1 标记，不是小 yaw 匀速往返数据；"
+                "大 yaw 数据请用 --friction-sweep / --friction-category")
+        return
+    mask = (j > 0.5) if want_s else (j <= 0.5)
+    if not mask.any():
+        raise ValueError(
+            ("找不到 joint=1（小 yaw）的行；" if want_s
+             else "找不到 joint=0（大 yaw）的行；")
+            + "检查是否把两类数据指反了")
+    for k in list(d):
+        d[k] = np.asarray(d[k])[mask]
+
+
+def _G2_of(row: dict, p_dyn: dict, key_sin: str = "mean_sin_psi_s",
+           key_cos: str = "mean_cos_psi_s") -> float:
+    """按已辨识参数算某个窗口的平均重力矩 G2（关节 s 方程里那一项）。"""
+    ms, Psx, Psy = p_dyn["ms"], p_dyn["Psx"], p_dyn["Psy"]
+    gx = float(row["gx"]) if "gx" in row else 0.0
+    gy = float(row["gy"]) if "gy" in row else 0.0
+    gs_sin = ms * (gx * Psx + gy * Psy)
+    gs_cos = ms * (gx * Psy - gy * Psx)
+    return gs_sin * float(row[key_sin]) + gs_cos * float(row[key_cos])
+
+
+def _M22_of(p_dyn: dict) -> float:
+    """关节 s 的等效惯量 M22 = Is + ms|Ps|²（与 θ_s 无关）。"""
+    return p_dyn["Is"] + p_dyn["ms"] * (p_dyn["Psx"] ** 2 + p_dyn["Psy"] ** 2)
+
+
+def _M12_of(p_dyn: dict, theta_s: float) -> float:
+    """耦合惯量 M12 = Is_ + ms·h(θ_s)（h 见 dynamics.cpp 的 computeKinematics）。"""
+    Dx, Dy, Psx, Psy = p_dyn["Dx"], p_dyn["Dy"], p_dyn["Psx"], p_dyn["Psy"]
+    c, s = np.cos(theta_s), np.sin(theta_s)
+    h = Dx * Psx * c + Dy * Psy * c + Dy * Psx * s - Dx * Psy * s
+    return _M22_of(p_dyn) + p_dyn["ms"] * h
+
+
+def fit_friction_sweep_s(sweep_path, p_dyn: dict | None = None,
+                         dyn_correct: bool = True) -> tuple[float, float, dict]:
+    """用小 yaw（关节 s）匀速往返数据独立拟合 (fsc, fsv)。
+
+    稳态关系（θ̈_b≈0、θ̈_s≈0、θ̇_b≈0、基座静止，见 gen_friction_sweep_s.py）：
+        Ts = G2(ψ_s) + fsv·θ̇_s + fsc·tanh(λ·θ̇_s)
+
+    数据里每个速度有正、反两趟，把它们配对做差：
+        ΔTs = fsv·Δθ̇_s + fsc·Δtanh(λθ̇_s) + [M22·Δθ̈_s + M12·Δθ̈_b + ΔC2 + ΔG2]
+    两趟扫过同一以 0 为中心**对称**的位置窗口 ⇒ **ΔG2 一阶精确抵消**（这是本方法
+    的核心，也是它比"用辨识参数直接扣 G2"稳的原因：G2 常比摩擦大一个量级）。
+
+    ``dyn_correct=True``（默认）时再用 p_dyn 扣掉残余的 M22·Δθ̈_s、M12·Δθ̈_b 与 ΔG2：
+    实机大 yaw 被机械抱死时这些项本来就接近 0（扣不扣几乎无差），但仿真里大 yaw
+    只靠位置环抱、M12 又大，不扣会偏 100%+（实测）。ΔC2 = −ms·h'·θ̇_b² 未扣
+    （需要逐样本的 h'·θ̇_b²，采集未记录；θ̇_b 已被阈值限制在很小的范围）。
+
+    sweep_path 可以是单个 npz 也可以是类别目录（合并其中全部 sweep_*.npz）。
+    返回 (fsc, fsv, 诊断信息)；诊断里带"纯差分（完全不依赖已辨识参数）"的结果。
+    """
+    d, sweep_files = _load_sweeps(sweep_path)
+    _select_joint(d, want_s=True)
+    n = int(np.asarray(d["omega"]).size)
+    if n == 0:
+        raise ValueError(f"{sweep_path} 里没有小 yaw 数据行")
+
+    # joint 过滤后每列都已对齐；逐"趟"打包成 dict 列表
+    rows = [{k: float(np.asarray(v)[i]) for k, v in d.items()} for i in range(n)]
+
+    def mp(rs, k):
+        return float(np.mean([r[k] for r in rs]))
+
+    def pair_delta(pp: list[dict], pm: list[dict]) -> dict:
+        """一对（正向若干趟 vs 反向若干趟）的差分量。"""
+        d_om = mp(pp, "omega") - mp(pm, "omega")
+        d_th = mp(pp, "tanh_omega") - mp(pm, "tanh_omega")
+        d_ts = mp(pp, "ts_mean") - mp(pm, "ts_mean")
+        corr = 0.0
+        if dyn_correct and p_dyn is not None:
+            corr += _M22_of(p_dyn) * (mp(pp, "ddtheta_s_mean") - mp(pm, "ddtheta_s_mean"))
+            m12 = 0.5 * (_M12_of(p_dyn, np.radians(mp(pp, "theta_s_mean_deg")))
+                         + _M12_of(p_dyn, np.radians(mp(pm, "theta_s_mean_deg"))))
+            if "ddtheta_b_mean" in pp[0]:
+                corr += m12 * (mp(pp, "ddtheta_b_mean") - mp(pm, "ddtheta_b_mean"))
+            corr += _G2_of(pp[0], p_dyn) - _G2_of(pm[0], p_dyn)   # 窗口没完全对齐时的残余
+        return dict(d_omega=d_om, d_tanh=d_th, d_ts=d_ts, corr=corr,
+                    d_b=mp(pp, "theta_b_mean_deg") - mp(pm, "theta_b_mean_deg"),
+                    omega=0.5 * abs(d_om), n_p=len(pp), n_m=len(pm))
+
+    dirn = np.sign(np.asarray(d["direction"])) if "direction" in d else np.zeros(n)
+    pid = np.asarray(d["pair_id"]).astype(int) if "pair_id" in d else np.zeros(n, dtype=int)
+    has_pair = bool((dirn > 0).any() and (dirn < 0).any())
+    pairs = []
+    if has_pair:
+        for p in sorted({int(x) for x in pid}):
+            idx = np.where(pid == p)[0]
+            pp = [rows[i] for i in idx if dirn[i] > 0]
+            pm = [rows[i] for i in idx if dirn[i] < 0]
+            if pp and pm:
+                pairs.append(pair_delta(pp, pm))
+
+    if not pairs:
+        # 没有配对信息（旧数据）：退回"直接用 p_dyn 扣 G2"的单趟拟合
+        if p_dyn is None:
+            raise ValueError(
+                f"{sweep_path} 里没有 pair_id/direction 配对列，单趟拟合又需要已辨识参数")
+        A = np.column_stack([np.asarray(d["omega"]), np.asarray(d["tanh_omega"])])
+        y = np.asarray(d["ts_mean"]) - np.array([_G2_of({k: float(np.asarray(v)[i])
+                                                         for k, v in d.items()}, p_dyn)
+                                                 for i in range(n)])
+        (fsv, fsc), *_ = np.linalg.lstsq(A, y, rcond=None)
+        info = dict(n=n, pairs=0, files=len(sweep_files), names=sweep_files,
+                    mode="single", fsc_raw=float(fsc), fsv_raw=float(fsv),
+                    omega_abs_min=float(np.abs(A[:, 0]).min()),
+                    omega_abs_max=float(np.abs(A[:, 0]).max()),
+                    residual=float(np.std(y - A @ np.array([fsv, fsc]))))
+        return float(fsc), float(fsv), info
+
+    A = np.array([[q["d_omega"], q["d_tanh"]] for q in pairs])
+    y_raw = np.array([q["d_ts"] for q in pairs])
+    y = y_raw - np.array([q["corr"] for q in pairs])
+
+    # 稳健化：先解一次，剔除修正后仍明显离群的对，再解一次。
+    # 一对坏数据（大 yaw 没被真正抱死的那一趟）就能把 fsv 拽偏 50%+（实测），
+    # 阈值 = max(4·1.4826·MAD, 5e-3 N·m)——5e-3 就是力矩测量/量化噪声量级。
+    dropped: list[int] = []
+    if len(y) >= 5:
+        c0 = np.linalg.lstsq(A, y, rcond=None)[0]
+        r0 = y - A @ c0
+        mad = 1.4826 * float(np.median(np.abs(r0 - np.median(r0))))
+        keep = np.abs(r0 - np.median(r0)) <= max(4.0 * mad, 5e-3)
+        if 3 <= int(keep.sum()) < len(y):
+            dropped = [int(i) for i in np.where(~keep)[0]]
+            A, y = A[keep], y[keep]
+
+    (fsv, fsc), *_ = np.linalg.lstsq(A, y, rcond=None)
+    (fsv_raw, fsc_raw), *_ = np.linalg.lstsq(
+        np.array([[q["d_omega"], q["d_tanh"]] for q in pairs]), y_raw, rcond=None)
+    resid = y - A @ np.array([fsv, fsc])
+    info = dict(n=n, pairs=len(pairs), files=len(sweep_files), names=sweep_files,
+                mode="diff", fsc_raw=float(fsc_raw), fsv_raw=float(fsv_raw),
+                dropped=dropped, kept=int(len(y)),
+                residual=float(np.std(resid)),
+                cond=float(np.linalg.cond(A)),
+                omega_abs_min=float(min(q["omega"] for q in pairs)),
+                omega_abs_max=float(max(q["omega"] for q in pairs)),
+                d_ts_max=float(np.abs(y_raw).max()))
+    return float(fsc), float(fsv), info
+
+
 def parse_stages(spec: str) -> list[tuple[int, float]]:
     """解析 "K:权重,K:权重,..." 形式的课程表，权重归一化到和为 1。"""
     out: list[tuple[int, float]] = []
@@ -972,6 +1129,7 @@ def fit_friction_sweep(sweep_path, p_dyn: dict) -> tuple[float, float, dict]:
     返回 (fbc, fbv, 诊断信息)。
     """
     d, sweep_files = _load_sweeps(sweep_path)
+    _select_joint(d, want_s=False)
     ms, Psx, Psy = p_dyn["ms"], p_dyn["Psx"], p_dyn["Psy"]
     mb, Pbx, Pby = p_dyn["mb"], p_dyn["Pbx"], p_dyn["Pby"]
     Dx, Dy = p_dyn["Dx"], p_dyn["Dy"]
@@ -1197,6 +1355,21 @@ def main() -> int:
     ap.add_argument("--no-friction-sweep", dest="use_friction_sweep",
                     action="store_false",
                     help="不用匀速旋转实验，摩擦仍由主回归给出（实测会解成负值）")
+    ap.add_argument("--friction-category-s", type=str, default=None,
+                    help="**小 yaw** 摩擦类别名（= 目录名）：读 data/<名字>/ 下全部 "
+                         "sweep_*.npz（gen_friction_sweep_s.py 的产物）；"
+                         "被 --friction-sweep-s 覆盖")
+    ap.add_argument("--friction-sweep-s", type=str, default=None,
+                    help="**小 yaw** 匀速往返数据：单个 npz 或目录；缺省用 "
+                         "--friction-category-s 或 data/friction_s。用它**独立**拟合 "
+                         "fsc/fsv（正反趟差分，不依赖大 yaw 摩擦）；找不到就回退成"
+                         "『大 yaw 摩擦的一半』")
+    ap.add_argument("--no-friction-sweep-s", dest="use_friction_sweep_s",
+                    action="store_false",
+                    help="不用小 yaw 数据，fsc/fsv 直接取大 yaw 的一半（旧行为）")
+    ap.add_argument("--fs-s-no-dyn", dest="fs_s_dyn", action="store_false",
+                    help="小 yaw 差分拟合**不扣** M22·Δθ̈_s + M12·Δθ̈_b + ΔG2，"
+                         "完全不依赖已辨识参数（纯差分；大 yaw 被机械抱死时两者几乎无差）")
     ap.add_argument("--init-orders", type=str, default=f"{LOG10_ORDERS_MIN},{LOG10_ORDERS_MAX}",
                     help='--init random 时，初值偏离真值的数量级区间 "min,max"')
     ap.add_argument("--freeze-params", type=str, default="",
@@ -1325,8 +1498,9 @@ def main() -> int:
     truth_ident = {n: ref[n] for n in PARAM_NAMES}
     rng = np.random.default_rng(args.seed)
     if args.init == "algebraic":
-        # ---- 摩擦：先用匀速旋转实验独立拟合（关节 s 取一半），再连同动力学一起回代 ----
+        # ---- 摩擦：大 yaw 用匀速旋转、小 yaw 用匀速往返，先各自独立拟合再回代 ----
         friction = None
+        p_dyn = None
         sweep_path = (Path(args.friction_sweep) if args.friction_sweep
                       else (cfg.category_dir(args.friction_category)
                             if args.friction_category
@@ -1335,8 +1509,7 @@ def main() -> int:
             p_dyn, _ = algebraic_init(cases, nominal=tuple(args.mass_nominal),
                                       friction=(0.0, 0.0, 0.0, 0.0), known=known)
             fbc, fbv, finfo = fit_friction_sweep(sweep_path, p_dyn)
-            friction = (fbc, fbv, 0.5 * fbc, 0.5 * fbv)   # s 取其一半
-            print(f"匀速旋转实验拟合摩擦（{finfo['files']} 个 sweep 文件，"
+            print(f"匀速旋转实验拟合大 yaw 摩擦（{finfo['files']} 个 sweep 文件，"
                   f"{finfo['n']} 个速度点，"
                   f"|ω| {finfo['omega_abs_min']:.4f}~{finfo['omega_abs_max']:.2f} rad/s，"
                   f"残差 {finfo['residual']:.2e} N·m，cond {finfo['cond']:.1f}）:")
@@ -1344,9 +1517,50 @@ def main() -> int:
                   + (f"   真值 {truth['fbc']:.5f} / {truth['fbv']:.5f}"
                      f"   （相对误差 {abs(fbc-truth['fbc'])/truth['fbc']:.2%} / "
                      f"{abs(fbv-truth['fbv'])/truth['fbv']:.2%}）" if has_truth else ""))
-            print(f"  关节 s 取一半: fsc={0.5*fbc:.5f} fsv={0.5*fbv:.5f}"
+            fsc, fsv = 0.5 * fbc, 0.5 * fbv            # 缺省回退：小 yaw 取一半
+            print(f"  关节 s 缺省取一半: fsc={fsc:.5f} fsv={fsv:.5f}"
                   + (f"   真值 {truth['fsc']:.5f} / {truth['fsv']:.5f}"
                      if has_truth else ""))
+
+            # ---- 小 yaw：独立拟合（正反趟差分），优先于"取一半" ----
+            s_path = (Path(args.friction_sweep_s) if args.friction_sweep_s
+                      else (cfg.category_dir(args.friction_category_s)
+                            if args.friction_category_s
+                            else cfg.DATA_DIR_FRICTION_S))
+            if args.use_friction_sweep_s and s_path.exists():
+                if p_dyn is None:
+                    p_dyn, _ = algebraic_init(cases, nominal=tuple(args.mass_nominal),
+                                              friction=(0.0, 0.0, 0.0, 0.0), known=known)
+                try:
+                    fsc2, fsv2, sinfo = fit_friction_sweep_s(s_path, p_dyn,
+                                                             dyn_correct=args.fs_s_dyn)
+                except ValueError as e:
+                    print(f"（小 yaw 数据 {s_path} 不可用：{e}）")
+                else:
+                    fsc, fsv = fsc2, fsv2
+                    how = ("正反趟差分 + p_dyn 扣 M22·Δθ̈_s/M12·Δθ̈_b/ΔG2"
+                           if (args.fs_s_dyn and sinfo["mode"] == "diff")
+                           else "单趟 + p_dyn 扣 G2" if sinfo["mode"] == "single"
+                           else "纯正反趟差分（不用任何已辨识参数）")
+                    print(f"小 yaw 匀速往返拟合关节 s 摩擦（{sinfo['files']} 个文件，"
+                          f"{sinfo['n']} 趟，{sinfo['pairs']} 对，"
+                          f"|ω| {sinfo['omega_abs_min']:.4f}~{sinfo['omega_abs_max']:.2f} "
+                          f"rad/s，残差 {sinfo['residual']:.2e} N·m，{how}）:")
+                    print(f"  fsc={fsc:.5f}  fsv={fsv:.5f}"
+                          + (f"   真值 {truth['fsc']:.5f} / {truth['fsv']:.5f}"
+                             f"   （相对误差 {abs(fsc-truth['fsc'])/truth['fsc']:.2%} / "
+                             f"{abs(fsv-truth['fsv'])/truth['fsv']:.2%}）"
+                             if has_truth else ""))
+                    if sinfo.get("dropped"):
+                        print(f"  稳健剔除 {len(sinfo['dropped'])} 对离群（修正后残差 "
+                              f"> 4·MAD 且 > 5e-3 N·m），留 {sinfo['kept']} 对")
+                    print(f"  对照·纯差分（不扣任何动力学项）: "
+                          f"fsc={sinfo['fsc_raw']:.5f} fsv={sinfo['fsv_raw']:.5f}"
+                          f"    → 两者差得越多说明大 yaw 没被真正固定住"
+                          f"（θ̈_b 残差被 M12 放大）")
+            elif args.use_friction_sweep_s:
+                print(f"（未找到小 yaw 数据 {s_path}，fsc/fsv 仍取大 yaw 的一半）")
+            friction = (fbc, fbv, fsc, fsv)
         elif args.use_friction_sweep:
             print(f"（未找到 {sweep_path}，摩擦改用主回归结果）")
         p_init, ainfo = algebraic_init(cases, nominal=tuple(args.mass_nominal),
