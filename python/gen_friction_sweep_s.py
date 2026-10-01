@@ -195,22 +195,45 @@ class SweepLoop:
         return self._b_torque(f), Ts
 
     # ---------------- 归位：把 θ_s 送到往返起点 ----------------
-    def goto(self, theta_s_target: float, band: float | None = None) -> bool:
-        """把 θ_s 送进以 θ_s_target 为中心的往返带。
+    def goto(self, theta_s_target: float) -> bool:
+        """把 θ_s 送到 θ_s_target（**独立的位置 PID**，与采集用的速度环不共用参数）。
 
-        收敛判据用**滤波后**的位置；位置测量有噪声时容差不可能小于 σ，所以只要
-        已经落进 |θ_s| ≤ band（往返带内）也算成功——往返本身会自己把中心摆正，
-        只有"离带太远"才需要先快速挪回来（否则低速下一趟要跑几十秒）。
+        为什么不用串级："位置P → 速度参考 → 速度环PI"展开后等效位置增益是
+        Kp = KPV·SS_REPOS_KP + KIV ≈ 11 N·m/rad（5.2° 误差即顶到 ±1 N·m 限幅），
+        从两个参数完全看不出来；而且它和采集共用积分状态，goto 攒的积分会漏进第一趟。
+        现在 Kp/Ki/Kd 直接可读：Kp=0.6 N·m/rad ⇒ 30° 误差才 0.31 N·m，
+        实机 M22≈0.0059 时 ω_n≈10 rad/s、ζ≈1.3（不过冲、不敲关节）。
+
+        参考轨迹从**当前位置**出发、按 SS_REPOS_V_MAX 限速推进（起点误差为 0、
+        力矩从 0 长起来），PID 跟的是这条参考而不是直接盯目标——否则第一帧力矩
+        就是 KP·误差（30° 时 0.31 N·m 的阶跃）。
+
+        收敛判据：位置进容差**并且速度也停了**。只判位置会在关节还以 0.7 rad/s
+        运动时就返回（实测），换速度和标定都会带着残余速度起步。容差按噪声自适应。
         """
-        tol = max(cfg.SS_REPOS_TOL_RAD, 3.0 * self.env.sigma[0] * 0.5)
+        env = self.env
+        dt = env.dt
+        tol = max(cfg.SS_REPOS_TOL_RAD, 3.0 * env.sigma[0] * 0.5)
+        tol_v = max(cfg.SS_REPOS_TOL_VEL, 2.0 * env.sigma[1])
+        integ = 0.0                                   # 归位自己的积分，不碰 _int_s
+        ref = float(self._measure()[1][2])            # 参考轨迹从当前位置出发
         for _ in range(cfg.SS_REPOS_MAX_STEPS):
             _st, f = self._measure()
-            if abs(theta_s_target - f[2]) < tol or (band is not None and abs(f[2]) <= band):
+            if abs(theta_s_target - f[2]) < tol and abs(f[3]) < tol_v:
                 return True
-            v_ref = float(np.clip(cfg.SS_REPOS_KP * (theta_s_target - f[2]),
-                                  -cfg.SS_REPOS_V_MAX, cfg.SS_REPOS_V_MAX))
-            Tb, Ts = self._torques(v_ref, f)
-            self.env.step(Tb, Ts)
+            ref += float(np.clip(theta_s_target - ref, -cfg.SS_REPOS_V_MAX * dt,
+                                 cfg.SS_REPOS_V_MAX * dt))
+            e = ref - f[2]
+            g2 = 0.0
+            if self.gravity_ff:
+                _, g2 = env.gravity_torque(f[0], f[2])
+            ts_raw = (g2 + cfg.SS_GOTO_KP * e + cfg.SS_GOTO_KI * integ
+                      - cfg.SS_GOTO_KD * f[3])
+            Ts = float(np.clip(ts_raw, -self.tau_s_max, self.tau_s_max))
+            if Ts == ts_raw:                          # 条件积分抗饱和
+                integ = float(np.clip(integ + e * dt,
+                                      -cfg.SS_GOTO_I_CLAMP, cfg.SS_GOTO_I_CLAMP))
+            env.step(self._b_torque(f), Ts)
         return False
 
     # ---------------- 最大可用角加速度标定 ----------------
@@ -520,6 +543,14 @@ def main() -> int:
     ap.add_argument("--ss-ts-sem-frac", type=float, default=cfg.SS_TS_SEM_FRAC)
     ap.add_argument("--ss-ts-sem-abs", type=float, default=cfg.SS_TS_SEM_ABS)
     ap.add_argument("--ss-rev-lpf-alpha", type=float, default=cfg.SS_REV_LPF_ALPHA)
+    ap.add_argument("--goto-kp", type=float, default=cfg.SS_GOTO_KP,
+                    help="归位位置 PID 的 Kp [N·m/rad]")
+    ap.add_argument("--goto-ki", type=float, default=cfg.SS_GOTO_KI,
+                    help="归位位置 PID 的 Ki [N·m/(rad·s)]")
+    ap.add_argument("--goto-kd", type=float, default=cfg.SS_GOTO_KD,
+                    help="归位位置 PID 的 Kd [N·m·s/rad]（作用在实测 θ̇_s 上）")
+    ap.add_argument("--ss-repos-v-max", type=float, default=cfg.SS_REPOS_V_MAX,
+                    help="归位参考轨迹限速 [rad/s]（越小起步越柔和、越慢）")
     ap.add_argument("--no-amax-cal", dest="amax_cal", action="store_false",
                     default=cfg.SS_AMAX_CAL,
                     help="跳过开始前用最大力矩标定可用角加速度这一步")
@@ -551,6 +582,10 @@ def main() -> int:
     cfg.SS_TS_SEM_FRAC = args.ss_ts_sem_frac
     cfg.SS_TS_SEM_ABS = args.ss_ts_sem_abs
     cfg.SS_REV_LPF_ALPHA = args.ss_rev_lpf_alpha
+    cfg.SS_GOTO_KP = args.goto_kp
+    cfg.SS_GOTO_KI = args.goto_ki
+    cfg.SS_GOTO_KD = args.goto_kd
+    cfg.SS_REPOS_V_MAX = args.ss_repos_v_max
     cfg.SS_AMAX_CAL = args.amax_cal
     cfg.SS_AMAX_CYCLES = args.amax_cycles
     cfg.SS_A_REF_FRAC = args.ss_a_ref_frac
@@ -625,8 +660,11 @@ def main() -> int:
                       f"   （≈ τ/M22，反向峰值因此停在 ±{cfg.THETA_S_TARGET_DEG:g}° 内）")
                 cfg.SS_A_REF = used
             else:
-                print(f"  最大角加速度标定失败（只拿到 {cal['n']} 段，需 ≥3），"
-                      f"沿用 --ss-a-ref={cfg.SS_A_REF:g} rad/s²")
+                safe = min(cfg.SS_A_REF, cfg.SS_A_REF_SAFE)
+                print(f"  最大角加速度标定失败（只拿到 {cal['n']} 段，需 ≥3）！"
+                      f"换向斜坡从 {cfg.SS_A_REF:g} 收到保守值 {safe:g} rad/s²"
+                      f"（标定失败往往意味着力矩方向/标定有问题，先查那个）")
+                cfg.SS_A_REF = safe
         for pair_id, w in enumerate(omegas):
             amp, _cv_half, gate = plan_amp(w)
             est = 2.0 * gate / (w * env.dt)          # 单趟预估样本数
