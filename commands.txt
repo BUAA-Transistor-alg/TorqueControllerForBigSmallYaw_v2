@@ -15,3 +15,5 @@ python3 python/identify_params.py --category Sentry1 \
     --known-params "Dx=0.0,Dy=0.07" \
     --out "./data/identify_Sentry1_ignore_gravity "\
     --ignore-gravity 
+
+python3 python/manual_tune.py
