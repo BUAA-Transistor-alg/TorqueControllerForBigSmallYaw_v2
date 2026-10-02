@@ -67,18 +67,19 @@ constexpr double MAX_TORQUE_S = 1.0;          // 小 yaw 软限幅 [N·m]
 //   因此位置上 Q→w_psi、力矩幅值上 R→w_tau、增量上 Rd→w_dx_b / w_dx_s；
 //   w_x_b / w_x_s 是"预 tanh 量"的 L2 惩罚，原版没有对应项，但本工程要求它们 > 0
 //   （把 x 约束在 tanh 线性区、保住梯度），故取与 R 同量级的小正数。
-constexpr double W_PSI_B  = 5.0;              // 大 yaw ← 原 Q
-constexpr double W_PSI_S  = 5.0;              // 小 yaw ← 原 Q
+constexpr double W_PSI_B  = 1.0;              // 大 yaw ← 原 Q
+constexpr double W_PSI_S  = 1.0;              // 小 yaw ← 原 Q
 constexpr double W_DPSI_B = 0.0;              // 大 yaw
 constexpr double W_DPSI_S = 0.0;              // 小 yaw
-constexpr double W_TAU_B  = 0.01;             // 大 yaw ← 原 R
-constexpr double W_TAU_S  = 0.01;             // 小 yaw ← 原 R
-constexpr double W_X_B    = 0.01;             // 大 yaw：原版无此项；必须 > 0
-constexpr double W_X_S    = 0.01;             // 小 yaw：同上
-constexpr double W_DX_B   = 0.1;              // 大 yaw ← 原 Rd
+constexpr double W_TAU_B  = 0.0;             // 大 yaw ← 原 R
+constexpr double W_TAU_S  = 0.0;             // 小 yaw ← 原 R
+
+constexpr double W_X_B    = 1.0;             // 大 yaw：原版无此项；必须 > 0
+constexpr double W_X_S    = 0.1;             // 小 yaw：同上
+constexpr double W_DX_B   = 10.0;              // 大 yaw ← 原 Rd
 constexpr double W_DX_S   = 0.1;              // 小 yaw ← 原 Rd
-constexpr double INTEGRAL_GAIN_B = 0.01;      // 大 yaw 积分补偿比例系数
-constexpr double INTEGRAL_GAIN_S = 0.01;      // 小 yaw 积分补偿比例系数
+constexpr double INTEGRAL_GAIN_B = 0.0;      // 大 yaw 积分补偿比例系数
+constexpr double INTEGRAL_GAIN_S = 0.0;      // 小 yaw 积分补偿比例系数
 
 // ===========================================================================
 //   gx / gy 是"摆平面内的等效重力分量"，运行期由 FullStrictPoseBuilder 反解得到。

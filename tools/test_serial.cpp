@@ -91,7 +91,7 @@ int main() {
         // 默认初始化的 frame_header1/2、protocol_version、data_size 已自动设置
         packet.auto_aim_enable = 1;
         packet.fire = 0;
-        packet.pitch_target_angle = 10.0f;
+        packet.pitch_target_angle = -6.708f;
         // ── 大 yaw：仅力矩模式、目标角/速度不参与 ──
         packet.yaw_big_mode            = com::mcu::YAW_MODE_TORQUE_ONLY;
         packet.yaw_big_target_angle    = 0.0;
