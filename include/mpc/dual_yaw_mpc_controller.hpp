@@ -30,10 +30,10 @@
 //   * step(target_psi_b_buf, target_psi_s_buf, enable)：直接用整条序列替换缓冲
 //     （取前 N 个，不足用最后一个值补齐）。
 //
-// 积分补偿（integral_enable = true 时）：
-//   积分值 += gain · (上一步预测的一步后方位角 − 这一步实测方位角)；
+// 积分补偿（integral_enable_b / integral_enable_s 分别控制两轴）：
+//   某轴启用时：该轴积分值 += gain · (上一步预测的一步后方位角 − 这一步实测方位角)；
 //   返回的力矩 = clamp(MPC 力矩 + 积分值, ±max_torque)；第一次 step 无上一步预测，
-//   不计算积分增量。integral_enable = false 时积分值清空为 0。
+//   不计算积分增量。某轴不启用时该轴积分值清空为 0（另一轴不受影响）。
 
 #include <vector>
 
@@ -137,12 +137,14 @@ public:
     DualYawMpcController& operator=(const DualYawMpcController&) = delete;
 
     /// 单点目标模式：压入延迟缓冲后求解（目标为世界系方位角）。
-    Result step(double target_psi_b, double target_psi_s, bool integral_enable = false);
+    /// integral_enable_b / integral_enable_s：两轴积分补偿开关，各自独立。
+    Result step(double target_psi_b, double target_psi_s,
+                bool integral_enable_b = false, bool integral_enable_s = false);
 
     /// 整序列模式：用传入序列替换延迟缓冲后求解（取前 N 个，不足用最后一个补齐）。
     Result step(const std::vector<double>& target_psi_b_buf,
                 const std::vector<double>& target_psi_s_buf,
-                bool integral_enable = false);
+                bool integral_enable_b = false, bool integral_enable_s = false);
 
     /// 离线 / 仿真入口：状态与两个世界系参考序列都由调用方直接给出
     /// （参考序列即预测窗口，长度不足 N 时用最后一个值补齐；空序列按目标 0）。
@@ -151,7 +153,7 @@ public:
     Result step(const Measurement& measurement,
                 const std::vector<double>& ref_psi_b,
                 const std::vector<double>& ref_psi_s,
-                bool integral_enable = false);
+                bool integral_enable_b = false, bool integral_enable_s = false);
 
     // ------------------------------------------------------------------
     // 只读访问 / 配置
@@ -177,7 +179,7 @@ public:
 
 private:
     /// 在线路径：读状态 + 用延迟缓冲构造参考序列 + 求解。
-    Result solve(bool integral_enable);
+    Result solve(bool integral_enable_b, bool integral_enable_s);
 
     /// 核心：给定状态与**已补齐到 N** 的参考序列求解（含重力更新与积分补偿）。
     Result solveWith(const Measurement& measurement,
@@ -185,7 +187,8 @@ private:
                      const std::vector<double>& ref_psi_s,
                      double target_psi_b,
                      double target_psi_s,
-                     bool integral_enable);
+                     bool integral_enable_b,
+                     bool integral_enable_s);
 
     /// 把一条目标序列写入延迟缓冲（最多 N 个，不足用最后一个值补齐到 N 个）。
     static void fillBuffer(std::vector<double>& buf,

@@ -46,12 +46,14 @@ void McuMpcController::stop() {
 }
 
 void McuMpcController::set(bool auto_aim_enable,
-                           bool yaw_torque_only_mode,
+                           bool yaw_torque_only_mode_b,
+                           bool yaw_torque_only_mode_s,
                            double target_psi_b,
                            double target_psi_s,
                            double pitch_target_angle,
                            bool fire,
-                           bool integral_enable) {
+                           bool integral_enable_b,
+                           bool integral_enable_s) {
     // 目标自动转换到与当前世界方位角差最小的等效角（避免参考序列引入整圈偏差）。
     // 读状态不持锁（内部走通信快照），与参考工程一致。
     const DualYawMpcController::Measurement meas = mpc_.measure();
@@ -62,8 +64,10 @@ void McuMpcController::set(bool auto_aim_enable,
 
     std::lock_guard<std::mutex> lock(set_mtx_);
     auto_aim_enable_ = auto_aim_enable;
-    yaw_torque_only_mode_ = yaw_torque_only_mode;
-    integral_enable_ = integral_enable;
+    yaw_torque_only_mode_b_ = yaw_torque_only_mode_b;
+    yaw_torque_only_mode_s_ = yaw_torque_only_mode_s;
+    integral_enable_b_ = integral_enable_b;
+    integral_enable_s_ = integral_enable_s;
     target_psi_b_ = adj_b;
     target_psi_s_ = adj_s;
     pitch_target_angle_ = pitch_target_angle;
@@ -78,12 +82,14 @@ void McuMpcController::set(bool auto_aim_enable,
 }
 
 void McuMpcController::set(bool auto_aim_enable,
-                           bool yaw_torque_only_mode,
+                           bool yaw_torque_only_mode_b,
+                           bool yaw_torque_only_mode_s,
                            const std::vector<double>& target_psi_b_seq,
                            const std::vector<double>& target_psi_s_seq,
                            const std::vector<double>& pitch_seq,
                            const std::vector<bool>& fire_seq,
-                           bool integral_enable) {
+                           bool integral_enable_b,
+                           bool integral_enable_s) {
     // 两个 yaw 序列各自的 wrap 基准：当前世界方位角。
     const DualYawMpcController::Measurement meas = mpc_.measure();
     const double ref_b0 = meas.valid ? meas.psi_b : 0.0;
@@ -91,8 +97,10 @@ void McuMpcController::set(bool auto_aim_enable,
 
     std::lock_guard<std::mutex> lock(set_mtx_);
     auto_aim_enable_ = auto_aim_enable;
-    yaw_torque_only_mode_ = yaw_torque_only_mode;
-    integral_enable_ = integral_enable;
+    yaw_torque_only_mode_b_ = yaw_torque_only_mode_b;
+    yaw_torque_only_mode_s_ = yaw_torque_only_mode_s;
+    integral_enable_b_ = integral_enable_b;
+    integral_enable_s_ = integral_enable_s;
 
     // 第一个值 remainder 到当前世界方位角 ±π 内，后续值 remainder 到前一个值 ±π 内。
     target_psi_b_seq_.clear();
@@ -123,14 +131,16 @@ void McuMpcController::loop() {
         auto start = std::chrono::steady_clock::now();
 
         // 取最新设置的发送参数与 MPC 目标；若序列模式非空则优先消费序列
-        bool aa, mode, fire, integral_enable, use_seq;
+        bool aa, mode_b, mode_s, fire, integral_enable_b, integral_enable_s, use_seq;
         double target_b, target_s, pitch;
         std::vector<double> seq_b, seq_s;
         {
             std::lock_guard<std::mutex> lock(set_mtx_);
             aa = auto_aim_enable_;
-            mode = yaw_torque_only_mode_;
-            integral_enable = integral_enable_;
+            mode_b = yaw_torque_only_mode_b_;
+            mode_s = yaw_torque_only_mode_s_;
+            integral_enable_b = integral_enable_b_;
+            integral_enable_s = integral_enable_s_;
             target_b = target_psi_b_;
             target_s = target_psi_s_;
             pitch = pitch_target_angle_;
@@ -169,9 +179,9 @@ void McuMpcController::loop() {
             // 某一路序列已用完时，用该路"保持值"组一个单元素序列（内部会补齐到 N）。
             if (seq_b.empty()) seq_b.assign(1, target_b);
             if (seq_s.empty()) seq_s.assign(1, target_s);
-            res = mpc_.step(seq_b, seq_s, integral_enable);
+            res = mpc_.step(seq_b, seq_s, integral_enable_b, integral_enable_s);
         } else {
-            res = mpc_.step(target_b, target_s, integral_enable);
+            res = mpc_.step(target_b, target_s, integral_enable_b, integral_enable_s);
         }
 
         // 配合最新设置构造发送包（yaw 目标角/角速度为**关节系**量）
@@ -179,10 +189,11 @@ void McuMpcController::loop() {
         pkt.auto_aim_enable = aa ? 1 : 0;
         pkt.fire = fire ? 1 : 0;
         pkt.pitch_target_angle = static_cast<float>(pitch);
-        const uint8_t yaw_mode =
-            mode ? com::mcu::YAW_MODE_TORQUE_ONLY : com::mcu::YAW_MODE_TORQUE_PLUS_PID;
-        pkt.yaw_big_mode = yaw_mode;
-        pkt.yaw_small_mode = yaw_mode;
+        // 两个 yaw 通道的模式各自独立（YawMode：1 = 仅力矩，2 = 力矩 + 内环）
+        pkt.yaw_big_mode = mode_b ? com::mcu::YAW_MODE_TORQUE_ONLY
+                                  : com::mcu::YAW_MODE_TORQUE_PLUS_PID;
+        pkt.yaw_small_mode = mode_s ? com::mcu::YAW_MODE_TORQUE_ONLY
+                                    : com::mcu::YAW_MODE_TORQUE_PLUS_PID;
 
         pkt.yaw_big_target_angle = res.pred_theta_b;
         pkt.yaw_big_target_velocity = static_cast<float>(res.pred_dtheta_b);

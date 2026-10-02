@@ -6,12 +6,14 @@
 // 与参考工程 /home/huhu233/rm2027/TorqueController 的 tcs::McuMpcController
 // 形式一致，区别只在于被控对象是双连杆（大 yaw + 小 yaw）：
 //
-//   - set(auto_aim_enable, yaw_torque_only_mode, target_psi_b, target_psi_s,
-//         pitch_target_angle, fire, integral_enable):
+//   - set(auto_aim_enable, yaw_torque_only_mode_b, yaw_torque_only_mode_s,
+//         target_psi_b, target_psi_s, pitch_target_angle, fire,
+//         integral_enable_b, integral_enable_s):
 //       一次性设置全部发送参数与 MPC 目标。两个 yaw 目标都是**世界系方位角**
 //       （psi_b / psi_s，rad）。设置时各自自动转换到与**当前**世界方位角角度差
 //       最小的等效角（|差| ≤ π，且同角度），避免参考序列引入整圈偏差。
-//       除两个目标传给 DualYawMpcController 外，其余参数由本类自己维护。
+//       除两个目标传给 DualYawMpcController 外，其余参数由本类自己维护；
+//       两个 yaw 通道的模式与积分开关各自独立。
 //
 //   - 后台线程以 loop_period（秒，默认 0.01 = 100Hz）为周期运行：
 //       取最新目标调用 DualYawMpcController::step，以 mpc 结果 + 最新发送参数
@@ -104,15 +106,19 @@ public:
     // 单目标 set：设置发送参数 + 两个 yaw 的 MPC 目标（线程安全）
     //
     // 目标为世界系方位角；内部自动转换到与当前世界方位角差最小的等效角。
-    // integral_enable：本步是否启用两轴积分补偿（透传 DualYawMpcController::step）。
+    // yaw_torque_only_mode_b / _s：两轴各自的 YawMode 选择（true = 仅力矩）。
+    // integral_enable_b / _s：本步两轴是否启用积分补偿（各自透传给
+    // DualYawMpcController::step）。
     // ------------------------------------------------------------------
     void set(bool auto_aim_enable,
-             bool yaw_torque_only_mode,
+             bool yaw_torque_only_mode_b,
+             bool yaw_torque_only_mode_s,
              double target_psi_b,
              double target_psi_s,
              double pitch_target_angle,
              bool fire,
-             bool integral_enable = false);
+             bool integral_enable_b = false,
+             bool integral_enable_s = false);
 
     // ------------------------------------------------------------------
     // 序列版 set：传入 target_psi_b / target_psi_s / pitch / fire 四个序列
@@ -122,12 +128,14 @@ public:
     // 调用单目标 set 会清空这些序列。
     // ------------------------------------------------------------------
     void set(bool auto_aim_enable,
-             bool yaw_torque_only_mode,
+             bool yaw_torque_only_mode_b,
+             bool yaw_torque_only_mode_s,
              const std::vector<double>& target_psi_b_seq,
              const std::vector<double>& target_psi_s_seq,
              const std::vector<double>& pitch_seq,
              const std::vector<bool>& fire_seq,
-             bool integral_enable = false);
+             bool integral_enable_b = false,
+             bool integral_enable_s = false);
 
     /// 最新 MPC 结果（线程安全，显示用）
     State state() const;
@@ -141,8 +149,10 @@ private:
     // 设置参数锁（后台线程读取）
     mutable std::mutex set_mtx_;
     bool   auto_aim_enable_ = true;
-    bool   yaw_torque_only_mode_ = false;
-    bool   integral_enable_ = false;  // 积分补偿开关（后台线程读取）
+    bool   yaw_torque_only_mode_b_ = false;  // 大 yaw 通道模式（true = 仅力矩）
+    bool   yaw_torque_only_mode_s_ = false;  // 小 yaw 通道模式
+    bool   integral_enable_b_ = false;       // 大 yaw 积分补偿开关
+    bool   integral_enable_s_ = false;       // 小 yaw 积分补偿开关
     double target_psi_b_ = 0.0;
     double target_psi_s_ = 0.0;
     double pitch_target_angle_ = 0.0;

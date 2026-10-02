@@ -50,7 +50,8 @@ void DualYawMpcController::fillBuffer(std::vector<double>& buf,
 
 DualYawMpcController::Result DualYawMpcController::step(double target_psi_b,
                                                         double target_psi_s,
-                                                        bool integral_enable) {
+                                                        bool integral_enable_b,
+                                                        bool integral_enable_s) {
     // 延迟目标缓冲（最多 N 个，最旧在前）。
     target_buf_b_.push_back(target_psi_b);
     target_buf_s_.push_back(target_psi_s);
@@ -60,16 +61,17 @@ DualYawMpcController::Result DualYawMpcController::step(double target_psi_b,
     while (static_cast<int>(target_buf_s_.size()) > n_) {
         target_buf_s_.erase(target_buf_s_.begin());
     }
-    return solve(integral_enable);
+    return solve(integral_enable_b, integral_enable_s);
 }
 
 DualYawMpcController::Result DualYawMpcController::step(
     const std::vector<double>& target_psi_b_buf,
     const std::vector<double>& target_psi_s_buf,
-    bool integral_enable) {
+    bool integral_enable_b,
+    bool integral_enable_s) {
     fillBuffer(target_buf_b_, target_psi_b_buf, n_);
     fillBuffer(target_buf_s_, target_psi_s_buf, n_);
-    return solve(integral_enable);
+    return solve(integral_enable_b, integral_enable_s);
 }
 
 DualYawMpcController::Measurement DualYawMpcController::measure() const {
@@ -99,7 +101,8 @@ DualYawMpcController::Measurement DualYawMpcController::measure() const {
     return m;
 }
 
-DualYawMpcController::Result DualYawMpcController::solve(bool integral_enable) {
+DualYawMpcController::Result DualYawMpcController::solve(bool integral_enable_b,
+                                                         bool integral_enable_s) {
     Result r;
 
     // ---- 1. 读严格反解包，按模型定义组装状态、世界方位角与重力 ----
@@ -121,14 +124,15 @@ DualYawMpcController::Result DualYawMpcController::solve(bool integral_enable) {
     while (static_cast<int>(ref_s.size()) < n_) ref_s.push_back(ref_s.back());
 
     return solveWith(meas, ref_b, ref_s, target_buf_b_.front(), target_buf_s_.front(),
-                     integral_enable);
+                     integral_enable_b, integral_enable_s);
 }
 
 DualYawMpcController::Result DualYawMpcController::step(
     const Measurement& measurement,
     const std::vector<double>& ref_psi_b,
     const std::vector<double>& ref_psi_s,
-    bool integral_enable) {
+    bool integral_enable_b,
+    bool integral_enable_s) {
     Result r;
     if (!measurement.valid) {
         return r;
@@ -140,7 +144,8 @@ DualYawMpcController::Result DualYawMpcController::step(
     while (static_cast<int>(ref_b.size()) < n_) ref_b.push_back(ref_b.back());
     while (static_cast<int>(ref_s.size()) < n_) ref_s.push_back(ref_s.back());
 
-    return solveWith(measurement, ref_b, ref_s, ref_b.front(), ref_s.front(), integral_enable);
+    return solveWith(measurement, ref_b, ref_s, ref_b.front(), ref_s.front(),
+                     integral_enable_b, integral_enable_s);
 }
 
 DualYawMpcController::Result DualYawMpcController::solveWith(
@@ -149,7 +154,8 @@ DualYawMpcController::Result DualYawMpcController::solveWith(
     const std::vector<double>& ref_s,
     double target_psi_b,
     double target_psi_s,
-    bool integral_enable) {
+    bool integral_enable_b,
+    bool integral_enable_s) {
     Result r;
 
     const double theta_c = measurement.theta_c;
@@ -203,28 +209,33 @@ DualYawMpcController::Result DualYawMpcController::solveWith(
     r.pred_psi_b_seq = mres.pred_psi_b_seq;
     r.pred_psi_s_seq = mres.pred_psi_s_seq;
 
-    // ---- 5. 积分补偿（两轴各自独立）----
-    if (integral_enable) {
-        // 第一次 step 无上一步预测，不计算积分增量。
+    // ---- 5. 积分补偿（两轴各自独立：累积量、增益、开关都分开）----
+    // 第一次 step 无上一步预测，不计算积分增量。
+    if (integral_enable_b) {
         if (has_prev_pred_) {
             integral_b_ += options_.integral_gain_b * (prev_pred_psi_b_ - psi_b);
-            integral_s_ += options_.integral_gain_s * (prev_pred_psi_s_ - psi_s);
         }
-        prev_pred_psi_b_ = r.pred_psi_b;
-        prev_pred_psi_s_ = r.pred_psi_s;
-        has_prev_pred_ = true;
         r.torque_b = std::clamp(r.torque_b + integral_b_, -mpc_.maxTorqueB(),
                                 mpc_.maxTorqueB());
+    } else {
+        // 大 yaw 未启用：只清空大 yaw 的积分值，力矩保持 MPC 结果。
+        integral_b_ = 0.0;
+    }
+    if (integral_enable_s) {
+        if (has_prev_pred_) {
+            integral_s_ += options_.integral_gain_s * (prev_pred_psi_s_ - psi_s);
+        }
         r.torque_s = std::clamp(r.torque_s + integral_s_, -mpc_.maxTorqueS(),
                                 mpc_.maxTorqueS());
     } else {
-        // 未启用：积分值清空为 0，力矩保持 MPC 结果。
-        integral_b_ = 0.0;
+        // 小 yaw 未启用：只清空小 yaw 的积分值，力矩保持 MPC 结果。
         integral_s_ = 0.0;
-        prev_pred_psi_b_ = r.pred_psi_b;
-        prev_pred_psi_s_ = r.pred_psi_s;
-        has_prev_pred_ = true;
     }
+    // 两轴的"上一步预测"都照常记录（下一次 step 算积分增量要用），与开关无关：
+    // 某一轴关掉再打开时不会拿到过期的预测值。
+    prev_pred_psi_b_ = r.pred_psi_b;
+    prev_pred_psi_s_ = r.pred_psi_s;
+    has_prev_pred_ = true;
     r.integral_b = integral_b_;
     r.integral_s = integral_s_;
 

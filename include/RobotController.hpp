@@ -118,16 +118,19 @@ public:
 
     /// 直通 McuMpcController::set（单目标模式）。
     /// 序列模式下调用本接口抛出 std::runtime_error。
-    void set(bool auto_aim_enable, bool yaw_torque_only_mode, double target_psi_b,
-             double target_psi_s, double pitch_target_angle, bool fire,
-             bool integral_enable);
+    /// yaw_torque_only_mode_b / _s（true = 该轴仅力矩）与 integral_enable_b / _s
+    /// 都是**大小 yaw 各自独立**；auto_aim_enable / fire / pitch 是整机单通道。
+    void set(bool auto_aim_enable, bool yaw_torque_only_mode_b, bool yaw_torque_only_mode_s,
+             double target_psi_b, double target_psi_s, double pitch_target_angle, bool fire,
+             bool integral_enable_b, bool integral_enable_s);
 
     /// 直通 McuMpcController 序列版 set。单目标模式下调用本接口抛出 std::runtime_error。
-    void set(bool auto_aim_enable, bool yaw_torque_only_mode,
+    void set(bool auto_aim_enable, bool yaw_torque_only_mode_b, bool yaw_torque_only_mode_s,
              const std::vector<double>& target_psi_b_seq,
              const std::vector<double>& target_psi_s_seq,
              const std::vector<double>& pitch_seq,
-             const std::vector<bool>& fire_seq, bool integral_enable);
+             const std::vector<bool>& fire_seq,
+             bool integral_enable_b, bool integral_enable_s);
 
     Mode mode() const { return sequence_mode_ ? Mode::SEQUENCE : Mode::SINGLE; }
 

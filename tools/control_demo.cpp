@@ -81,6 +81,14 @@ constexpr double W_DX_S   = 0.1;              // 小 yaw ← 原 Rd
 constexpr double INTEGRAL_GAIN_B = 0.0;      // 大 yaw 积分补偿比例系数
 constexpr double INTEGRAL_GAIN_S = 0.0;      // 小 yaw 积分补偿比例系数
 
+// ── 两轴各自的控制模式与积分开关（同样按大 / 小 yaw 分开）──
+//   TORQUE_ONLY_*: true  = 仅力矩（YawMode 1，电控只施加 MPC 力矩、不叠加内环）
+//                  false = 力矩 + 位置/速度内环（YawMode 2）
+constexpr bool TORQUE_ONLY_B     = true;     // 大 yaw 通道模式
+constexpr bool TORQUE_ONLY_S     = true;     // 小 yaw 通道模式
+constexpr bool INTEGRAL_ENABLE_B = false;    // 大 yaw 积分补偿开关
+constexpr bool INTEGRAL_ENABLE_S = false;    // 小 yaw 积分补偿开关
+
 // ===========================================================================
 //   gx / gy 是"摆平面内的等效重力分量"，运行期由 FullStrictPoseBuilder 反解得到。
 //   **是否真的进模型**由 MPCController::Options::use_gravity 决定（本文件里经
@@ -215,12 +223,13 @@ int main(int argc, char** argv) {
         double t = std::chrono::duration<double>(start - t0).count();
 
         // 设置发送参数 + MPC 目标（后台线程 100Hz 求解并发送）
-        // 两轴都用"仅力矩"模式（YawMode 1）：电控只施加 MPC 力矩，不叠加内环
+        // 两个 yaw 通道的模式与积分开关各自独立；auto_aim / fire / pitch 是整机单通道
         double psi_b = targetPsiB(t);
         double psi_s = targetPsiS(t);
         double pitch = targetPitch(t);
-        rc.set(/*auto_aim_enable=*/true, /*yaw_torque_only_mode=*/true,
-               psi_b, psi_s, pitch, /*fire=*/false, /*integral_enable=*/false);
+        rc.set(/*auto_aim_enable=*/true, TORQUE_ONLY_B, TORQUE_ONLY_S,
+               psi_b, psi_s, pitch, /*fire=*/false,
+               INTEGRAL_ENABLE_B, INTEGRAL_ENABLE_S);
 
         // 每 0.1s 打印一次
         if (++loop % 10 == 0) {

@@ -88,28 +88,33 @@ RobotController::State RobotController::getState() {
     return st;
 }
 
-void RobotController::set(bool auto_aim_enable, bool yaw_torque_only_mode,
-                          double target_psi_b, double target_psi_s,
-                          double pitch_target_angle, bool fire, bool integral_enable) {
+void RobotController::set(bool auto_aim_enable, bool yaw_torque_only_mode_b,
+                          bool yaw_torque_only_mode_s, double target_psi_b,
+                          double target_psi_s, double pitch_target_angle, bool fire,
+                          bool integral_enable_b, bool integral_enable_s) {
     if (sequence_mode_) {
         throw std::runtime_error("RobotController: SEQUENCE mode selected, "
                                  "use sequence set() instead of single set()");
     }
-    mcu_mpc_.set(auto_aim_enable, yaw_torque_only_mode, target_psi_b, target_psi_s,
-                 pitch_target_angle, fire, integral_enable);
+    mcu_mpc_.set(auto_aim_enable, yaw_torque_only_mode_b, yaw_torque_only_mode_s,
+                 target_psi_b, target_psi_s, pitch_target_angle, fire,
+                 integral_enable_b, integral_enable_s);
 }
 
-void RobotController::set(bool auto_aim_enable, bool yaw_torque_only_mode,
+void RobotController::set(bool auto_aim_enable, bool yaw_torque_only_mode_b,
+                          bool yaw_torque_only_mode_s,
                           const std::vector<double>& target_psi_b_seq,
                           const std::vector<double>& target_psi_s_seq,
                           const std::vector<double>& pitch_seq,
-                          const std::vector<bool>& fire_seq, bool integral_enable) {
+                          const std::vector<bool>& fire_seq,
+                          bool integral_enable_b, bool integral_enable_s) {
     if (!sequence_mode_) {
         throw std::runtime_error("RobotController: SINGLE mode selected, "
                                  "use single set() instead of sequence set()");
     }
-    mcu_mpc_.set(auto_aim_enable, yaw_torque_only_mode, target_psi_b_seq, target_psi_s_seq,
-                 pitch_seq, fire_seq, integral_enable);
+    mcu_mpc_.set(auto_aim_enable, yaw_torque_only_mode_b, yaw_torque_only_mode_s,
+                 target_psi_b_seq, target_psi_s_seq, pitch_seq, fire_seq,
+                 integral_enable_b, integral_enable_s);
 }
 
 }  // namespace tcbs
