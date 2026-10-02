@@ -60,15 +60,23 @@ constexpr double MAX_TORQUE_S = 1.0;          // 小 yaw 软限幅 [N·m]
 //   原版代价 = Q·sqrt(err²+a) + R·mean(τ²) + Rd·mean(Δτ²)（单轴）
 //   本工程代价（见 include/mpc/mpc_controller.hpp）= Σ w_psi·mean(psi 误差)
 //              + w_dpsi·mean(dpsi 误差) + w_tau·mean(τ²)
-//              + w_x·mean(x²) + w_dx·mean(Δx²)（两轴各一份，均值除以 2N）
-//   因此位置上 Q→w_psi、力矩幅值上 R→w_tau、增量上 Rd→w_dx；
-//   w_x 是"预 tanh 量"的 L2 惩罚，原版没有对应项，但本工程要求它 > 0
+//              + w_x_b·mean(x_b²) + w_x_s·mean(x_s²)
+//              + w_dx_b·mean(Δx_b²) + w_dx_s·mean(Δx_s²)
+//   （内层六项与两个外层 L2 都按大 / 小 yaw 各一份权重；每个 mean 都是**该通道
+//     自己** N 步的均值）
+//   因此位置上 Q→w_psi、力矩幅值上 R→w_tau、增量上 Rd→w_dx_b / w_dx_s；
+//   w_x_b / w_x_s 是"预 tanh 量"的 L2 惩罚，原版没有对应项，但本工程要求它们 > 0
 //   （把 x 约束在 tanh 线性区、保住梯度），故取与 R 同量级的小正数。
-constexpr double W_PSI    = 5.0;              // ← 原 Q
-constexpr double W_DPSI   = 0.0;
-constexpr double W_TAU    = 0.01;             // ← 原 R
-constexpr double W_X      = 0.01;             // 原版无此项；必须 > 0
-constexpr double W_DX     = 0.1;              // ← 原 Rd
+constexpr double W_PSI_B  = 5.0;              // 大 yaw ← 原 Q
+constexpr double W_PSI_S  = 5.0;              // 小 yaw ← 原 Q
+constexpr double W_DPSI_B = 0.0;              // 大 yaw
+constexpr double W_DPSI_S = 0.0;              // 小 yaw
+constexpr double W_TAU_B  = 0.01;             // 大 yaw ← 原 R
+constexpr double W_TAU_S  = 0.01;             // 小 yaw ← 原 R
+constexpr double W_X_B    = 0.01;             // 大 yaw：原版无此项；必须 > 0
+constexpr double W_X_S    = 0.01;             // 小 yaw：同上
+constexpr double W_DX_B   = 0.1;              // 大 yaw ← 原 Rd
+constexpr double W_DX_S   = 0.1;              // 小 yaw ← 原 Rd
 constexpr double INTEGRAL_GAIN_B = 0.01;      // 大 yaw 积分补偿比例系数
 constexpr double INTEGRAL_GAIN_S = 0.01;      // 小 yaw 积分补偿比例系数
 
@@ -102,14 +110,16 @@ mpc::MPCController::Options makeMpcOptions(bool use_gravity) {
     opt.N            = MPC_PRED_N;
     opt.max_torque_b = MAX_TORQUE_B;
     opt.max_torque_s = MAX_TORQUE_S;
-    opt.w_psi_b      = W_PSI;
-    opt.w_psi_s      = W_PSI;
-    opt.w_dpsi_b     = W_DPSI;
-    opt.w_dpsi_s     = W_DPSI;
-    opt.w_tau_b      = W_TAU;
-    opt.w_tau_s      = W_TAU;
-    opt.w_x          = W_X;
-    opt.w_dx         = W_DX;
+    opt.w_psi_b      = W_PSI_B;
+    opt.w_psi_s      = W_PSI_S;
+    opt.w_dpsi_b     = W_DPSI_B;
+    opt.w_dpsi_s     = W_DPSI_S;
+    opt.w_tau_b      = W_TAU_B;
+    opt.w_tau_s      = W_TAU_S;
+    opt.w_x_b        = W_X_B;
+    opt.w_x_s        = W_X_S;
+    opt.w_dx_b       = W_DX_B;
+    opt.w_dx_s       = W_DX_S;
     opt.max_iter     = MAX_ITER;
     opt.use_gravity  = use_gravity;   // true（默认）= 实测 gx/gy 进模型
     return opt;

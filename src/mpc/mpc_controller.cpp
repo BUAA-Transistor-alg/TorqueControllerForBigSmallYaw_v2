@@ -75,7 +75,8 @@ MPCController::MPCController(const dm::Params& params, const Options& options)
         throw std::invalid_argument("MPCController: max_torque must be > 0");
     }
     const double weights[] = {opt_.w_psi_b, opt_.w_psi_s, opt_.w_dpsi_b, opt_.w_dpsi_s,
-                              opt_.w_tau_b, opt_.w_tau_s, opt_.w_x,      opt_.w_dx};
+                              opt_.w_tau_b, opt_.w_tau_s, opt_.w_x_b,   opt_.w_x_s,
+                              opt_.w_dx_b,  opt_.w_dx_s};
     for (double w : weights) {
         if (!(w >= 0.0)) {
             throw std::invalid_argument("MPCController: weights must be >= 0");
@@ -178,18 +179,23 @@ dm::LossSpec MPCController::makeLossSpec() const {
 }
 
 // ----------------------------------------------------------------------------
-// 目标函数：内层解析 loss/梯度 + 外层 L2 惩罚
+// 目标函数：内层解析 loss/梯度 + 外层 L2 惩罚（大小 yaw 各自一套权重）
 //
-//   F(Δx) = L_inner(τ(x)) + w_x·mean(x²) + w_dx·mean(Δx²)
+//   F(Δx) = L_inner(τ(x)) + w_x_b ·mean_b(x²)  + w_x_s ·mean_s(x²)
+//                         + w_dx_b·mean_b(Δx²) + w_dx_s·mean_s(Δx²)
 //
-// 梯度（链式）：
-//   ∂F/∂x_i    = ∂L_inner/∂τ_i · τ_max·(1 - tanh²(x_i)) + 2·w_x/(2N)·x_i
-//   ∂F/∂Δx_c[k] = Σ_{j≥k} ∂F/∂x_c[j] + 2·w_dx/(2N)·Δx_c[k]
+// mean_c(·) = (1/N)·Σ_{k=0..N-1}(·_c[k])（c = b/s）：每个权重就是**对应通道**的
+// N 步均方值权重，两通道互不影响（内层 loss 仍沿用 dm 的 0.5·inv_k 口径）。
+//
+// 梯度（链式，inv_n = 1/N，c 为 i 所属通道）：
+//   ∂F/∂x_c[k]   = ∂L_inner/∂τ_c[k] · τ_max_c·(1 - tanh²(x_c[k]))
+//                  + 2·w_x_c ·inv_n·x_c[k]
+//   ∂F/∂Δx_c[k]  = Σ_{j≥k} ∂F/∂x_c[j] + 2·w_dx_c·inv_n·Δx_c[k]
 // （x_c[k] 对 Δx_c[j] 的导数在 j ≤ k 时为 1，故外层是对 Δx 的反向累加）
 // ----------------------------------------------------------------------------
 double MPCController::evaluate(const double* delta, double* gradient) const {
     const int m = numParameters();
-    const double inv_m = 1.0 / static_cast<double>(m);
+    const double inv_n = 1.0 / static_cast<double>(opt_.N);
 
     buildTorque(delta, x_scratch_.data(), tau_scratch_.data());
 
@@ -201,30 +207,41 @@ double MPCController::evaluate(const double* delta, double* gradient) const {
         static_cast<std::size_t>(opt_.N), tau_scratch_.data(), spec, x0_, ws_,
         (gradient != nullptr) ? grad_tau_.data() : nullptr, nullptr, false);
 
-    // ---- 外层 L2 惩罚 ----
-    double sum_x2 = 0.0;
-    double sum_d2 = 0.0;
-    for (int i = 0; i < m; ++i) {
-        sum_x2 += x_scratch_[i] * x_scratch_[i];
-        sum_d2 += delta[i] * delta[i];
+    // ---- 外层 L2 惩罚（两通道分别累加，权重也分别取）----
+    double sum_x2_b = 0.0;
+    double sum_x2_s = 0.0;
+    double sum_d2_b = 0.0;
+    double sum_d2_s = 0.0;
+    for (int k = 0; k < opt_.N; ++k) {
+        const double xb = x_scratch_[2 * k + 0];
+        const double xs = x_scratch_[2 * k + 1];
+        const double db = delta[2 * k + 0];
+        const double ds = delta[2 * k + 1];
+        sum_x2_b += xb * xb;
+        sum_x2_s += xs * xs;
+        sum_d2_b += db * db;
+        sum_d2_s += ds * ds;
     }
-    loss += opt_.w_x * inv_m * sum_x2 + opt_.w_dx * inv_m * sum_d2;
+    loss += inv_n * (opt_.w_x_b * sum_x2_b + opt_.w_x_s * sum_x2_s +
+                     opt_.w_dx_b * sum_d2_b + opt_.w_dx_s * sum_d2_s);
 
     // ---- 解析梯度 ----
     if (gradient != nullptr) {
         for (int i = 0; i < m; ++i) {
-            const double limit = (i % 2 == 0) ? opt_.max_torque_b : opt_.max_torque_s;
+            const bool big = (i % 2 == 0);
+            const double limit = big ? opt_.max_torque_b : opt_.max_torque_s;
+            const double wx = big ? opt_.w_x_b : opt_.w_x_s;
             const double th = std::tanh(x_scratch_[i]);
             grad_x_[i] = grad_tau_[i] * limit * (1.0 - th * th) +
-                         opt_.w_x * 2.0 * inv_m * x_scratch_[i];
+                         wx * 2.0 * inv_n * x_scratch_[i];
         }
         double acc_b = 0.0;
         double acc_s = 0.0;
         for (int k = opt_.N - 1; k >= 0; --k) {
             acc_b += grad_x_[2 * k + 0];
             acc_s += grad_x_[2 * k + 1];
-            gradient[2 * k + 0] = acc_b + opt_.w_dx * 2.0 * inv_m * delta[2 * k + 0];
-            gradient[2 * k + 1] = acc_s + opt_.w_dx * 2.0 * inv_m * delta[2 * k + 1];
+            gradient[2 * k + 0] = acc_b + opt_.w_dx_b * 2.0 * inv_n * delta[2 * k + 0];
+            gradient[2 * k + 1] = acc_s + opt_.w_dx_s * 2.0 * inv_n * delta[2 * k + 1];
         }
     }
     return loss;

@@ -17,14 +17,17 @@
 //      再经 tanh 重参数化做**软限幅**：
 //          τ_c[k] = max_torque_c · tanh(x_c[k])      ⇒ |τ_c| < max_torque_c
 //
-//   3) 总 loss = 内层 loss + 外层两个 L2 惩罚（均方值 × 权重）：
-//          F(Δx) = L_inner(τ)                  // dm::LossSpec 的六项均值形式
-//                + w_x  · mean_i( x_i²  )      // 预 tanh 值均方
-//                + w_dx · mean_i( Δx_i² )      // 相邻两步差值（增量）均方
-//      两个 mean 均除以元素个数 2N（1/(2N)·Σ）。
+//   3) 总 loss = 内层 loss + 外层 L2 惩罚（大 / 小 yaw **各自一套权重**）：
+//          F(Δx) = L_inner(τ)                     // dm::LossSpec 的六项均值形式
+//                + w_x_b  · mean_k( x_b[k]² )     // 大 yaw 预 tanh 值均方
+//                + w_x_s  · mean_k( x_s[k]² )     // 小 yaw 预 tanh 值均方
+//                + w_dx_b · mean_k( Δx_b[k]² )    // 大 yaw 增量（相邻两步差值）均方
+//                + w_dx_s · mean_k( Δx_s[k]² )    // 小 yaw 增量均方
+//      每个 mean_k(·) 都是**该通道自己的** N 步时间均值：mean_k(·) = (1/N)·Σ_{k=0..N-1}(·)。
+//      即每个权重只管一个通道、按该通道的步数 N 归一，两通道互不影响。
 //
 //   4) 变化率**不再做范围限制**（参考工程里 max_torque_rate 的参数硬边界已去掉），
-//      限速完全由 w_dx 的 L2 惩罚 + tanh 软限幅实现；也没有任何参数上下界。
+//      限速完全由 w_dx_b / w_dx_s 的 L2 惩罚 + tanh 软限幅实现；也没有任何参数上下界。
 //
 // 内层 loss 的参考量沿用 dm::LossSpec 语义（世界系绝对量）：
 //   psi_b = theta_c + theta_b,  psi_s = theta_c + theta_b + theta_s
@@ -79,13 +82,15 @@ public:
         double w_tau_b = 0.0;    ///< 大 yaw 力矩幅值
         double w_tau_s = 0.0;    ///< 小 yaw 力矩幅值
 
-        // ---- 外层 L2 惩罚权重（作用在预 tanh 量上）----
-        // 注意：w_x 建议**必须 > 0**。tanh 在饱和区 dτ/dx = τ_max·(1-tanh²x) 指数趋零，
-        // 若完全不惩罚 x，x 会漂到饱和区（|x| ≳ 30）使解析梯度数值上变成 0，梯度法
-        // 将无法退出饱和（Ceres 会以 0 次迭代直接返回）。w_x·mean(x²) 正是把 x 约束在
-        // tanh 线性区、保住梯度的机制；w_dx 只惩罚增量，无法约束 x 的常数漂移。
-        double w_x = 0.0;        ///< mean(x²)，x 为预 tanh 力矩（建议 > 0，见上）
-        double w_dx = 0.0;       ///< mean(Δx²)，Δx 为预 tanh 力矩的相邻两步差值
+        // ---- 外层 L2 惩罚权重（作用在预 tanh 量上，大小 yaw 各一份）----
+        // 注意：w_x_b / w_x_s 建议**必须 > 0**。tanh 在饱和区 dτ/dx = τ_max·(1-tanh²x)
+        // 指数趋零，若完全不惩罚 x，x 会漂到饱和区（|x| ≳ 30）使解析梯度数值上变成 0，
+        // 梯度法将无法退出饱和（Ceres 会以 0 次迭代直接返回）。w_x_*·mean(x²) 正是把 x
+        // 约束在 tanh 线性区、保住梯度的机制；w_dx_* 只惩罚增量，无法约束 x 的常数漂移。
+        double w_x_b = 0.0;      ///< 大 yaw mean(x_b²)，x 为预 tanh 力矩（建议 > 0，见上）
+        double w_x_s = 0.0;      ///< 小 yaw mean(x_s²)，同上
+        double w_dx_b = 0.0;     ///< 大 yaw mean(Δx_b²)，Δx 为预 tanh 力矩的相邻两步差值
+        double w_dx_s = 0.0;     ///< 小 yaw mean(Δx_s²)，同上
 
         int max_iter = 50;       ///< Ceres LBFGS 最大迭代次数
 
