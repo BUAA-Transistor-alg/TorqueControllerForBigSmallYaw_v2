@@ -84,9 +84,18 @@ class SimEnv:
                  sigma_tau: float = cfg.SIGMA_TAU,
                  dt: float = cfg.DT,
                  refinement: int = cfg.REFINEMENT,
-                 seed: int | None = None):
+                 seed: int | None = None,
+                 params_override: dict | None = None):
         # ---- 动力学参数直接从配置文件读取（调用方不接触真实参数）----
-        d = cfg.DEFAULT_PARAMS
+        # params_override 只用于"换一套真值造数据"（例如改 kb/ks 后重新采集），
+        # 键必须已存在于 DEFAULT_PARAMS，避免拼错时静默生效。
+        d = dict(cfg.DEFAULT_PARAMS)
+        if params_override:
+            bad = set(params_override) - set(d)
+            if bad:
+                raise ValueError(f"SimEnv: 未知的参数覆盖 {sorted(bad)}；"
+                                 f"可选 {sorted(d)}")
+            d.update({k: float(v) for k, v in params_override.items()})
         rng = np.random.default_rng(seed)
         gx, gy, alpha = sample_gravity(rng, zero=zero_gravity)
         self._gravity = (float(gx), float(gy))
@@ -129,10 +138,14 @@ class SimEnv:
         """
         ab, as_ = float(Tb), float(Ts)
         if self._noise:
-            st_ = self._sigma[2]
-            ab = float(np.clip(ab + self._nrng.normal(0.0, st_),
+            # σ_tau 的口径是**物理力矩** [N·m]（见 sim_config 的 SIGMA_TAU 注释："直接加到
+            # 实际施加上"）。而物理力矩 = kb/ks × 指令值，所以命令侧要**除以 k**，
+            # 否则 kb=4 时实际力矩噪声会被放大成 0.02 N·m（比摩擦还大），
+            # 让轨迹在 3 s 内发散、辨识退化成拟合噪声。
+            sp, sv, s_tau = self._sigma
+            ab = float(np.clip(ab + self._nrng.normal(0.0, s_tau / max(abs(self._params.kb), 1e-12)),
                                -cfg.TAU_B_MAX, cfg.TAU_B_MAX))
-            as_ = float(np.clip(as_ + self._nrng.normal(0.0, st_),
+            as_ = float(np.clip(as_ + self._nrng.normal(0.0, s_tau / max(abs(self._params.ks), 1e-12)),
                                 -cfg.TAU_S_MAX, cfg.TAU_S_MAX))
         return self._measured(self._sim.step(ab, as_, 0.0, 0.0, 0.0))
 

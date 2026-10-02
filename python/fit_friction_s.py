@@ -147,7 +147,9 @@ def main() -> int:
         fsc, fsv, info = ip.fit_friction_sweep_s(
             sweep_path, p_dyn, dyn_correct=args.dyn_correct,
             drop_first=args.drop_first, drop_last=args.drop_last,
-            vmin=args.vmin, vmax=args.vmax, verbose=True)
+            vmin=args.vmin, vmax=args.vmax, verbose=True,
+            # 数据里的 ts_mean 是指令值：用与 p_dyn 同标度的 ks 换算成物理力矩
+            ks=(float(p_dyn["ks"]) if p_dyn is not None else 1.0))
     except ValueError as e:
         print(f"拟合失败：{e}")
         return 1

@@ -269,3 +269,31 @@ def category_dir(name: str) -> Path:
     ``--category friction_simA`` → ``data/friction_simA``。
     """
     return REPO / "data" / name
+
+
+def parse_param_override(spec: str) -> dict:
+    """解析 ``--set-params`` 的 "名字=值,..." 覆盖表，用于造数据时临时改真值参数。
+
+    只允许覆盖 ``DEFAULT_PARAMS`` 里已有的键（拼错会立刻报错，而不是静默忽略）；
+    空串返回空 dict。典型用法（换一套力矩通道增益造数据）::
+
+        --set-params "kb=4.0,ks=0.5"
+
+    ★ 采集脚本只负责把覆盖表交给 SimEnv；真实硬件（RealEnv）路径下该参数无效。
+    """
+    out: dict[str, float] = {}
+    for part in (spec or "").replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise SystemExit(f"--set-params 的 {part!r} 缺少 '='；应为 名字=值")
+        name, val_s = (s.strip() for s in part.split("=", 1))
+        if name not in DEFAULT_PARAMS:
+            raise SystemExit(f"--set-params 里的 {name!r} 不是可覆盖参数；"
+                             f"可选: {', '.join(sorted(DEFAULT_PARAMS))}")
+        try:
+            out[name] = float(val_s)
+        except ValueError:
+            raise SystemExit(f"--set-params 里 {name} 的值 {val_s!r} 不是数") from None
+    return out

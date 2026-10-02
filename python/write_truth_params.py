@@ -26,7 +26,14 @@ def main() -> int:
                     help="输出目录（优先于 --category）；缺省时按 --category 或 data/sim")
     ap.add_argument("--category", type=str, default=None,
                     help="类别名（= 目录名）：写到 data/<类别>/truth_params.txt")
+    ap.add_argument("--set-params", type=str, default="",
+                    help='把真值里的某些参数替换掉（只允许 DEFAULT_PARAMS 里已有的键），'
+                         '形如 "kb=4.0,ks=0.5"。★ 必须与造数据时用的值一致')
     args = ap.parse_args()
+
+    ov = cfg.parse_param_override(args.set_params)
+    truth = dict(cfg.DEFAULT_PARAMS)
+    truth.update(ov)
 
     out_dir = (Path(args.out) if args.out
                else (cfg.category_dir(args.category) if args.category else cfg.DATA_DIR_SIM))
@@ -39,9 +46,11 @@ def main() -> int:
         f.write(f"# noise_sigma: pos={cfg.SIGMA_POS} vel={cfg.SIGMA_VEL} tau={cfg.SIGMA_TAU}\n")
         f.write(f"# weights: {cfg.W_PSI_B} {cfg.W_PSI_S} {cfg.W_DPSI_B} {cfg.W_DPSI_S}\n")
         for n in cfg.PARAM_NAMES:
-            f.write(f"{n} {cfg.DEFAULT_PARAMS[n]:.10g}\n")
+            f.write(f"{n} {truth[n]:.10g}\n")
         f.write(f"lambda_ {cfg.LAMBDA:.10g}\n")
     print(f"真实参数 -> {path}")
+    if ov:
+        print("  覆盖: " + "，".join(f"{k}={v:g}" for k, v in sorted(ov.items())))
     return 0
 
 

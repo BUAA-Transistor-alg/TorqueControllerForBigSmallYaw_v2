@@ -210,19 +210,27 @@ def compute_algebraic_init(files, known, fric_big, fric_small, use_sweeps=True,
     cases = [Case(f) for f in files]
     raw_g = [(c.gx, c.gy) for c in cases]
     info = {"n_files": len(cases), "friction": None}
+    # kb/ks 是**力矩通道增益**（物理力矩 = k × 下发的指令值），属于模型的一部分。
+    # 这里把 gains/known 指定的 k 交给 algebraic_init，由它按 k 缩放两行回归；
+    # 解出的参数与这两个 k 处在同一标度，因此不能事后再覆盖 k（否则差一个倍数）。
+    known_k = dict(known)
+    for g in ("kb", "ks"):
+        known_k.setdefault(g, gains[g])
     try:
         # g=0：等价 --ignore-gravity（此时必须给 Dx/Dy 才能分离 Dx/Dy/Psx/Psy）
         for c in cases:
             c.gx = 0.0
             c.gy = 0.0
         # ---- 先解一次动力学（带 0 摩擦），用来给摩擦扫频扣 G1/G2 ----
-        p_dyn, _ = algebraic_init(cases, friction=(0.0, 0.0, 0.0, 0.0), known=known)
-        for g in ("kb", "ks"):          # 摩擦扫频只用物理量，但补齐保证 Params 完整
-            p_dyn[g] = float(known.get(g, gains[g]))
+        p_dyn, ainfo_dyn = algebraic_init(cases, friction=(0.0, 0.0, 0.0, 0.0),
+                                          known=known_k)
+        log(f"[init] 力矩通道增益: kb={p_dyn['kb']:.6g} [{ainfo_dyn['kb_source']}]  "
+            f"ks={p_dyn['ks']:.6g} [{ainfo_dyn['ks_source']}]")
 
         friction = None
         if use_sweeps and fric_big is not None and Path(fric_big).exists():
-            fbc, fbv, ib = fit_friction_sweep(fric_big, p_dyn, ignore_gravity=True)
+            fbc, fbv, ib = fit_friction_sweep(fric_big, p_dyn, ignore_gravity=True,
+                                              kb=float(p_dyn["kb"]))
             fsc, fsv = 0.5 * fbc, 0.5 * fbv        # 缺省回退：小 yaw 取大 yaw 的一半
             info["friction"] = dict(fbc=fbc, fbv=fbv, info_big=ib, small=None)
             log(f"[init] 大 yaw 摩擦（{ib['files']} 个 sweep，{ib['n']} 个速度点，"
@@ -230,7 +238,8 @@ def compute_algebraic_init(files, known, fric_big, fric_small, use_sweeps=True,
             if fric_small is not None and Path(fric_small).exists():
                 try:
                     fsc, fsv, ism = fit_friction_sweep_s(
-                        fric_small, p_dyn, verbose=False, ignore_gravity=True)
+                        fric_small, p_dyn, verbose=False, ignore_gravity=True,
+                        ks=float(p_dyn["ks"]))
                 except Exception as exc:
                     log(f"[warn] 小 yaw 摩擦拟合失败，改用大 yaw 的一半: {exc}")
                 else:
@@ -241,11 +250,8 @@ def compute_algebraic_init(files, known, fric_big, fric_small, use_sweeps=True,
         elif use_sweeps:
             log(f"[warn] 未找到摩擦扫频目录 {fric_big}，摩擦改用主回归结果")
 
-        p_init, ainfo = algebraic_init(cases, friction=friction, known=known)
-        # kb/ks 不进闭式回归：known 优先，否则用 --torque-gain 的初值。
-        # 必须补上，否则 sanitize_params 按 PARAM_NAMES(16) 取值会 KeyError。
-        for g in ("kb", "ks"):
-            p_init[g] = float(known.get(g, gains[g]))
+        p_init, ainfo = algebraic_init(cases, friction=friction, known=known_k)
+        # kb/ks 已由 algebraic_init 采用（known_k 里的值），参数与它们同标度，不再覆盖。
         p_init = sanitize_params(p_init, log=log)
         info["mb"] = ainfo["mb"]
         info["ms"] = ainfo["ms"]

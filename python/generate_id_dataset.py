@@ -227,6 +227,30 @@ def main() -> int:
                     help="类别名（= 目录名）：输出到 data/<类别>/；"
                          "例如 --category simA -> data/simA")
     ap.add_argument("--seed", type=int, default=cfg.DEFAULT_SEED)
+    ap.add_argument("--set-params", type=str, default="",
+                    help='[仿真] 临时覆盖真值参数（只允许 DEFAULT_PARAMS 里已有的键），'
+                         '形如 "kb=4.0,ks=0.5"。用于换一套力矩通道增益重新造数据；'
+                         '真值文件请用同样的 --set-params 跑 write_truth_params.py。'
+                         '[--real] 无效')
+    ap.add_argument("--no-gain-compensate", dest="gain_compensate",
+                    action="store_false", default=True,
+                    help="关掉「控制增益按 1/k 换算」。默认开启：kb/ks≠1 时把 "
+                         "KP_*/KD_*/REPOS_* 除以对应通道增益，保持物理环路增益不变"
+                         "（不换算会让闭环滑到饱和、轨迹对噪声极敏感）")
+    ap.add_argument("--ts-ref-deg", type=float, default=None,
+                    help=f"小 yaw 激励幅值 [°]（缺省 cfg.TS_REF_DEG={cfg.TS_REF_DEG}）。"
+                         "★ 通道增益 k 会改变可用物理力矩（τ_max = k·1.0）："
+                         "ks 小的时候必须调小参考，否则小 yaw 环路长期饱和、"
+                         "轨迹对噪声极度敏感，辨识会退化成拟合噪声")
+    ap.add_argument("--ts-freq-hi", type=float, default=None,
+                    help=f"小 yaw 激励频带上限 [Hz]（缺省 cfg.TS_FREQ_HI={cfg.TS_FREQ_HI}）。"
+                         "所需力矩 ∝ A·(2πf)²，ks 小时要一起降下来")
+    ap.add_argument("--tb-ref-rad", type=float, default=None,
+                    help=f"大 yaw 激励幅值 [rad]（缺省 cfg.TB_REF_RAD={cfg.TB_REF_RAD}）")
+    ap.add_argument("--alpha-max-deg", type=float, default=None,
+                    help=f"[仿真] 随机倾角上界 [°]（缺省 cfg.RAMP_MAX_DEG={cfg.RAMP_MAX_DEG}）。"
+                         "★ 平面内重力矩 G2 ∝ |g|，ks 小时高倾角会把小 yaw 的力矩预算吃光"
+                         "（长时间贴在 ±1 限幅上），轨迹对噪声极敏感")
     ap.add_argument("--start-index", type=int, default=0,
                     help="本会话第一条的编号（多次运行拼接数据集时用）")
     ap.add_argument("--zero-gravity", action="store_true",
@@ -273,6 +297,42 @@ def main() -> int:
                     help="[--real] 非 --hold-pitch 时下发的固定 pitch 目标角 [°]（默认 0）")
     args = ap.parse_args()
 
+    override = cfg.parse_param_override(args.set_params)
+    if override and args.real:
+        print("[警告] --real 下 --set-params 无效（真机参数不可注入），已忽略")
+        override = {}
+    # ---- 控制增益按通道增益换算 ----
+    # 控制器输出的是**指令值**，物理力矩 = k × 指令值 ⇒ 物理环路增益 ∝ k。
+    # cfg 里 KP_*/KD_*/REPOS_* 是按 k=1 整定的，kb/ks≠1 时必须除以 k，
+    # 否则 kb=4 时大 yaw 位置环物理刚度 ×4、ks=0.5 时小 yaw 力矩权限减半，
+    # 闭环会滑到饱和/临界，采集到的轨迹对噪声极度敏感（实测真值 loss 均值从 5e-2
+    # 恶化到 1.3、最大 29，辨识退化成拟合噪声）。加 --no-gain-compensate 可关掉。
+    kb_eff = float(override.get("kb", cfg.DEFAULT_PARAMS.get("kb", 1.0)))
+    ks_eff = float(override.get("ks", cfg.DEFAULT_PARAMS.get("ks", 1.0)))
+    if args.gain_compensate and not args.real:
+        for n, f in (("KP_B", kb_eff), ("KD_B", kb_eff),
+                     ("REPOS_KP_B", kb_eff), ("REPOS_KI_B", kb_eff),
+                     ("REPOS_KD_B", kb_eff),
+                     ("KP_S", ks_eff), ("KD_S", ks_eff),
+                     ("REPOS_KP_S", ks_eff), ("REPOS_KI_S", ks_eff),
+                     ("REPOS_KD_S", ks_eff)):
+            setattr(cfg, n, getattr(cfg, n) / max(abs(f), 1e-9))
+    if override:
+        print(f"控制增益（kb={kb_eff:g}, ks={ks_eff:g}"
+              f"{'，已按 1/k 换算' if (args.gain_compensate and not args.real) else '，未换算'}）: "
+              f"KP_B={cfg.KP_B:g} KD_B={cfg.KD_B:g} KP_S={cfg.KP_S:g} KD_S={cfg.KD_S:g}")
+    # 激励参考可单独调（ks 小 ⇒ 可用力矩小 ⇒ 必须调小参考，否则环路饱和）
+    if args.ts_ref_deg is not None:
+        cfg.TS_REF_DEG = float(args.ts_ref_deg)
+    if args.ts_freq_hi is not None:
+        cfg.TS_FREQ_HI = float(args.ts_freq_hi)
+    if args.tb_ref_rad is not None:
+        cfg.TB_REF_RAD = float(args.tb_ref_rad)
+    if args.alpha_max_deg is not None:
+        cfg.RAMP_MAX_DEG = float(args.alpha_max_deg)
+    print(f"激励参考: 大 yaw ±{cfg.TB_REF_RAD:g} rad ({cfg.TB_FREQ_LO}~{cfg.TB_FREQ_HI} Hz), "
+          f"小 yaw ±{cfg.TS_REF_DEG:g}° ({cfg.TS_FREQ_LO}~{cfg.TS_FREQ_HI} Hz)")
+
     if args.out is not None:
         out_dir = Path(args.out)
     elif args.category:
@@ -287,6 +347,9 @@ def main() -> int:
           f"起始编号: {args.start_index}   数据源: {'真实硬件' if args.real else '仿真'}")
     print(f"采样: dt={cfg.DT}s ({1/cfg.DT:.0f}Hz)  K={cfg.NUM_STEPS}  "
           f"refinement={cfg.REFINEMENT}（回放用）")
+    if override:
+        print("真值参数覆盖（--set-params）: "
+              + "，".join(f"{k}={v:g}" for k, v in sorted(override.items())))
     print(f"约束: θ_s 目标 ≤{cfg.THETA_S_TARGET_DEG:.0f}° / 硬限 "
           f"{cfg.THETA_S_LIMIT_DEG:.0f}°；速度 ±{cfg.V_MAX_B:.1f}/±{cfg.V_MAX_S:.1f} rad/s")
     if not args.real:
@@ -309,7 +372,8 @@ def main() -> int:
     else:
         env = SimEnv(zero_gravity=args.zero_gravity, noise=args.noise,
                      sigma_pos=args.sigma_pos, sigma_vel=args.sigma_vel,
-                     sigma_tau=args.sigma_tau, seed=args.gravity_seed)
+                     sigma_tau=args.sigma_tau, seed=args.gravity_seed,
+                     params_override=override)
     gx, gy = env.gravity
     alpha = env.gravity_alpha_deg
     print(f"等效重力（{'反解得到' if args.real else '环境构造时随机确定'}，不可设置）: "

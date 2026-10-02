@@ -29,9 +29,16 @@
 ★ 自由度：kb 与 ks 的**公共尺度**与物理参数的标度严格不可辨识（同乘 λ、惯量/质心
   同除 λ 得到逐点相同的轨迹）。固定其中一个即可消除自由度，本脚本两种都支持：
 
-    --known-params "kb=4.0"          # 固定 kb（已实测），辨识 ks
-    --known-params "ks=1.0"          # 固定 ks，辨识 kb
+    --known-params "kb=4.0"          # 固定 kb（已实测），由闭式解标定 ks
+    --known-params "ks=1.0"          # 固定 ks，由闭式解标定 kb
+    （两个都不给）                    # 约定 kb=1，由闭式解标定 ks
     --freeze-params "kb:3000"        # 先冻 kb 3000 步再放开
+
+  ★ 关键点（旧版的 bug）：闭式最小二乘里 kb/ks **不是**可以随手"补上"的常数——
+    整组参数（惯量/重力/摩擦/k）可以同乘一个常数而轨迹不变，所以解出的参数与
+    所用的 k 必须处在同一标度。现在 algebraic_init 直接按"物理力矩 = k × 指令值"
+    组装回归（一个 k 已知就用它、另一个用增广最小二乘标定、都不知就约定 kb=1），
+    标定出的 k **原样**喂给正向模型和摩擦扫频拟合，不再被 DEFAULT_PARAMS 覆盖。
 
   --known-params 只在**初始最小二乘阶段**指定值；后续优化是否冻结由 --freeze-params
   单独决定（不给则沿用旧行为=全程冻结；写 "kb:0" 就是只当初值、训练中放开）。
@@ -837,6 +844,22 @@ def algebraic_init(cases: list[Case], nominal=(1.0, 1.0),
                    ) -> tuple[dict, dict]:
     """在测量数据上做闭式最小二乘，解出可辨识组合，再回代成物理参数。
 
+    力矩通道增益 kb / ks（物理力矩 = k × 下发的指令值）
+    --------------------------------------------------
+    数据里存的是**指令值** Tb/Ts，而运动方程用的是物理力矩 kb·Tb / ks·Ts，所以回归
+    两行的右端要按 k 缩放。又因为整组参数（惯量、重力、摩擦、k）可以整体同乘一个
+    常数而不改变轨迹（标度退化，见文件头说明），必须**至少固定一个 k** 才能把参数的
+    绝对标度钉住：
+
+      * kb、ks 都已知 —— 两行都按已知值缩放，解 12 个可辨识组合；
+      * 只知 kb       —— 增广最小二乘同时解 (12 个组合, ks)，ks 由数据标定；
+      * 只知 ks       —— 增广最小二乘同时解 (12 个组合, kb)，kb 由数据标定；
+      * 都不知道      —— **约定 kb = 1**（只是选一个标度），再标定 ks。
+
+    标定出的 k 与解出的参数处在**同一标度**：既能直接给正向模型用，也能原样传给
+    摩擦扫频拟合（``kb=best["kb"]`` / ``ks=best["ks"]``，见 fit_friction_sweep*）。
+    返回的 ``info`` 里带 ``kb_source``/``ks_source``（known / calibrated / assumed）。
+
     friction 若给出 (fbc, fbv, fsc, fsv) 则**直接采用**（来自匀速旋转实验），
     否则用回归自己的结果。注意 (mb, ms) 的可行性判据只看 Ib/Is，与摩擦无关——
     因此摩擦解坏掉也不会像以前那样让整个初始化抛异常。
@@ -845,45 +868,98 @@ def algebraic_init(cases: list[Case], nominal=(1.0, 1.0),
       * ``Dx``/``Dy``：把 A+B = Dx·P + Dy·Q2、C−D = Dy·P − Dx·Q2 折进 P、Q2 两列，
         设计矩阵 12 列 → 10 列（这是固定精确机械尺寸时唯一正确的降维方式）；
       * ``fbc``..``fsv``：该列搬到右端并丢掉，其余组合由"扣除已知摩擦后的力矩"估计；
-      * ``mb``/``ms``：跳过对应方向的网格搜索，直接用给定值（2 个都给 = 平坦谷消失）。
-    known 里的摩擦优先于 ``friction`` 参数。
+      * ``mb``/``ms``：跳过对应方向的网格搜索，直接用给定值（2 个都给 = 平坦谷消失）；
+      * ``kb``/``ks``：力矩通道增益，见上。
+    已知摩擦（``known`` 优先于 ``friction``）同样折到右端，不再当作自由未知数。
     """
     known = dict(known or {})
     unknown = [n for n in known if n not in KNOWN_OK]
     if unknown:
         raise ValueError(f"algebraic_init 收到不支持的已知参数: {', '.join(unknown)}")
 
+    # ---- 力矩通道增益：决定哪一行按哪个 k 缩放，以及谁需要被标定 ----
+    kb_known = known.get("kb")
+    ks_known = known.get("ks")
+    if kb_known is None and ks_known is None:
+        kb_known = 1.0                      # 约定：都不给就把 kb 当 1（只为定标度）
+    unknown_kb = kb_known is None
+    unknown_ks = ks_known is None
+    kb_used = 1.0 if kb_known is None else float(kb_known)
+
     R = np.vstack([_regression_block(c)[0] for c in cases])
     y = np.concatenate([_regression_block(c)[1] for c in cases])
+    # _regression_block 的 2K 行是 (b, s) 交替：偶数行 = 关节 b，奇数行 = 关节 s
+    Rb, Rs = R[0::2], R[1::2]
+    Tb_cmd, Ts_cmd = y[0::2], y[1::2]       # 都是"下发给电控的指令值"
 
     keep = np.ones(R.shape[1], dtype=bool)
     if "Dx" in known:
         # A+B 与 C−D 都是 P=ms·Psx、Q2=ms·Psy 的已知系数线性组合：折进去并丢掉这两列
-        R[:, 4] = R[:, 4] + known["Dx"] * R[:, 2] + known["Dy"] * R[:, 3]
-        R[:, 5] = R[:, 5] + known["Dy"] * R[:, 2] - known["Dx"] * R[:, 3]
+        for M in (Rb, Rs):
+            M[:, 4] = M[:, 4] + known["Dx"] * M[:, 2] + known["Dy"] * M[:, 3]
+            M[:, 5] = M[:, 5] + known["Dy"] * M[:, 2] - known["Dx"] * M[:, 3]
         keep[2] = keep[3] = False
-    for j, n in ((8, "fbc"), (9, "fbv"), (10, "fsc"), (11, "fsv")):
+
+    # ---- 摩擦：known 优先于 sweep 给出的 friction；两者都搬到右端并丢掉该列 ----
+    eff_fric: dict[str, float] = {}
+    for n in ("fbc", "fbv", "fsc", "fsv"):
         if n in known:
-            y = y - R[:, j] * known[n]      # 已知摩擦搬到右端
+            eff_fric[n] = float(known[n])
+    if friction is not None:
+        for i, n in enumerate(("fbc", "fbv", "fsc", "fsv")):
+            eff_fric.setdefault(n, float(friction[i]))
+    fold_b = np.zeros_like(Tb_cmd)
+    fold_s = np.zeros_like(Ts_cmd)
+    for j, n in ((8, "fbc"), (9, "fbv"), (10, "fsc"), (11, "fsv")):
+        if n in eff_fric:
+            fold_b = fold_b + Rb[:, j] * eff_fric[n]
+            fold_s = fold_s + Rs[:, j] * eff_fric[n]
             keep[j] = False
 
+    # ---- 组装（可能含未知 k 的）增广线性系统并求解 ----
+    #   b 行：Rb·x = kb·Tb − (已知摩擦折项)
+    #   s 行：Rs·x = ks·Ts − (已知摩擦折项)
+    Rb_k, Rs_k = Rb[:, keep], Rs[:, keep]
+    nk = int(keep.sum())
+    if unknown_ks:
+        # 未知 (x, ks)：Rs·x − Ts·ks = −fold_s
+        A = np.vstack([np.hstack([Rb_k, np.zeros((Rb_k.shape[0], 1))]),
+                       np.hstack([Rs_k, -Ts_cmd[:, None]])])
+        rhs = np.concatenate([kb_used * Tb_cmd - fold_b, -fold_s])
+    elif unknown_kb:
+        # 未知 (x, kb)：Rb·x − Tb·kb = −fold_b
+        A = np.vstack([np.hstack([Rb_k, -Tb_cmd[:, None]]),
+                       np.hstack([Rs_k, np.zeros((Rs_k.shape[0], 1))])])
+        rhs = np.concatenate([-fold_b, float(ks_known) * Ts_cmd - fold_s])
+    else:
+        A = np.vstack([Rb_k, Rs_k])
+        rhs = np.concatenate([kb_used * Tb_cmd - fold_b,
+                              float(ks_known) * Ts_cmd - fold_s])
+    sol, *_ = np.linalg.lstsq(A, rhs, rcond=None)
+
     xs = np.zeros(R.shape[1])
-    xs[keep], *_ = np.linalg.lstsq(R[:, keep], y, rcond=None)
+    xs[keep] = sol[:nk]
+    if unknown_ks:
+        ks_used = float(sol[nk])
+    elif unknown_kb:
+        kb_used = float(sol[nk])
+        ks_used = float(ks_known)
+    else:
+        ks_used = float(ks_known)
+    if not (kb_used > 0.0 and ks_used > 0.0):
+        print(f"[警告] 标定出的力矩通道增益非正（kb={kb_used:.4g}, ks={ks_used:.4g}）；"
+              f"已夹到 1e-3，请检查数据与 --known-params")
+        kb_used = kb_used if kb_used > 0.0 else 1e-3
+        ks_used = ks_used if ks_used > 0.0 else 1e-3
     for j, n in ((8, "fbc"), (9, "fbv"), (10, "fsc"), (11, "fsv")):
-        if n in known:                      # 折掉的那几列回填已知值，便于下面统一取用
-            xs[j] = known[n]
+        if n in eff_fric:                   # 折掉的列回填已知/扫频值，便于下面统一取用
+            xs[j] = eff_fric[n]
 
     I_BD, I_S = xs[0], xs[1]
     AB, CmD = xs[2], xs[3]
     P, Q2 = xs[4], xs[5]
     RU, SV = xs[6], xs[7]
-    if friction is None:
-        friction = (xs[8], xs[9], xs[10], xs[11])
-    else:
-        # known 优先于 sweep 给出的摩擦
-        friction = tuple(known.get(n, friction[i])
-                         for i, n in enumerate(("fbc", "fbv", "fsc", "fsv")))
-    fbc, fbv, fsc, fsv = friction
+    fbc, fbv, fsc, fsv = xs[8], xs[9], xs[10], xs[11]
     if "Dx" in known:
         Dx, Dy = known["Dx"], known["Dy"]       # 直接采用测量值，不再从 P/Q2 回解
     else:
@@ -898,14 +974,16 @@ def algebraic_init(cases: list[Case], nominal=(1.0, 1.0),
         Pby = (SV - ms * Dy) / mb
         return dict(mb=mb, Ib=I_B - mb * (Pbx ** 2 + Pby ** 2), Pbx=Pbx, Pby=Pby,
                     ms=ms, Is=I_S - (P * P + Q2 * Q2) / ms, Psx=P / ms, Psy=Q2 / ms,
-                    Dx=Dx, Dy=Dy, fbc=fbc, fbv=fbv, fsc=fsc, fsv=fsv)
+                    Dx=Dx, Dy=Dy, fbc=fbc, fbv=fbv, fsc=fsc, fsv=fsv,
+                    kb=kb_used, ks=ks_used)
 
     def feasible(p: dict) -> bool:
         # 可行性只看动力学参数；摩擦由独立实验给出，不参与这个判据
         v = np.array([p["mb"], p["Ib"], p["Pbx"], p["Pby"],
                       p["ms"], p["Is"], p["Psx"], p["Psy"], p["Dx"], p["Dy"]])
         return bool(np.isfinite(v).all() and p["mb"] > 0 and p["ms"] > 0
-                    and p["Ib"] > 1e-6 and p["Is"] > 1e-6)
+                    and p["Ib"] > 1e-6 and p["Is"] > 1e-6
+                    and p["kb"] > 0.0 and p["ks"] > 0.0)
 
     mb_grid = ([known["mb"]] if "mb" in known
                else np.geomspace(0.02, 100.0, 140))
@@ -929,7 +1007,11 @@ def algebraic_init(cases: list[Case], nominal=(1.0, 1.0),
 
     for n, v in known.items():                  # 已知量按给定值精确回填（免去往返误差）
         best[n] = float(v)
-    info = dict(mb=best["mb"], ms=best["ms"], combo_err=None, known=dict(known))
+    best["kb"], best["ks"] = kb_used, ks_used
+    kb_source = "known" if "kb" in known else ("calibrated" if unknown_kb else "assumed")
+    ks_source = "known" if "ks" in known else ("calibrated" if unknown_ks else "assumed")
+    info = dict(mb=best["mb"], ms=best["ms"], combo_err=None, known=dict(known),
+                kb=kb_used, ks=ks_used, kb_source=kb_source, ks_source=ks_source)
     return best, info
 
 
@@ -997,14 +1079,19 @@ def fit_friction_sweep_s(sweep_path, p_dyn: dict | None = None,
                          vmin: float | None = None, vmax: float | None = None,
                          verbose: bool = False,
                          list_only: bool = False,
-                         ignore_gravity: bool = False) -> tuple[float, float, dict]:
+                         ignore_gravity: bool = False,
+                         ks: float = 1.0) -> tuple[float, float, dict]:
     """用小 yaw（关节 s）匀速往返数据独立拟合 (fsc, fsv)。
 
     稳态关系（θ̈_b≈0、θ̈_s≈0、θ̇_b≈0、基座静止，见 gen_friction_sweep_s.py）：
-        Ts = G2(ψ_s) + fsv·θ̇_s + fsc·tanh(λ·θ̇_s)
+        ks·Ts = G2(ψ_s) + fsv·θ̇_s + fsc·tanh(λ·θ̇_s)
+
+    ★ ``ks`` 是力矩通道增益（物理力矩 = ks × 下发的指令值）。数据里的 ``ts_mean`` 是
+      **指令值**，右端必须先乘 ks 才是物理力矩；应传「与 p_dyn 同一标度」的那个 ks
+      （由 algebraic_init 标定，见那里的说明）。默认 1.0 = kb/ks 引入前的旧数据口径。
 
     数据里每个速度有正、反两趟，把它们配对做差：
-        ΔTs = fsv·Δθ̇_s + fsc·Δtanh(λθ̇_s) + [M22·Δθ̈_s + M12·Δθ̈_b + ΔC2 + ΔG2]
+        Δ(ks·Ts) = fsv·Δθ̇_s + fsc·Δtanh(λθ̇_s) + [M22·Δθ̈_s + M12·Δθ̈_b + ΔC2 + ΔG2]
     两趟扫过同一以 0 为中心**对称**的位置窗口 ⇒ **ΔG2 一阶精确抵消**（这是本方法
     的核心，也是它比"用辨识参数直接扣 G2"稳的原因：G2 常比摩擦大一个量级）。
 
@@ -1041,7 +1128,7 @@ def fit_friction_sweep_s(sweep_path, p_dyn: dict | None = None,
         """一对（正向若干趟 vs 反向若干趟）的差分量。"""
         d_om = mp(pp, "omega") - mp(pm, "omega")
         d_th = mp(pp, "tanh_omega") - mp(pm, "tanh_omega")
-        d_ts = mp(pp, "ts_mean") - mp(pm, "ts_mean")
+        d_ts = ks * (mp(pp, "ts_mean") - mp(pm, "ts_mean"))
         corr = 0.0
         if dyn_correct and p_dyn is not None:
             corr += _M22_of(p_dyn) * (mp(pp, "ddtheta_s_mean") - mp(pm, "ddtheta_s_mean"))
@@ -1123,9 +1210,9 @@ def fit_friction_sweep_s(sweep_path, p_dyn: dict | None = None,
             raise ValueError(
                 f"{sweep_path} 里没有 pair_id/direction 配对列，单趟拟合又需要已辨识参数")
         A = np.column_stack([np.asarray(d["omega"]), np.asarray(d["tanh_omega"])])
-        y = np.asarray(d["ts_mean"]) - np.array([_G2_of({k: float(np.asarray(v)[i])
-                                                         for k, v in d.items()}, p_dyn)
-                                                 for i in range(n)])
+        y = ks * np.asarray(d["ts_mean"]) - np.array([_G2_of({k: float(np.asarray(v)[i])
+                                                              for k, v in d.items()}, p_dyn)
+                                                      for i in range(n)])
         (fsv, fsc), *_ = np.linalg.lstsq(A, y, rcond=None)
         info = dict(n=n, pairs=0, files=len(sweep_files), names=sweep_files,
                     mode="single", fsc_raw=float(fsc), fsv_raw=float(fsv),
@@ -1231,11 +1318,17 @@ def _load_sweeps(path) -> tuple[dict, list[str]]:
 
 
 def fit_friction_sweep(sweep_path, p_dyn: dict,
-                       ignore_gravity: bool = False) -> tuple[float, float, dict]:
+                       ignore_gravity: bool = False,
+                       kb: float = 1.0) -> tuple[float, float, dict]:
     """用匀速旋转实验的稳态数据拟合关节 b 的两个摩擦系数。
 
     稳态关系（θ̈_b=θ̈_s=0、θ̇_s≈0、基座静止，见 gen_friction_sweep.py 的推导）：
-        Tb = G1(ψ_b) + fbv·ω + fbc·tanh(λ·ω)
+        kb·Tb = G1(ψ_b) + fbv·ω + fbc·tanh(λ·ω)
+
+    ★ ``kb`` 是力矩通道增益（物理力矩 = kb × 下发的指令值）。数据里的 ``tb_mean`` 是
+      **指令值**，必须先乘 kb 才是物理力矩；应传「与 p_dyn 同一标度」的那个 kb
+      （由 algebraic_init 标定，见那里的说明）。默认 1.0 = kb/ks 引入前的旧数据口径。
+
     用 p_dyn（已辨识的动力学参数）把 G1 精确减掉，剩下的就是 (ω, tanh(λω)) 的二维
     线性最小二乘——实测残差 ~3e-4 N·m、条件数 ~2，比主回归（cond 1e18）好十几个
     数量级，所以摩擦能真正解出来。
@@ -1263,7 +1356,7 @@ def fit_friction_sweep(sweep_path, p_dyn: dict,
     gs_cos = gx * Q2 - gy * P
     G1 = (gb_sin * d["mean_sin_psi_b"] + gb_cos * d["mean_cos_psi_b"]
           + gs_sin * d["mean_sin_psi_s"] + gs_cos * d["mean_cos_psi_s"])
-    yv = d["tb_mean"] - G1
+    yv = kb * d["tb_mean"] - G1
     A = np.column_stack([d["omega"], d["tanh_omega"]])
     (fbv, fbc), *_ = np.linalg.lstsq(A, yv, rcond=None)
     resid = yv - A @ np.array([fbv, fbc])
@@ -1516,6 +1609,8 @@ def main() -> int:
                          '例: --known-params "Dx=0.05,Dy=0.30"；'
                          '固定力矩通道增益以消除自由度: --known-params "kb=4.0"'
                          '（实测口径：下发 1 ⇒ 4 N·m）或 "ks=1.0"。'
+                         '★ 只给一个 k 时，另一个由闭式最小二乘标定；一个都不给时'
+                         '**约定 kb=1**（只为定标度）再标定 ks，见 algebraic_init。'
                          f"可用的已知参数: {', '.join(sorted(KNOWN_OK))}")
     ap.add_argument("--ignore-gravity", "--no-gravity", dest="ignore_gravity",
                     action="store_true",
@@ -1540,6 +1635,18 @@ def main() -> int:
     # ---- known 与 freeze 是两件事 ----
     #   --known-params  只在**初始最小二乘阶段**指定值（kb/ks 作为该通道增益初值）。
     #   --freeze-params 控制**后续优化**是否冻结（含"先冻 n 步再放开"）。
+    # ---- 力矩通道增益：一个 k 都不给时按 kb=1 处理 ----
+    # 标度退化（整组参数同乘常数 ⇒ 轨迹不变）使得"参数的绝对标度"必须靠一个 k 钉住：
+    #   * 给了 kb 或 ks 之一 → 另一个由闭式解标定（见 algebraic_init）；
+    #   * 一个都不给        → 约定 kb = 1（纯粹是选标度），再标定 ks。
+    # 这里把"约定的 kb=1"写进 known，于是它会被下面的循环默认冻结、也会参与
+    # algebraic_init 的按 k 缩放；想让它参与优化就写 --freeze-params "kb:0"。
+    assumed_kb = "kb" not in known and "ks" not in known
+    if assumed_kb:
+        known["kb"] = 1.0
+        print("[约定] --known-params 没给 kb/ks：按 kb=1 处理（只为定标度），"
+              "ks 由闭式最小二乘标定；kb 默认冻结，"
+              "若要放开请加 --freeze-params \"kb:0\"")
     # 为不破坏既有命令行，known 里的参数默认仍按全程冻结处理；
     # 想"只当初始值、训练时放开"就显式写 --freeze-params "名字:0"。
     for n in known:
@@ -1668,10 +1775,20 @@ def main() -> int:
                             if args.friction_category
                             else REPO / "data" / "friction"))
         if args.use_friction_sweep and sweep_path.exists():
-            p_dyn, _ = algebraic_init(cases, nominal=tuple(args.mass_nominal),
-                                      friction=(0.0, 0.0, 0.0, 0.0), known=known)
+            # ★ friction=None：让摩擦列留在回归里自由求解（旧版传 (0,0,0,0) 时那些列
+            #   仍在解里、只是解完被覆盖成 0；新版会把"已知摩擦"折到右端，传 0 等于
+            #   强行假设无摩擦，会把其余参数带偏）。p_dyn 只用来扣 G1/G2 与提供
+            #   M22/M12，摩擦取多少都不影响这两个用途。
+            p_dyn, ainfo_dyn = algebraic_init(cases, nominal=tuple(args.mass_nominal),
+                                              friction=None, known=known)
+            # 摩擦扫频数据里存的是**指令值**，所以必须用"与 p_dyn 同一标度"的 k
+            # 把它换算成物理力矩（kb 给 b 行、ks 给 s 行）——这就是标定出的那两个 k。
+            kb_gain, ks_gain = float(p_dyn["kb"]), float(p_dyn["ks"])
+            print(f"力矩通道增益（摩擦拟合用，与 p_dyn 同标度）: "
+                  f"kb={kb_gain:.6g} [{ainfo_dyn['kb_source']}]  "
+                  f"ks={ks_gain:.6g} [{ainfo_dyn['ks_source']}]")
             fbc, fbv, finfo = fit_friction_sweep(
-                sweep_path, p_dyn, ignore_gravity=args.ignore_gravity)
+                sweep_path, p_dyn, ignore_gravity=args.ignore_gravity, kb=kb_gain)
             print(f"匀速旋转实验拟合大 yaw 摩擦（{finfo['files']} 个 sweep 文件，"
                   f"{finfo['n']} 个速度点，"
                   f"|ω| {finfo['omega_abs_min']:.4f}~{finfo['omega_abs_max']:.2f} rad/s，"
@@ -1699,7 +1816,7 @@ def main() -> int:
                         s_path, p_dyn, dyn_correct=args.fs_s_dyn,
                         drop_first=args.fs_s_drop_first, drop_last=args.fs_s_drop_last,
                         vmin=args.fs_s_vmin, vmax=args.fs_s_vmax, verbose=True,
-                        ignore_gravity=args.ignore_gravity)
+                        ignore_gravity=args.ignore_gravity, ks=ks_gain)
                 except ValueError as e:
                     print(f"（小 yaw 数据 {s_path} 不可用：{e}）")
                 else:
@@ -1731,9 +1848,12 @@ def main() -> int:
             print(f"（未找到 {sweep_path}，摩擦改用主回归结果）")
         p_init, ainfo = algebraic_init(cases, nominal=tuple(args.mass_nominal),
                                       friction=friction, known=known)
-        # kb / ks 不参与闭式回归（只缩放两行的 y，几何不变），由已知量或标称值补上
-        for g in ("kb", "ks"):
-            p_init[g] = float(known.get(g, cfg.DEFAULT_PARAMS[g]))
+        # kb / ks 已由 algebraic_init 采用（已知量）或标定（闭式解），这里**不再覆盖**：
+        # 它同时定下了整组参数的绝对标度，必须与解出的参数保持同一标度，
+        # 否则正向模型 kb·Tb 会与参数差一个倍数（这正是旧版把 kb 覆盖成 4 的 bug）。
+        print(f"力矩通道增益（代数初始化输出）: "
+              f"kb={p_init['kb']:.6g} [{ainfo['kb_source']}]  "
+              f"ks={p_init['ks']:.6g} [{ainfo['ks_source']}]")
         ps = ParamSpec(ref, rng, orders=(0.0, 0.0))
         ps.theta = torch.tensor(
             ParamSpec.to_theta([p_init[n] for n in PARAM_NAMES]),

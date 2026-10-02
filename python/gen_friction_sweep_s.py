@@ -471,6 +471,9 @@ def main() -> int:
                     help="[仿真] 把等效重力强制设为 0（水平面，做「不用重力」的对照）；"
                          "不给则**默认在倾角范围内随机抽重力**——即默认使用重力。")
     ap.add_argument("--gravity-seed", type=int, default=None)
+    ap.add_argument("--set-params", type=str, default="",
+                    help='[仿真] 临时覆盖真值参数（只允许 DEFAULT_PARAMS 里已有的键），'
+                         '形如 "kb=4.0,ks=0.5"；[--real] 无效')
     ap.add_argument("--no-noise", dest="noise", action="store_false",
                     help="[仿真] 关闭环境噪声")
     ap.add_argument("--sigma-pos", type=float, default=cfg.SIGMA_POS)
@@ -538,6 +541,11 @@ def main() -> int:
     ap.add_argument("--debug", action="store_true", help="打印每趟被剔除的原因")
     args = ap.parse_args()
 
+    override = cfg.parse_param_override(args.set_params)
+    if override and args.real:
+        print("[警告] --real 下 --set-params 无效（真机参数不可注入），已忽略")
+        override = {}
+
     # 内部统一读 cfg，命令行覆盖就直接改这里的模块级配置
     cfg.SS_A_REF = args.ss_a_ref
     cfg.SS_TIME_BUDGET = args.ss_time_budget
@@ -602,7 +610,8 @@ def main() -> int:
     else:
         env = SimEnv(zero_gravity=args.zero_gravity, noise=args.noise,
                      sigma_pos=args.sigma_pos, sigma_vel=args.sigma_vel,
-                     sigma_tau=args.sigma_tau, seed=args.gravity_seed)
+                     sigma_tau=args.sigma_tau, seed=args.gravity_seed,
+                     params_override=override)
     gx, gy = env.gravity
     print(f"  等效重力（{'反解得到' if args.real else '构造时随机确定'}）: "
           f"α={env.gravity_alpha_deg:.3f}°  (gx,gy)=({gx:.4f},{gy:.4f})  "

@@ -114,11 +114,23 @@ def main() -> int:
                          "不给则**默认在倾角范围内随机抽重力**——即默认使用重力。")
     ap.add_argument("--gravity-seed", type=int, default=None,
                     help="重力抽样的随机种子；不给则每次运行都不同")
+    ap.add_argument("--set-params", type=str, default="",
+                    help='[仿真] 临时覆盖真值参数（只允许 DEFAULT_PARAMS 里已有的键），'
+                         '形如 "kb=4.0,ks=0.5"；[--real] 无效')
     ap.add_argument("--no-noise", dest="noise", action="store_false",
                     help="关闭仿真环境里的噪声")
     ap.add_argument("--sigma-pos", type=float, default=cfg.SIGMA_POS)
     ap.add_argument("--sigma-vel", type=float, default=cfg.SIGMA_VEL)
     ap.add_argument("--sigma-tau", type=float, default=cfg.SIGMA_TAU)
+    # ---- 速度环/位置环增益（默认按 kb/ks 自动换算，见下）----
+    ap.add_argument("--fs-kpv", type=float, default=None,
+                    help=f"关节 b 速度环 P（缺省 = {cfg.FS_KPV}/kb，保持物理环路增益不变）")
+    ap.add_argument("--fs-kiv", type=float, default=None,
+                    help=f"关节 b 速度环 I（缺省 = {cfg.FS_KIV}/kb）")
+    ap.add_argument("--fs-kps", type=float, default=None,
+                    help=f"关节 s 位置环 P（缺省 = {cfg.FS_KPS}/ks）")
+    ap.add_argument("--fs-kds", type=float, default=None,
+                    help=f"关节 s 位置环 D（缺省 = {cfg.FS_KDS}/ks）")
 
     # ---- 真实硬件环境（RealEnv）----
     ap.add_argument("--real", action="store_true",
@@ -147,6 +159,29 @@ def main() -> int:
     ap.add_argument("--fs-vel-tol-abs", type=float, default=0.0,
                     help="稳态判据的绝对容差 [rad/s]（真机建议给一点，如 0.02）")
     args = ap.parse_args()
+
+    override = cfg.parse_param_override(args.set_params)
+    if override and args.real:
+        print("[警告] --real 下 --set-params 无效（真机参数不可注入），已忽略")
+        override = {}
+    # ---- 速度环/位置环增益 ----
+    # 控制器输出的是**指令值**，物理力矩 = k × 指令值，所以 kb/ks 会改变等效环路增益。
+    # 实测（kb=4、ks=0.5）：按 1/k 缩放增益反而更差（3 次运行 14/48 通过 vs 不缩 23/48）
+    # ——因为该速度环本来就临界，且力矩噪声是按**指令单位**注入的。因此这里**默认不动**
+    # cfg 里的增益，只保留显式覆盖；要提高通过率就多跑几次（辨识侧会合并同类目录下
+    # 全部 sweep_*.npz）。
+    kb_eff = float(override.get("kb", cfg.DEFAULT_PARAMS.get("kb", 1.0)))
+    ks_eff = float(override.get("ks", cfg.DEFAULT_PARAMS.get("ks", 1.0)))
+    if args.fs_kpv is not None:
+        cfg.FS_KPV = args.fs_kpv
+    if args.fs_kiv is not None:
+        cfg.FS_KIV = args.fs_kiv
+    if args.fs_kps is not None:
+        cfg.FS_KPS = args.fs_kps
+    if args.fs_kds is not None:
+        cfg.FS_KDS = args.fs_kds
+    print(f"环路增益: KPV={cfg.FS_KPV:g} KIV={cfg.FS_KIV:g} "
+          f"KPS={cfg.FS_KPS:g} KDS={cfg.FS_KDS:g}（kb={kb_eff:g}, ks={ks_eff:g}）")
 
     stamp = cfg.run_stamp()          # 本次运行的启动时间戳
     if args.out is not None:
@@ -183,7 +218,8 @@ def main() -> int:
     else:
         env = SimEnv(zero_gravity=args.zero_gravity, noise=args.noise,
                      sigma_pos=args.sigma_pos, sigma_vel=args.sigma_vel,
-                     sigma_tau=args.sigma_tau, seed=args.gravity_seed)
+                     sigma_tau=args.sigma_tau, seed=args.gravity_seed,
+                     params_override=override)
     gx, gy = env.gravity
     alpha = env.gravity_alpha_deg
     print(f"  等效重力（{'反解得到' if args.real else '构造时随机确定'}，不可设置）: "
