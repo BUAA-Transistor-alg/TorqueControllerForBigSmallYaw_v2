@@ -10,3 +10,4 @@ __pycache__/
 
 # dsh
 .tmpdiag
+.profile_run/
