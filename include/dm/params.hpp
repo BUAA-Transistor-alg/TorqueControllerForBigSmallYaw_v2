@@ -55,11 +55,7 @@ struct Params {
     Params() = delete;
 
     /// 前 17 个参数之后**追加** kb / ks（带默认值 1.0）。
-    ///
-    /// 为什么给默认值：本结构有 30+ 个构造点（含 tools/ 与 build/mpcchk/ 下的
-    /// 校验程序），全部改一遍噪声大；而 kb = ks = 1 恰好是"旧行为"（指令值即物理
-    /// 力矩），因此默认值只在"没有专门配过增益"的旧场景里生效，不会静默改变已有
-    /// 校验程序的语义。**凡是描述真实机器人/真实数据的路径都必须显式给出**。
+    /// **凡是描述真实机器人/真实数据的路径都必须显式给出**。
     Params(double mb_,
            double Ib_,
            double Pbx_,
@@ -77,8 +73,8 @@ struct Params {
            double fsc_,
            double fsv_,
            double lambda_,
-           double kb_ = 1.0,
-           double ks_ = 1.0)
+           double kb_,
+           double ks_)
         : mb(mb_),
           Ib(Ib_),
           Pbx(Pbx_),

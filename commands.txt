@@ -15,4 +15,37 @@ python3 python/identify_params.py --category Sentry1 \
     --known-params "" \
     --out "./data/identify_Sentry1_release_all"
 
+python3 python/identify_params.py --category Sentry1 \
+    --friction-category friction_Sentry1 --friction-category-s friction_s_Sentry1 \
+    --known-params "kb=4.0" \
+    --steps 2000 --stages "20:0.4,50:0.6" \
+    --out "./data/identify_Sentry1_sim_same_test"
+
+python3 python/identify_params.py --category Sentry1 \
+    --friction-category friction_Sentry1 --friction-category-s friction_s_Sentry1 \
+    --w-psi-b 1.0 --w-psi-s 1.0 --w-dpsi-b 1.0 --w-dpsi-s 1.0 \
+    --grad-mode batch --batch-threads 18 \
+    --steps 40000 --batch 120 \
+    --freeze-params "" \
+    --known-params "kb=4.0" \
+    --stages "20:0.4,50:0.6" \
+    --out "./data/identify_Sentry1_not_same_test"
+
+python3 python/identify_params.py --category Sentry1 \
+    --friction-category friction_Sentry1 --friction-category-s friction_s_Sentry1 \
+    --w-psi-b 1.0 --w-psi-s 1.0 --w-dpsi-b 1.0 --w-dpsi-s 1.0 \
+    --grad-mode batch --batch-threads 18 \
+    --steps 2500 --batch 120 \
+    --freeze-params "" \
+    --known-params "kb=4.0" \
+    --out "./data/identify_Sentry1_not_same_test_v2"
+
+python3 python/identify_params.py --category Sentry1 \
+    --friction-category friction_Sentry1 --friction-category-s friction_s_Sentry1 \
+    --w-psi-b 1.0 --w-psi-s 1.0 --w-dpsi-b 0.1 --w-dpsi-s 0.01 \
+    --no-full-batch-final --batch 120 \
+    --known-params "kb=4.0" \
+    --steps 6000 --stages "10:0.333,20:0.334,50:0.333" \
+    --out "./data/identify_Sentry1_final"
+
 python3 python/manual_tune.py

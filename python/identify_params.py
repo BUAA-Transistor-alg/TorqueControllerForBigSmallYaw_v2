@@ -1757,8 +1757,8 @@ def main() -> int:
     if args.curriculum:
         plan = [(min(k, full_K), max(1, int(round(args.steps * w))))
                 for k, w in parse_stages(args.stages)]
-        plan.sort()
-        plan[-1] = (full_K, plan[-1][1])       # 最后阶段一定用全窗口
+        # plan.sort()
+        # plan[-1] = (full_K, plan[-1][1])
     else:
         plan = [(full_K, args.steps)]
     total_steps = sum(n for _, n in plan)
