@@ -149,8 +149,8 @@ private:
     // 设置参数锁（后台线程读取）
     mutable std::mutex set_mtx_;
     bool   auto_aim_enable_ = true;
-    bool   yaw_torque_only_mode_b_ = false;  // 大 yaw 通道模式（true = 仅力矩）
-    bool   yaw_torque_only_mode_s_ = false;  // 小 yaw 通道模式
+    bool   yaw_torque_only_mode_b_ = true;  // 大 yaw 通道模式（true = 仅力矩）
+    bool   yaw_torque_only_mode_s_ = true;  // 小 yaw 通道模式
     bool   integral_enable_b_ = false;       // 大 yaw 积分补偿开关
     bool   integral_enable_s_ = false;       // 小 yaw 积分补偿开关
     double target_psi_b_ = 0.0;
