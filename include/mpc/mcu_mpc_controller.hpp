@@ -27,6 +27,22 @@
 //     不跟随绝对时间点，避免误差累计。
 //   - 循环真实帧率由 FrameRateCounter 记录（滑动窗口 60 帧），随 State::loop_fps 返回。
 //   - 设置参数与最新结果（last_state_）使用独立的锁保护。
+//
+//   - **首个 set 之前的安全返回包**：后台线程从启动起就在发帧，若电控上电即在等
+//     上位机 yaw 力矩，构造到首次 set 之间会有一段"零目标 MPC 力矩"窗口（且冷启动时
+//     状态全 0，见 FullStrictPoseBuilder 的样本缓存）。因此本类持有一个构造期就建好的
+//     安全包 safe_packet_（auto_aim / fire 关闭、pitch 目标 0、两轴模式均为仅力矩、
+//     yaw 目标角/角速度/力矩全 0），并在首个 set 的数据"被解算出来但还没应用"之前
+//     替代真实控制量下发。替换只发生在发送处：
+//       * 解算、延迟缓冲、积分补偿、热启动、last_state_ 全部照常执行（该次解算照常
+//         计入 MPC 内部状态，控制连续性不受影响）；
+//       * 首个 set 的参数**第一次参与解算的那一帧**发安全包，它的 MPC 结果不发送；
+//         从下一帧起恢复正常发送。构造后、首个 set 之前的每一帧也都是安全包。
+//     ★ 只挡**首个** set：三态状态机 safe_send_state_ 只在 set_mtx_ 内读写，且是单向
+//       闩锁（WAITING_FIRST_SET → FIRST_SET_PENDING → APPLIED，APPLIED 之后不再回退），
+//       所以首个 set 之后的每次 set() 都是普通的目标刷新，直接按新参数出控制量。
+//       因此无论首个 set 落在 loop 的哪个时刻（含正好落在 loop 持锁前），它的控制量
+//       都最早只能从解算它的下一帧生效。
 
 #include <atomic>
 #include <cstdint>
@@ -109,6 +125,10 @@ public:
     // yaw_torque_only_mode_b / _s：两轴各自的 YawMode 选择（true = 仅力矩）。
     // integral_enable_b / _s：本步两轴是否启用积分补偿（各自透传给
     // DualYawMpcController::step）。
+    //
+    // ★ 仅**首次**调用本函数（或序列版）会触发安全包交接：状态从 WAITING_FIRST_SET
+    //   推到 FIRST_SET_PENDING，后台线程把这次参数解算出来的那一帧仍发 safe_packet_，
+    //   从下一帧起才发真实控制量；之后的调用只是普通目标刷新，不再影响安全包。
     // ------------------------------------------------------------------
     void set(bool auto_aim_enable,
              bool yaw_torque_only_mode_b,
@@ -158,6 +178,25 @@ private:
     double pitch_target_angle_ = 0.0;
     bool   fire_ = false;
 
+    // ★ 安全包状态机（见类头"首个 set 之前的安全返回包"）。用三态而不是一个 bool，
+    //   因为"构造后到首个 set 之间一直发安全包"与"首个 set 被解算的那一帧发安全包"
+    //   是两个独立条件，单个 bool 无法同时表达：
+    //     WAITING_FIRST_SET : 外部还从未 set ⇒ 本帧发安全包（覆盖构造后**每一帧**）
+    //     FIRST_SET_PENDING : 首个外部 set 已到达、但还没有一帧解算过它
+    //                         ⇒ 本帧解算它、仍发安全包，然后转 APPLIED
+    //     APPLIED           : 本帧发真实控制包（**吸收态**）
+    //   ★ 只有在 WAITING_FIRST_SET 状态下收到 set 才会跳到 FIRST_SET_PENDING，即
+    //     "只挡**首个** set。之后的 set 是正常运行时的周期性目标刷新，直接按新参数出
+    //     控制量，绝不重置状态机" —— 否则正常运行时每个 set() 都会把状态推回起点，
+    //     导致每一帧都发安全包、机器人永远收不到力矩。
+    //   三个状态只在 set_mtx_ 内读写，故"首个 set 的控制量最早从解算它的下一帧生效"
+    //   与 set() 落在 loop 哪个时刻无关。
+    enum class SafeSendState { WAITING_FIRST_SET, FIRST_SET_PENDING, APPLIED };
+    // 初值 WAITING_FIRST_SET：构造后既无操作员意图、冷启动时状态样本也可能还是全 0
+    //（FullStrictPoseBuilder 从未收到样本时全 0），此时解算出来的"零目标 MPC 力矩"
+    // 正是要避免的东西 ⇒ 首个 set 到达前每一帧都发 safe_packet_。
+    SafeSendState safe_send_state_ = SafeSendState::WAITING_FIRST_SET;
+
     // 序列模式成员（非空时 loop 优先消费）
     std::deque<double> target_psi_b_seq_;
     std::deque<double> target_psi_s_seq_;
@@ -167,6 +206,16 @@ private:
     // 最新结果锁（显示线程读取）
     mutable std::mutex state_mtx_;
     State last_state_;
+
+    // ★ 安全返回包：**构造期一次性建好**，内容在对象生命周期内不再变化（故为 const）。
+    //   仅在"首个 set 的数据尚未被解算"期间替代真实控制量下发：
+    //     auto_aim_enable = 0、fire = 0、pitch_target_angle = 0（映射前的关节角语义，
+    //     仍照常过 McuDataPreprocessor::processSend）、两轴 yaw_big/small_mode 均为
+    //     YAW_MODE_TORQUE_ONLY（仅力矩，不叠加电控位置/速度内环）、
+    //     yaw 目标角/目标角速度/力矩两轴全 0。
+    //   （成员初始化列表里用 makeSafeSendPacket() 逐字段赋值；SendPacket 多数字段没有
+    //     默认成员初始化器，必须先值初始化再赋，否则会按未定义值发出。）
+    const com::mcu::SendPacket safe_packet_;
 
     double loop_period_ = 0.01;      // 后台 loop 周期（秒，构造传入）
     FrameRateCounter fps_counter_;   // loop 真实帧率统计（滑动窗口 60 帧）
