@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <stdexcept>
 
+#include "angle_wrap.hpp"   // 每拍把参考整圈对齐到实测世界方位角（见 solveWith 的 2b 段）
+
 namespace tcbs {
 namespace mpc {
 
@@ -169,12 +171,30 @@ DualYawMpcController::Result DualYawMpcController::solveWith(
     r.state_theta_s = measurement.theta_s;
     r.state_theta_c = theta_c;
     r.state_dtheta_c = dtheta_c;
-    r.target_psi_b = target_psi_b;
-    r.target_psi_s = target_psi_s;
+
+    // ---- 2b. ★ **每拍**（100Hz）把参考对齐到当拍实测世界方位角所在圈 ----
+    //   只做「整体平移 2π 的整数倍」：
+    //     · 序列形状（斜率/曲率/各点相对关系）完全不变，跟踪误差也原样保留；
+    //     · 实测与参考本来就相差 < π 时是恒等变换（正常运行路径零副作用）；
+    //     · 只在「圈」不一致时（底盘方位角跨过 ±π、参考来自不同圈等）把整条参考拉回
+    //       同一圈——否则代价里会出现 w_psi_b·(2π)² 的整圈残差，MPC 会打出恒定幅值的
+    //       力矩脉冲（每圈一次）。根因修复见 FullStrictPoseBuilder::unwrapChassisAzimuth，
+    //       这里是**兜底**：任何环节的整圈表示差都不再能变成控制量脉冲。
+    //   ★ 放在 solveWith() 而不是 McuMpcController::set()：本函数是标量目标、
+    //     序列目标、显式测量三条调用路径的唯一汇聚点，且每拍必到（set() 只有每帧一次）。
+    std::vector<double> ref_b_aligned = ref_b;
+    std::vector<double> ref_s_aligned = ref_s;
+    alignSeqToNearest(ref_b_aligned, psi_b);
+    alignSeqToNearest(ref_s_aligned, psi_s);
+    const double target_b_aligned = wrapToNearest(target_psi_b, psi_b);
+    const double target_s_aligned = wrapToNearest(target_psi_s, psi_s);
+
+    r.target_psi_b = target_b_aligned;
+    r.target_psi_s = target_s_aligned;
 
     MPCController::Reference reference;
-    reference.psi_b = ref_b;
-    reference.psi_s = ref_s;
+    reference.psi_b = ref_b_aligned;
+    reference.psi_s = ref_s_aligned;
 
     dm::State x0;
     x0.theta_b = measurement.theta_b;
@@ -204,8 +224,8 @@ DualYawMpcController::Result DualYawMpcController::solveWith(
     r.pred_theta_s = r.pred_psi_s - r.pred_psi_b;
     r.pred_dtheta_b = r.pred_dpsi_b - dtheta_c;
     r.pred_dtheta_s = r.pred_dpsi_s - r.pred_dpsi_b;
-    r.ref_psi_b = ref_b;
-    r.ref_psi_s = ref_s;
+    r.ref_psi_b = ref_b_aligned;
+    r.ref_psi_s = ref_s_aligned;
     r.pred_psi_b_seq = mres.pred_psi_b_seq;
     r.pred_psi_s_seq = mres.pred_psi_s_seq;
 

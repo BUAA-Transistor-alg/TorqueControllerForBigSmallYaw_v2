@@ -4,19 +4,11 @@
 #include <chrono>
 #include <cmath>
 
+#include "angle_wrap.hpp"   // wrapToNearest（整圈对齐的唯一实现，见该头文件）
+
 namespace tcbs {
 namespace mpc {
 namespace {
-
-/// 2π（不依赖 M_PI，保证 -std=c++17 严格模式下也可用）。
-constexpr double kTwoPi = 2.0 * 3.14159265358979323846;
-
-/// 把一个绝对目标角 remainder 到与 ref 角度差最小的等效角：
-///   adj = ref + remainder(target − ref, 2π)
-/// 满足 |adj − ref| ≤ π 且 adj ≡ target (mod 2π)。
-inline double wrapToNearest(double target, double ref) {
-    return ref + std::remainder(target - ref, kTwoPi);
-}
 
 /// 构造"安全返回包"（构造 McuMpcController 时调用一次，之后内容不再变化）。
 ///

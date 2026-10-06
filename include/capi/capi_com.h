@@ -186,6 +186,12 @@ typedef struct TcbsComLatestData {
  * 没有 valid 标志，始终可读；所需数据缺失时（从未收到该来源的样本）以 0 参与。
  * chassis_euler_* / chassis_azimuth / big_azimuth / small_azimuth / gx,gy 均由
  * 反解算法给出：底盘水平时 gx = gy = 0，倾斜时为旋转平面内的重力分量。
+ *
+ * ★ 角度范围约定（别混用）：
+ *   chassis_euler_yaw / _pitch / _roll ：包裹值，yaw ∈ (−π, π]；
+ *   chassis_azimuth / big_azimuth / small_azimuth ：**多圈连续量**（累计圈数解卷绕，
+ *     不受 ±π 限制），与电控上报的多圈关节角 θ_b/θ_s 同口径 —— 下游 MPC 正是按
+ *     psi_b = chassis_azimuth + θ_b 使用。需要包裹值请取 chassis_euler_yaw。
  */
 typedef struct TcbsComPose {
     /* 反解输入 */

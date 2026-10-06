@@ -20,6 +20,11 @@
 //     · 各环节方位角速度由 IMU 陀螺 gz/gy 与关节角速度按构型链式合成。
 //   角度由 atan2 / asin 给出，天然落在 (−π, π]（pitch ∈ [−π/2, π/2]）。
 //
+//   ★ 唯一的例外是 chassis_azimuth：它被**累计圈数解卷绕成多圈连续量**（见 StrictPose
+//     的字段注释与 unwrapChassisAzimuth），因为下游按「多圈世界方位角」使用它。其余
+//     atan2/asin 输出（chassis_euler_*）保持 (−π, π] 不变——那两个是给变换树用的
+//     包裹欧拉角，语义不同，禁止顺手"一起解卷绕"。
+//
 // ── 约定 ──
 //   · 与 `dual_yaw::StrictPose` 一致: **没有 valid 标志，始终可读**；
 //     所需数据缺失时以历史值或 0 参与计算。
@@ -45,8 +50,15 @@ public:
         double yaw_small_angle = 0.0;    // θ_s（小 yaw 关节角）
         double pitch_angle = 0.0;        // θ_p（pitch 关节角）
         // ── 反解结果 ──
+        // chassis_euler_*：ZXY 欧拉角，**包裹在 (−π, π]**（变换树/流水线按包裹值使用）。
         double chassis_euler_yaw = 0.0, chassis_euler_pitch = 0.0, chassis_euler_roll = 0.0;
         // ── 各环节的世界方位角 ──
+        // ★ 三者都是**多圈连续量**（不是 (−π,π] 包裹值）：
+        //     chassis_azimuth = 累计圈数解卷绕后的底盘方位角；
+        //     big_azimuth     = chassis_azimuth + θ_b（θ_b 是电控给的多圈关节角）。
+        //   mpc::DualYawMpcController::measure() 正是按此口径合成
+        //   psi_b = chassis_azimuth + θ_b，若这里给包裹值，底盘每转一圈 psi_b 就跳 ±2π，
+        //   MPC 代价会出现整圈残差（每圈一个力矩脉冲）。
         double chassis_azimuth = 0.0;
         double big_azimuth = 0.0;
         double small_azimuth = 0.0;
@@ -102,6 +114,13 @@ public:
 
 
 private:
+    // ── 底盘方位角的**累计圈数解卷绕**（见 .cpp 里的实现与说明）──
+    //   matToEulerZXY 用 atan2 给出的 azimuth 落在 (−π, π]：底盘每转一圈就跳 ±2π。
+    //   这里以「上一拍输出」为参考、把 ±2π 的跳变吸收进 turn，使输出成为多圈连续量。
+    //   语义：顺序滤波器。必须与样本快照同序调用；重复喂同一个快照时增量为 0（幂等），
+    //   因此多线程各自调用 strictPose() 也不会把圈数累坏。
+    double unwrapChassisAzimuth(double wrapped) const;
+
     mutable std::mutex mtx_;   // 保护内部状态（回调线程写、主线程读）
     ImuSample imu_;            // 最近一次 IMU 样本（从未传入则全 0）
     McuSample mcu_;            // 最近一次 MCU 样本（从未传入则全 0）
@@ -109,6 +128,12 @@ private:
     ImuLocation imu_location_;
 
     double g_ = 9.81;
+
+    // 解卷绕状态（独立锁：与上面的样本快照互不阻塞）
+    mutable std::mutex azimuth_mtx_;
+    mutable bool   chassis_unwrap_init_ = false;  // 是否已锁存首个样本
+    mutable double chassis_azimuth_last_ = 0.0;   // 上一拍输出的多圈值（rad）
+    mutable double chassis_azimuth_turn_ = 0.0;   // 累计圈数偏移（2π 的整数倍，rad）
 };
 
 }  // namespace com

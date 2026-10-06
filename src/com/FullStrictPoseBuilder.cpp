@@ -5,6 +5,8 @@
 //       底盘姿态 chassis_euler_*、底盘方位角 chassis_azimuth、
 //       大/小 yaw 世界方位角 big_azimuth / small_azimuth、
 //       旋转平面内重力分量 gx / gy、以及各环节方位角速度。
+//     其中 chassis_azimuth 会经 unwrapChassisAzimuth 累计圈数，输出为**多圈连续量**
+//     （atan2 给的 (−π,π] 单圈值只作为它的输入），详见该函数与头文件注释。
 //     运动学链按 imu_location_ 分支（ON_HEAD / ON_BIG_YAW），两分支的旋转矩阵与
 //     角速度合成方式不同，见下方 strictPose() 内的注释。
 #include "FullStrictPoseBuilder.h"
@@ -15,6 +17,10 @@ namespace com {
 
 
 namespace {
+
+/// 2π / π（不依赖 M_PI，保证 -std=c++17 严格模式下也可用）。
+constexpr double kTwoPi = 2.0 * 3.14159265358979323846;
+constexpr double kPi    = 3.14159265358979323846;
 
 // ============================================================================
 // 3x3 旋转矩阵工具（ZXY 约定: R = Rz(yaw)·Rx(pitch)·Ry(roll)，与
@@ -225,6 +231,13 @@ FullStrictPoseBuilder::StrictPose FullStrictPoseBuilder::strictPose() const {
     double dummy1;
     double dummy2;
     matToEulerZXY(R_plain_chassis, sp.chassis_azimuth, dummy1, dummy2);
+
+    // ★ 底盘方位角解卷绕：(−π,π] 单圈值 → **多圈连续量**。
+    //   必须在这里做、且在合成 big/small_azimuth 之前做：下游 mpc::DualYawMpcController
+    //   按 psi_b = chassis_azimuth + θ_b 使用（θ_b 本身就是多圈关节角），两者圈数口径
+    //   一致才不会有整圈残差。理由与故障现象见头文件与该函数实现。
+    sp.chassis_azimuth = unwrapChassisAzimuth(sp.chassis_azimuth);
+
     sp.big_azimuth = sp.chassis_azimuth + sp.yaw_big_angle;
     sp.small_azimuth = sp.big_azimuth + sp.yaw_small_angle;
 
@@ -232,6 +245,44 @@ FullStrictPoseBuilder::StrictPose FullStrictPoseBuilder::strictPose() const {
     sp.gy = projY * g_;
 
     return sp;
+}
+
+// 底盘方位角：(−π, π] 单圈值 → 多圈连续值。
+//
+// ── 为什么必须解卷绕（一次真实故障的根因）──
+//   matToEulerZXY 用 atan2 给出 azimuth，底盘每转一圈输出就跳 ±2π。而下游
+//   mpc::DualYawMpcController::measure() 按
+//       psi_b = chassis_azimuth + theta_b        （theta_b 是电控给的多圈关节角）
+//   合成世界方位角（MPC 代价用的就是它）。若这里给包裹值，psi_b 每圈跳 ±2π，
+//   而参考序列只在 McuMpcController::set()（上位机每帧一次）对齐过圈数，100Hz 的
+//   拍之间不再对齐 ⇒ 底盘跨过 ±π 到下一帧之间，MPC 代价里出现 w_psi_b·(2π)² ≈ 39.5
+//   的整圈残差（正常跟踪时 ~4e-4），表现为**底盘每转一圈就有一个恒定幅值的力矩
+//   脉冲**（大 yaw 抖一下），且固定在同一个底盘角度（= atan2 的 ±π 边界）。
+//
+// ── 语义与线程安全 ──
+//   · 首个样本：多圈零位就取该包裹值所在圈（输出 = 输入），保证改动前启动阶段的
+//     行为与数值完全不变，圈数只是相对累计；
+//   · 之后以「上一拍输出」为参考吸收 ±2π 跳变（标准 unwrap），输出因此连续；
+//   · 顺序滤波器：重复喂同一个快照或相互接近的快照时增量恒为 0（幂等），
+//     故多个线程各自调用 strictPose() 不会把圈数累坏（锁只保护这四个成员）。
+double FullStrictPoseBuilder::unwrapChassisAzimuth(double wrapped) const {
+    std::lock_guard<std::mutex> lock(azimuth_mtx_);
+    if (!chassis_unwrap_init_) {
+        chassis_azimuth_last_ = wrapped;
+        chassis_azimuth_turn_ = 0.0;
+        chassis_unwrap_init_  = true;
+        return wrapped;
+    }
+    // 先按当前累计圈数还原，再看与上一拍输出差了多少整圈并吸收掉
+    const double d = (wrapped + chassis_azimuth_turn_) - chassis_azimuth_last_;
+    if (d > kPi) {
+        chassis_azimuth_turn_ -= kTwoPi;   // 跨过 +π：回退一圈
+    } else if (d < -kPi) {
+        chassis_azimuth_turn_ += kTwoPi;   // 跨过 −π：前进一圈
+    }
+    const double out = wrapped + chassis_azimuth_turn_;
+    chassis_azimuth_last_ = out;
+    return out;
 }
 
 }  // namespace com

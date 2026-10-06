@@ -17,6 +17,11 @@
 //   dθ_c       = chassis_omega           dθ_b      = big_motor_omega
 //   dθ_s       = small_motor_omega
 //   当前世界方位角按模型定义计算：psi_b = θ_c + θ_b，psi_s = psi_b + θ_s
+//   ★ θ_c = chassis_azimuth 是**多圈连续量**（FullStrictPoseBuilder 已累计圈数解卷绕），
+//     与电控上报的多圈 θ_b 同口径；若 θ_c 给的是 (−π,π] 包裹值，psi_b 每转一圈就跳 ±2π。
+//     参考序列也必须与实测**同圈**：solveWith() 每拍会把整条参考整体平移整数圈、对齐到
+//     当拍实测 psi（见 include/mpc/angle_wrap.hpp 与 solveWith 的 2b 段）。这是曾经
+//     "底盘每转一圈就出现一个力矩脉冲"故障的兜底修复，**不要删**。
 // （chassis_azimuth / big_azimuth / small_azimuth / gx / gy 由 FullStrictPoseBuilder
 //  反解得到；底盘水平时 gx = gy = 0，倾斜时为旋转平面内的重力分量。
 //  每步 setGravity() 把实测值交给 MPC；**是否真的进模型**由
